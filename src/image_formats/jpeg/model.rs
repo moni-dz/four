@@ -1,0 +1,369 @@
+//! Owns frame geometry, bounded coefficient storage, and pixel materialization.
+
+use exn::OptionExt;
+
+use super::{
+    BLOCK_SIDE, COMPONENTS_MAX, DIMENSION_MAX, DecodedImage, JPEGError, JPEGLimit, JPEGTableKind,
+    PIXELS_MAX, PROGRESSIVE_COEFFICIENT_BYTES_MAX, QUANTIZATION_TABLES_MAX, Result, divide_ceil,
+    error, idct,
+};
+
+#[derive(Clone, Copy)]
+pub(super) enum ColorTransform {
+    YCbCr,
+    Rgb,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum CodingProcess {
+    Sequential,
+    Progressive,
+}
+
+pub(super) struct FrameComponent {
+    pub(super) identifier: u8,
+    pub(super) horizontal_sampling: u8,
+    pub(super) vertical_sampling: u8,
+    pub(super) quantization_table: usize,
+    pub(super) plane_width: u32,
+    pub(super) plane: Vec<u8>,
+    pub(super) block_columns: u32,
+    pub(super) block_rows: u32,
+    pub(super) data_block_columns: u32,
+    pub(super) data_block_rows: u32,
+    pub(super) coefficients: Vec<[i32; 64]>,
+}
+
+pub(super) struct Frame {
+    pub(super) width: u32,
+    pub(super) height: u32,
+    pub(super) mcu_columns: u32,
+    pub(super) mcu_rows: u32,
+    pub(super) max_horizontal_sampling: u8,
+    pub(super) max_vertical_sampling: u8,
+    pub(super) components: Vec<FrameComponent>,
+    pub(super) process: CodingProcess,
+}
+
+impl Frame {
+    pub(super) fn new(
+        width: u32,
+        height: u32,
+        mut components: Vec<FrameComponent>,
+        process: CodingProcess,
+    ) -> Result<Self> {
+        invariant!(!components.is_empty());
+        invariant!(components.len() <= COMPONENTS_MAX);
+
+        let max_horizontal_sampling = components
+            .iter()
+            .map(|component| component.horizontal_sampling)
+            .max()
+            .expect("frame has components");
+        let max_vertical_sampling = components
+            .iter()
+            .map(|component| component.vertical_sampling)
+            .max()
+            .expect("frame has components");
+
+        let mcu_width = u32::from(max_horizontal_sampling) * BLOCK_SIDE;
+        let mcu_height = u32::from(max_vertical_sampling) * BLOCK_SIDE;
+        let mcu_columns = divide_ceil(width, mcu_width);
+        let mcu_rows = divide_ceil(height, mcu_height);
+
+        let storage = ComponentStorageLayout {
+            width,
+            height,
+            mcu_columns,
+            mcu_rows,
+            max_horizontal_sampling,
+            max_vertical_sampling,
+            process,
+        };
+
+        validate_progressive_storage(&components, &storage)?;
+
+        for component in &mut components {
+            allocate_component_storage(component, &storage)?;
+        }
+
+        Ok(Self {
+            width,
+            height,
+            mcu_columns,
+            mcu_rows,
+            max_horizontal_sampling,
+            max_vertical_sampling,
+            components,
+            process,
+        })
+    }
+
+    pub(super) fn materialize_progressive(
+        &mut self,
+        quantization_tables: &[Option<[u16; 64]>; QUANTIZATION_TABLES_MAX],
+    ) -> Result<()> {
+        invariant_eq!(self.process, CodingProcess::Progressive);
+        invariant!(!self.components.is_empty());
+
+        for component in &mut self.components {
+            let quantization =
+                quantization_tables[component.quantization_table].ok_or_raise(|| {
+                    JPEGError::Table(
+                        JPEGTableKind::Quantization,
+                        "frame references a missing quantization table",
+                    )
+                })?;
+
+            let block_count = component
+                .block_columns
+                .checked_mul(component.block_rows)
+                .ok_or_raise(|| {
+                    JPEGError::ArithmeticOverflow("component block count overflowed")
+                })?;
+
+            if component.coefficients.len() != block_count as usize {
+                return Err(error(JPEGError::Frame(
+                    "progressive coefficient plane has an invalid size",
+                )));
+            }
+
+            for block_index in 0..block_count {
+                let block_index_usize = usize::try_from(block_index)
+                    .expect("the bounded component block count fits usize");
+                let quantized = component.coefficients[block_index_usize];
+                let coefficients = dequantize_block(&quantized, &quantization)?;
+                let samples = idct::inverse(&coefficients);
+                let block_x = block_index % component.block_columns;
+                let block_y = block_index / component.block_columns;
+                write_block(component, block_x, block_y, &samples);
+            }
+
+            component.coefficients = Vec::new();
+        }
+
+        Ok(())
+    }
+
+    pub(super) fn into_image(self, transform: ColorTransform) -> DecodedImage {
+        invariant!(self.components.len() == 1 || self.components.len() == 3);
+        invariant!(u64::from(self.width) * u64::from(self.height) <= PIXELS_MAX);
+
+        let byte_count = u64::from(self.width) * u64::from(self.height) * 4;
+        let capacity = usize::try_from(byte_count)
+            .expect("the decoded pixel limit fits every supported pointer width");
+        let mut rgba = Vec::with_capacity(capacity);
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let first = self.sample(0, x, y);
+                let pixel = if self.components.len() == 1 {
+                    [first, first, first, 255]
+                } else {
+                    let second = self.sample(1, x, y);
+                    let third = self.sample(2, x, y);
+                    convert_color(first, second, third, transform)
+                };
+                rgba.extend_from_slice(&pixel);
+            }
+        }
+
+        invariant_eq!(rgba.len(), capacity);
+        DecodedImage::new(self.width, self.height, rgba)
+    }
+
+    pub(super) fn sample(&self, component_index: usize, x: u32, y: u32) -> u8 {
+        invariant!(component_index < self.components.len());
+        invariant!(x < self.width);
+        invariant!(y < self.height);
+
+        let component = &self.components[component_index];
+        let sample_x =
+            x * u32::from(component.horizontal_sampling) / u32::from(self.max_horizontal_sampling);
+        let sample_y =
+            y * u32::from(component.vertical_sampling) / u32::from(self.max_vertical_sampling);
+        let index = u64::from(sample_y) * u64::from(component.plane_width) + u64::from(sample_x);
+        let index = usize::try_from(index).expect("the bounded component plane index fits usize");
+        component.plane[index]
+    }
+}
+
+pub(super) fn dequantize_block(values: &[i32; 64], quantization: &[u16; 64]) -> Result<[i32; 64]> {
+    invariant!(quantization.iter().all(|value| *value > 0));
+    invariant!(values.iter().all(|value| value.checked_abs().is_some()));
+
+    let mut coefficients = [0_i32; 64];
+    for index in 0..64 {
+        coefficients[index] = values[index]
+            .checked_mul(i32::from(quantization[index]))
+            .ok_or_raise(|| {
+                JPEGError::ArithmeticOverflow("dequantized progressive coefficient overflowed")
+            })?;
+    }
+    Ok(coefficients)
+}
+
+pub(super) fn write_block(
+    component: &mut FrameComponent,
+    block_x: u32,
+    block_y: u32,
+    samples: &[u8; 64],
+) {
+    invariant!(component.plane_width > 0);
+    invariant!(!component.plane.is_empty());
+
+    let pixel_x = block_x * BLOCK_SIDE;
+    let pixel_y = block_y * BLOCK_SIDE;
+    for y in 0..BLOCK_SIDE {
+        let target_start =
+            u64::from(pixel_y + y) * u64::from(component.plane_width) + u64::from(pixel_x);
+        let target_end = target_start + u64::from(BLOCK_SIDE);
+        let source_start =
+            usize::try_from(y * BLOCK_SIDE).expect("an eight-row JPEG block always fits usize");
+        let source_end = source_start + BLOCK_SIDE as usize;
+        let target_start =
+            usize::try_from(target_start).expect("the bounded component plane offset fits usize");
+        let target_end =
+            usize::try_from(target_end).expect("the bounded component plane offset fits usize");
+        component.plane[target_start..target_end]
+            .copy_from_slice(&samples[source_start..source_end]);
+    }
+}
+
+struct ComponentStorageLayout {
+    width: u32,
+    height: u32,
+    mcu_columns: u32,
+    mcu_rows: u32,
+    max_horizontal_sampling: u8,
+    max_vertical_sampling: u8,
+    process: CodingProcess,
+}
+
+fn validate_progressive_storage(
+    components: &[FrameComponent],
+    layout: &ComponentStorageLayout,
+) -> Result<()> {
+    invariant!(!components.is_empty());
+    invariant!(components.len() <= COMPONENTS_MAX);
+
+    if layout.process == CodingProcess::Sequential {
+        return Ok(());
+    }
+    let mut byte_count = 0_u64;
+    for component in components {
+        let blocks = u64::from(layout.mcu_columns)
+            * u64::from(component.horizontal_sampling)
+            * u64::from(layout.mcu_rows)
+            * u64::from(component.vertical_sampling);
+        let component_bytes = blocks * 64 * size_of::<i32>() as u64;
+        byte_count = byte_count.checked_add(component_bytes).ok_or_raise(|| {
+            JPEGError::ArithmeticOverflow("progressive coefficient storage overflowed")
+        })?;
+    }
+    if byte_count > PROGRESSIVE_COEFFICIENT_BYTES_MAX {
+        return Err(error(JPEGError::LimitExceeded(
+            JPEGLimit::ProgressiveCoefficientBytes(PROGRESSIVE_COEFFICIENT_BYTES_MAX),
+        )));
+    }
+    Ok(())
+}
+
+fn allocate_component_storage(
+    component: &mut FrameComponent,
+    layout: &ComponentStorageLayout,
+) -> Result<()> {
+    invariant!(component.plane.is_empty());
+    invariant!(component.horizontal_sampling > 0);
+
+    let block_columns = layout
+        .mcu_columns
+        .checked_mul(u32::from(component.horizontal_sampling))
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("component block width overflowed"))?;
+    let block_rows = layout
+        .mcu_rows
+        .checked_mul(u32::from(component.vertical_sampling))
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("component block height overflowed"))?;
+    let plane_width = block_columns
+        .checked_mul(BLOCK_SIDE)
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("component plane width overflowed"))?;
+    let plane_height = block_rows
+        .checked_mul(BLOCK_SIDE)
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("component plane height overflowed"))?;
+    let sample_count = plane_width
+        .checked_mul(plane_height)
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("component plane size overflowed"))?;
+    let data_width = layout
+        .width
+        .checked_mul(u32::from(component.horizontal_sampling))
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("component data width overflowed"))?;
+    let data_height = layout
+        .height
+        .checked_mul(u32::from(component.vertical_sampling))
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("component data height overflowed"))?;
+    let data_block_columns = divide_ceil(
+        data_width,
+        u32::from(layout.max_horizontal_sampling) * BLOCK_SIDE,
+    );
+    let data_block_rows = divide_ceil(
+        data_height,
+        u32::from(layout.max_vertical_sampling) * BLOCK_SIDE,
+    );
+
+    component.plane_width = plane_width;
+    component.plane = vec![0; sample_count as usize];
+    component.block_columns = block_columns;
+    component.block_rows = block_rows;
+    component.data_block_columns = data_block_columns;
+    component.data_block_rows = data_block_rows;
+    if layout.process == CodingProcess::Progressive {
+        let block_count = block_columns.checked_mul(block_rows).ok_or_raise(|| {
+            JPEGError::ArithmeticOverflow("component coefficient count overflowed")
+        })?;
+        component.coefficients = vec![[0; 64]; block_count as usize];
+    }
+    invariant_eq!(component.plane.len(), sample_count as usize);
+    Ok(())
+}
+
+fn convert_color(first: u8, second: u8, third: u8, transform: ColorTransform) -> [u8; 4] {
+    match transform {
+        ColorTransform::Rgb => [first, second, third, 255],
+        ColorTransform::YCbCr => {
+            let luminance = f32::from(first);
+            let blue_difference = f32::from(second) - 128.0;
+            let red_difference = f32::from(third) - 128.0;
+            let red = luminance + 1.402 * red_difference;
+            let green = luminance - 0.344_136 * blue_difference - 0.714_136 * red_difference;
+            let blue = luminance + 1.772 * blue_difference;
+            [clamp_color(red), clamp_color(green), clamp_color(blue), 255]
+        }
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "YCbCr conversion values are rounded and clamped to u8 before conversion"
+)]
+fn clamp_color(value: f32) -> u8 {
+    invariant!(value.is_finite());
+    value.round().clamp(f32::from(u8::MIN), f32::from(u8::MAX)) as u8
+}
+
+pub(super) fn validate_dimensions(width: u32, height: u32) -> Result<()> {
+    if width == 0 || height == 0 {
+        return Err(error(JPEGError::Frame("JPEG dimensions must be nonzero")));
+    }
+    if width > DIMENSION_MAX || height > DIMENSION_MAX {
+        return Err(error(JPEGError::LimitExceeded(JPEGLimit::Dimensions(
+            DIMENSION_MAX,
+        ))));
+    }
+    if u64::from(width) * u64::from(height) > PIXELS_MAX {
+        return Err(error(JPEGError::LimitExceeded(JPEGLimit::Pixels(
+            PIXELS_MAX,
+        ))));
+    }
+    Ok(())
+}

@@ -1,0 +1,2 @@
+# Functions larger than one screen hide control flow and make invariant review harder.
+too-many-lines-threshold = 70
