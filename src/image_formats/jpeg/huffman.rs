@@ -3,11 +3,15 @@ use super::{Error, Result};
 
 const HUFFMAN_BITS_MAX: usize = 16;
 const HUFFMAN_SYMBOLS_MAX: usize = 256;
+const LOOKUP_BITS: u8 = 8;
+const LOOKUP_SIZE: usize = 1 << LOOKUP_BITS;
+const LOOKUP_SYMBOL_MASK: u16 = 0x00ff;
 
 #[derive(Clone)]
 pub(super) struct HuffmanTable {
     counts: [u8; HUFFMAN_BITS_MAX],
     symbols: Vec<u8>,
+    lookup: [u16; LOOKUP_SIZE],
 }
 
 impl HuffmanTable {
@@ -22,10 +26,30 @@ impl HuffmanTable {
             ));
         }
         validate_code_space(&counts)?;
-        Ok(Self { counts, symbols })
+        let lookup = build_lookup(&counts, &symbols);
+        Ok(Self {
+            counts,
+            symbols,
+            lookup,
+        })
     }
 
     pub(super) fn decode(&self, reader: &mut BitReader<'_>) -> Result<u8> {
+        assert!(self.symbols.len() <= HUFFMAN_SYMBOLS_MAX);
+        assert_eq!(self.counts.len(), HUFFMAN_BITS_MAX);
+
+        if let Some(prefix) = reader.peek_bits(LOOKUP_BITS)? {
+            let entry = self.lookup[usize::from(prefix)];
+            let bit_length = (entry >> 8) as u8;
+            if bit_length > 0 {
+                reader.consume_bits(bit_length);
+                return Ok((entry & LOOKUP_SYMBOL_MASK) as u8);
+            }
+        }
+        self.decode_slow(reader)
+    }
+
+    fn decode_slow(&self, reader: &mut BitReader<'_>) -> Result<u8> {
         assert!(self.symbols.len() <= HUFFMAN_SYMBOLS_MAX);
         assert_eq!(self.counts.len(), HUFFMAN_BITS_MAX);
 
@@ -48,6 +72,35 @@ impl HuffmanTable {
         }
         Err(Error::new("entropy data contains an invalid Huffman code"))
     }
+}
+
+/// Expand codes of eight bits or fewer over every matching prefix. Most JPEG Huffman symbols fit
+/// here, replacing up to eight dependent bit reads and branches with one lookup.
+fn build_lookup(counts: &[u8; HUFFMAN_BITS_MAX], symbols: &[u8]) -> [u16; LOOKUP_SIZE] {
+    assert!(symbols.len() <= HUFFMAN_SYMBOLS_MAX);
+    assert_eq!(counts.len(), HUFFMAN_BITS_MAX);
+
+    let mut lookup = [0_u16; LOOKUP_SIZE];
+    let mut code = 0_u32;
+    let mut symbol_index = 0_usize;
+    for (length_index, count) in counts.iter().copied().enumerate() {
+        let bit_length = length_index as u8 + 1;
+        for _ in 0..count {
+            if bit_length <= LOOKUP_BITS {
+                let suffix_bits = LOOKUP_BITS - bit_length;
+                let start = (code << suffix_bits) as usize;
+                let end = start + (1_usize << suffix_bits);
+                let entry = u16::from(bit_length) << 8 | u16::from(symbols[symbol_index]);
+                assert!(lookup[start..end].iter().all(|value| *value == 0));
+                lookup[start..end].fill(entry);
+            }
+            code += 1;
+            symbol_index += 1;
+        }
+        code <<= 1;
+    }
+    assert_eq!(symbol_index, symbols.len());
+    lookup
 }
 
 fn validate_code_space(counts: &[u8; HUFFMAN_BITS_MAX]) -> Result<()> {
@@ -81,6 +134,18 @@ mod tests {
         let mut reader = BitReader::new(&[0b0101_1000]);
 
         assert_eq!(table.decode(&mut reader).unwrap(), 10);
+        assert_eq!(table.decode(&mut reader).unwrap(), 20);
+        assert_eq!(table.decode(&mut reader).unwrap(), 30);
+    }
+
+    #[test]
+    fn lookup_and_slow_path_decode_the_same_table() {
+        let mut counts = [0; HUFFMAN_BITS_MAX];
+        counts[0] = 1;
+        counts[8] = 2;
+        let table = HuffmanTable::new(counts, vec![10, 20, 30]).unwrap();
+        let mut reader = BitReader::new(&[0b1000_0000, 0b0100_0000, 0b0100_0000]);
+
         assert_eq!(table.decode(&mut reader).unwrap(), 20);
         assert_eq!(table.decode(&mut reader).unwrap(), 30);
     }

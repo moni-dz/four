@@ -1,3 +1,5 @@
+#![feature(portable_simd)]
+
 mod image_formats;
 
 use std::fs;

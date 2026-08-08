@@ -1,0 +1,5 @@
+[toolchain]
+# Portable SIMD is intentionally unstable, so make the nightly requirement explicit.
+channel = "nightly"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
