@@ -20,6 +20,27 @@ impl<'a> Reader<'a> {
         self.bytes.len() - self.offset
     }
 
+    pub(super) fn remaining_slice(&self) -> &'a [u8] {
+        assert!(self.offset <= self.bytes.len());
+        assert_eq!(self.remaining(), self.bytes.len() - self.offset);
+        &self.bytes[self.offset..]
+    }
+
+    pub(super) fn advance(&mut self, length: usize) -> Result<()> {
+        assert!(self.offset <= self.bytes.len());
+        assert!(self.bytes.len() <= isize::MAX as usize);
+
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| Error::new("JPEG input offset overflowed"))?;
+        if end > self.bytes.len() {
+            return Err(Error::new("JPEG input offset extends past the input"));
+        }
+        self.offset = end;
+        Ok(())
+    }
+
     pub(super) fn read_u8(&mut self) -> Result<u8> {
         assert!(self.offset <= self.bytes.len());
         assert!(self.bytes.len() <= isize::MAX as usize);

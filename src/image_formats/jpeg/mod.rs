@@ -1,5 +1,6 @@
 mod huffman;
 mod idct;
+mod progressive;
 mod reader;
 #[cfg(test)]
 mod test_data;
@@ -19,11 +20,14 @@ const COMPONENTS_MAX: usize = 3;
 const DIMENSION_MAX: u32 = 16_384;
 const HUFFMAN_TABLES_MAX: usize = 4;
 const PIXELS_MAX: u64 = 64 * 1024 * 1024;
+const PROGRESSIVE_COEFFICIENT_BYTES_MAX: u64 = 512 * 1024 * 1024;
 const QUANTIZATION_TABLES_MAX: usize = 4;
+const SCANS_MAX: u32 = 4_096;
 
 const MARKER_SOI: u8 = 0xd8;
 const MARKER_EOI: u8 = 0xd9;
 const MARKER_SOF0: u8 = 0xc0;
+const MARKER_SOF2: u8 = 0xc2;
 const MARKER_DHT: u8 = 0xc4;
 const MARKER_DQT: u8 = 0xdb;
 const MARKER_DRI: u8 = 0xdd;
@@ -36,7 +40,7 @@ const ZIGZAG_TO_NATURAL: [usize; 64] = [
     52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
-// These relationships are part of the baseline JPEG grammar, so breaking one is a code defect.
+// These relationships are part of the JPEG DCT grammar, so breaking one is a code defect.
 const _: () = {
     assert!(BLOCK_SIDE == 8);
     assert!(COMPONENTS_MAX == 3);
@@ -73,7 +77,7 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-/// Decode an 8-bit, Huffman-coded baseline JPEG without using an image-decoding crate.
+/// Decode an 8-bit Huffman-coded baseline or progressive JPEG without an image-decoding crate.
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     assert!(bytes.len() <= isize::MAX as usize);
     Parser::new(bytes).decode()
@@ -87,6 +91,8 @@ struct Parser<'a> {
     frame: Option<Frame>,
     restart_interval: u32,
     color_transform: ColorTransform,
+    coefficient_bits: [[Option<u8>; 64]; COMPONENTS_MAX],
+    scan_count: u32,
 }
 
 impl<'a> Parser<'a> {
@@ -100,6 +106,8 @@ impl<'a> Parser<'a> {
             frame: None,
             restart_interval: 0,
             color_transform: ColorTransform::Ycbcr,
+            coefficient_bits: [[None; 64]; COMPONENTS_MAX],
+            scan_count: 0,
         }
     }
 
@@ -110,19 +118,23 @@ impl<'a> Parser<'a> {
         if self.reader.marker()? != MARKER_SOI {
             return Err(Error::new("JPEG does not begin with an SOI marker"));
         }
+        let mut marker = self.reader.marker()?;
         loop {
-            let marker = self.reader.marker()?;
             match marker {
                 MARKER_DQT => self.parse_quantization_tables()?,
-                MARKER_SOF0 => self.parse_frame()?,
+                MARKER_SOF0 => self.parse_frame(CodingProcess::Baseline)?,
+                MARKER_SOF2 => self.parse_frame(CodingProcess::Progressive)?,
                 MARKER_DHT => self.parse_huffman_tables()?,
                 MARKER_DRI => self.parse_restart_interval()?,
-                MARKER_SOS => return self.parse_scan_and_decode(),
+                MARKER_SOS => {
+                    marker = self.parse_scan_and_decode()?;
+                    continue;
+                }
                 0xe0..=0xef => self.parse_application_segment(marker)?,
                 0xfe => self.skip_segment()?,
-                MARKER_EOI => return Err(Error::new("JPEG ended before its first scan")),
+                MARKER_EOI => return self.finish(),
                 MARKER_SOI => return Err(Error::new("duplicate SOI marker")),
-                0xc1..=0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf => {
+                0xc1 | 0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf => {
                     return Err(unsupported_frame_error(marker));
                 }
                 0xcc => return Err(Error::new("arithmetic-coded JPEG is not supported")),
@@ -132,6 +144,7 @@ impl<'a> Parser<'a> {
                     )));
                 }
             }
+            marker = self.reader.marker()?;
         }
     }
 
@@ -201,14 +214,14 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn parse_frame(&mut self) -> Result<()> {
+    fn parse_frame(&mut self, process: CodingProcess) -> Result<()> {
         if self.frame.is_some() {
             return Err(Error::new("multiple JPEG frames are not supported"));
         }
         assert!(self.frame.is_none());
         let mut segment = self.reader.segment()?;
         if segment.read_u8()? != 8 {
-            return Err(Error::new("only 8-bit baseline JPEG samples are supported"));
+            return Err(Error::new("only 8-bit DCT JPEG samples are supported"));
         }
         let height = u32::from(segment.read_u16()?);
         let width = u32::from(segment.read_u16()?);
@@ -224,7 +237,7 @@ impl<'a> Parser<'a> {
         if segment.remaining() != 0 {
             return Err(Error::new("SOF0 segment has trailing bytes"));
         }
-        self.frame = Some(Frame::new(width, height, components)?);
+        self.frame = Some(Frame::new(width, height, components, process)?);
         Ok(())
     }
 
@@ -269,29 +282,61 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn parse_scan_and_decode(mut self) -> Result<DecodedImage> {
+    fn parse_scan_and_decode(&mut self) -> Result<u8> {
+        if self.scan_count >= SCANS_MAX {
+            return Err(Error::new("JPEG contains more than 4096 scans"));
+        }
         let scan = {
             let mut segment = self.reader.segment()?;
             parse_scan_header(&mut segment, self.frame.as_ref())?
         };
-        let mut frame = self
+        let process = self
             .frame
-            .take()
+            .as_ref()
+            .map(|frame| frame.process)
             .ok_or_else(|| Error::new("SOS marker appeared before SOF0"))?;
-        let plans = self.build_scan_plans(&frame, &scan)?;
-        let entropy = self.reader.read_slice(self.reader.remaining())?;
-        let (bytes_consumed, marker) =
-            decode_entropy(entropy, &mut frame, &plans, self.restart_interval)?;
-        if marker != MARKER_EOI {
-            return Err(Error::new(format!(
-                "only one baseline scan is supported; found marker FF{marker:02X}"
-            )));
-        }
-        assert!(bytes_consumed <= entropy.len());
-        frame.into_image(self.color_transform)
+        let result = match process {
+            CodingProcess::Baseline => self.decode_baseline_scan(&scan)?,
+            CodingProcess::Progressive => self.decode_progressive_scan(&scan)?,
+        };
+        let (bytes_consumed, marker) = result;
+        let entropy_length = self.reader.remaining();
+        self.reader.advance(bytes_consumed)?;
+        assert!(bytes_consumed <= entropy_length);
+        self.commit_progression(&scan);
+        self.scan_count += 1;
+        Ok(marker)
     }
 
-    fn build_scan_plans(&self, frame: &Frame, scan: &[ScanComponent]) -> Result<Vec<ScanPlan>> {
+    fn decode_baseline_scan(&mut self, scan: &ScanHeader) -> Result<(usize, u8)> {
+        assert_eq!(
+            scan.components.len(),
+            self.frame.as_ref().unwrap().components.len()
+        );
+        assert!(scan.spectral_start == 0 && scan.spectral_end == 63);
+
+        if self.scan_count != 0 {
+            return Err(Error::new("baseline JPEG contains more than one scan"));
+        }
+        let plans = self.build_scan_plans(&scan.components)?;
+        let entropy = self.reader.remaining_slice();
+        let frame = self.frame.as_mut().expect("frame was checked");
+        decode_entropy(entropy, frame, &plans, self.restart_interval)
+    }
+
+    fn decode_progressive_scan(&mut self, scan: &ScanHeader) -> Result<(usize, u8)> {
+        assert!(scan.spectral_start <= scan.spectral_end);
+        assert!(scan.spectral_end < 64);
+
+        self.validate_progression(scan)?;
+        let plans = self.build_progressive_plans(scan)?;
+        let entropy = self.reader.remaining_slice();
+        let frame = self.frame.as_mut().expect("frame was checked");
+        progressive::decode_scan(entropy, frame, &plans, scan, self.restart_interval)
+    }
+
+    fn build_scan_plans(&self, scan: &[ScanComponent]) -> Result<Vec<ScanPlan>> {
+        let frame = self.frame.as_ref().expect("frame was checked");
         assert!(scan.len() <= COMPONENTS_MAX);
         assert_eq!(scan.len(), frame.components.len());
 
@@ -317,12 +362,111 @@ impl<'a> Parser<'a> {
         }
         Ok(plans)
     }
+
+    fn build_progressive_plans(&self, scan: &ScanHeader) -> Result<Vec<ProgressivePlan>> {
+        let frame = self.frame.as_ref().expect("frame was checked");
+        assert!(scan.components.len() <= COMPONENTS_MAX);
+        assert_eq!(frame.process, CodingProcess::Progressive);
+
+        let mut plans = Vec::with_capacity(scan.components.len());
+        for component in &scan.components {
+            let frame_component = &frame.components[component.frame_index];
+            let dc = if scan.spectral_start == 0 && scan.successive_high == 0 {
+                Some(self.dc_tables[component.dc_table].clone().ok_or_else(|| {
+                    Error::new("progressive DC scan references a missing Huffman table")
+                })?)
+            } else {
+                None
+            };
+            let ac = if scan.spectral_start > 0 {
+                Some(self.ac_tables[component.ac_table].clone().ok_or_else(|| {
+                    Error::new("progressive AC scan references a missing Huffman table")
+                })?)
+            } else {
+                None
+            };
+            plans.push(ProgressivePlan {
+                frame_index: component.frame_index,
+                horizontal_sampling: frame_component.horizontal_sampling,
+                vertical_sampling: frame_component.vertical_sampling,
+                dc,
+                ac,
+            });
+        }
+        Ok(plans)
+    }
+
+    fn validate_progression(&self, scan: &ScanHeader) -> Result<()> {
+        assert!(scan.spectral_start <= scan.spectral_end);
+        assert!(scan.components.len() <= COMPONENTS_MAX);
+
+        for component in &scan.components {
+            if scan.spectral_start > 0 && self.coefficient_bits[component.frame_index][0].is_none()
+            {
+                return Err(Error::new(
+                    "progressive AC scan appeared before its DC scan",
+                ));
+            }
+            for coefficient in scan.spectral_start..=scan.spectral_end {
+                let previous =
+                    self.coefficient_bits[component.frame_index][usize::from(coefficient)];
+                if scan.successive_high == 0 && previous.is_some() {
+                    return Err(Error::new(
+                        "progressive coefficient band was initialized twice",
+                    ));
+                }
+                if scan.successive_high > 0 && previous != Some(scan.successive_high) {
+                    return Err(Error::new(
+                        "progressive refinement has an inconsistent bit order",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn commit_progression(&mut self, scan: &ScanHeader) {
+        assert!(scan.spectral_start <= scan.spectral_end);
+        assert!(scan.components.len() <= COMPONENTS_MAX);
+
+        for component in &scan.components {
+            for coefficient in scan.spectral_start..=scan.spectral_end {
+                self.coefficient_bits[component.frame_index][usize::from(coefficient)] =
+                    Some(scan.successive_low);
+            }
+        }
+    }
+
+    fn finish(mut self) -> Result<DecodedImage> {
+        if self.scan_count == 0 {
+            return Err(Error::new("JPEG ended before its first scan"));
+        }
+        let mut frame = self
+            .frame
+            .take()
+            .ok_or_else(|| Error::new("JPEG ended before defining a frame"))?;
+        if frame.process == CodingProcess::Progressive {
+            for component_index in 0..frame.components.len() {
+                if self.coefficient_bits[component_index][0].is_none() {
+                    return Err(Error::new("progressive JPEG is missing a DC scan"));
+                }
+            }
+            frame.materialize_progressive(&self.quantization_tables)?;
+        }
+        frame.into_image(self.color_transform)
+    }
 }
 
 #[derive(Clone, Copy)]
 enum ColorTransform {
     Ycbcr,
     Rgb,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CodingProcess {
+    Baseline,
+    Progressive,
 }
 
 struct FrameComponent {
@@ -332,6 +476,11 @@ struct FrameComponent {
     quantization_table: usize,
     plane_width: u32,
     plane: Vec<u8>,
+    block_columns: u32,
+    block_rows: u32,
+    data_block_columns: u32,
+    data_block_rows: u32,
+    coefficients: Vec<[i32; 64]>,
 }
 
 struct Frame {
@@ -342,10 +491,16 @@ struct Frame {
     max_horizontal_sampling: u8,
     max_vertical_sampling: u8,
     components: Vec<FrameComponent>,
+    process: CodingProcess,
 }
 
 impl Frame {
-    fn new(width: u32, height: u32, mut components: Vec<FrameComponent>) -> Result<Self> {
+    fn new(
+        width: u32,
+        height: u32,
+        mut components: Vec<FrameComponent>,
+        process: CodingProcess,
+    ) -> Result<Self> {
         assert!(!components.is_empty());
         assert!(components.len() <= COMPONENTS_MAX);
 
@@ -364,8 +519,18 @@ impl Frame {
         let mcu_columns = divide_ceil(width, mcu_width);
         let mcu_rows = divide_ceil(height, mcu_height);
 
+        let storage = ComponentStorageLayout {
+            width,
+            height,
+            mcu_columns,
+            mcu_rows,
+            max_horizontal_sampling,
+            max_vertical_sampling,
+            process,
+        };
+        validate_progressive_storage(&components, &storage)?;
         for component in &mut components {
-            allocate_component_plane(component, mcu_columns, mcu_rows)?;
+            allocate_component_storage(component, &storage)?;
         }
         Ok(Self {
             width,
@@ -375,7 +540,40 @@ impl Frame {
             max_horizontal_sampling,
             max_vertical_sampling,
             components,
+            process,
         })
+    }
+
+    fn materialize_progressive(
+        &mut self,
+        quantization_tables: &[Option<[u16; 64]>; QUANTIZATION_TABLES_MAX],
+    ) -> Result<()> {
+        assert_eq!(self.process, CodingProcess::Progressive);
+        assert!(!self.components.is_empty());
+
+        for component in &mut self.components {
+            let quantization = quantization_tables[component.quantization_table]
+                .ok_or_else(|| Error::new("frame references a missing quantization table"))?;
+            let block_count = component
+                .block_columns
+                .checked_mul(component.block_rows)
+                .ok_or_else(|| Error::new("component block count overflowed"))?;
+            if component.coefficients.len() != block_count as usize {
+                return Err(Error::new(
+                    "progressive coefficient plane has an invalid size",
+                ));
+            }
+            for block_index in 0..block_count {
+                let quantized = component.coefficients[block_index as usize];
+                let coefficients = dequantize_block(&quantized, &quantization)?;
+                let samples = idct::inverse(&coefficients);
+                let block_x = block_index % component.block_columns;
+                let block_y = block_index / component.block_columns;
+                write_block(component, block_x, block_y, &samples);
+            }
+            component.coefficients = Vec::new();
+        }
+        Ok(())
     }
 
     fn into_image(self, transform: ColorTransform) -> Result<DecodedImage> {
@@ -416,10 +614,31 @@ impl Frame {
     }
 }
 
+fn dequantize_block(values: &[i32; 64], quantization: &[u16; 64]) -> Result<[i32; 64]> {
+    assert!(quantization.iter().all(|value| *value > 0));
+    assert!(values.iter().all(|value| value.checked_abs().is_some()));
+
+    let mut coefficients = [0_i32; 64];
+    for index in 0..64 {
+        coefficients[index] = values[index]
+            .checked_mul(i32::from(quantization[index]))
+            .ok_or_else(|| Error::new("dequantized progressive coefficient overflowed"))?;
+    }
+    Ok(coefficients)
+}
+
 struct ScanComponent {
     frame_index: usize,
     dc_table: usize,
     ac_table: usize,
+}
+
+struct ScanHeader {
+    components: Vec<ScanComponent>,
+    spectral_start: u8,
+    spectral_end: u8,
+    successive_high: u8,
+    successive_low: u8,
 }
 
 struct ScanPlan {
@@ -429,6 +648,14 @@ struct ScanPlan {
     quantization: [u16; 64],
     dc: HuffmanTable,
     ac: HuffmanTable,
+}
+
+struct ProgressivePlan {
+    frame_index: usize,
+    horizontal_sampling: u8,
+    vertical_sampling: u8,
+    dc: Option<HuffmanTable>,
+    ac: Option<HuffmanTable>,
 }
 
 fn parse_frame_components(
@@ -470,6 +697,11 @@ fn parse_frame_components(
             quantization_table,
             plane_width: 0,
             plane: Vec::new(),
+            block_columns: 0,
+            block_rows: 0,
+            data_block_columns: 0,
+            data_block_rows: 0,
+            coefficients: Vec::new(),
         });
     }
     if blocks_per_mcu > 10 {
@@ -478,20 +710,15 @@ fn parse_frame_components(
     Ok(components)
 }
 
-fn parse_scan_header(
-    segment: &mut Reader<'_>,
-    frame: Option<&Frame>,
-) -> Result<Vec<ScanComponent>> {
+fn parse_scan_header(segment: &mut Reader<'_>, frame: Option<&Frame>) -> Result<ScanHeader> {
     assert!(frame.is_none_or(|frame| frame.components.len() <= COMPONENTS_MAX));
 
     let frame = frame.ok_or_else(|| Error::new("SOS marker appeared before SOF0"))?;
     let component_count = usize::from(segment.read_u8()?);
-    if component_count != frame.components.len() {
-        return Err(Error::new(
-            "only a single interleaved baseline scan is supported",
-        ));
+    if component_count == 0 || component_count > frame.components.len() {
+        return Err(Error::new("scan component count is out of range"));
     }
-    let mut scan = Vec::with_capacity(component_count);
+    let mut components = Vec::with_capacity(component_count);
     for _ in 0..component_count {
         let identifier = segment.read_u8()?;
         let frame_index = frame
@@ -499,7 +726,7 @@ fn parse_scan_header(
             .iter()
             .position(|component| component.identifier == identifier)
             .ok_or_else(|| Error::new("scan references an unknown frame component"))?;
-        if scan
+        if components
             .iter()
             .any(|component: &ScanComponent| component.frame_index == frame_index)
         {
@@ -511,25 +738,70 @@ fn parse_scan_header(
         if dc_table >= HUFFMAN_TABLES_MAX || ac_table >= HUFFMAN_TABLES_MAX {
             return Err(Error::new("scan Huffman table selector is out of range"));
         }
-        scan.push(ScanComponent {
+        components.push(ScanComponent {
             frame_index,
             dc_table,
             ac_table,
         });
     }
-    validate_scan_range(segment)?;
-    Ok(scan)
-}
-
-fn validate_scan_range(segment: &mut Reader<'_>) -> Result<()> {
     let spectral_start = segment.read_u8()?;
     let spectral_end = segment.read_u8()?;
     let approximation = segment.read_u8()?;
-    if spectral_start != 0 || spectral_end != 63 || approximation != 0 {
-        return Err(Error::new("scan parameters are not baseline sequential"));
-    }
     if segment.remaining() != 0 {
         return Err(Error::new("SOS segment has trailing bytes"));
+    }
+    let header = ScanHeader {
+        components,
+        spectral_start,
+        spectral_end,
+        successive_high: approximation >> 4,
+        successive_low: approximation & 0x0f,
+    };
+    validate_scan_header(&header, frame.process, frame.components.len())?;
+    Ok(header)
+}
+
+fn validate_scan_header(
+    scan: &ScanHeader,
+    process: CodingProcess,
+    frame_component_count: usize,
+) -> Result<()> {
+    assert!(!scan.components.is_empty());
+    assert!(scan.components.len() <= COMPONENTS_MAX);
+
+    if process == CodingProcess::Baseline {
+        let is_full_scan = scan.components.len() == frame_component_count;
+        let is_sequential = scan.spectral_start == 0
+            && scan.spectral_end == 63
+            && scan.successive_high == 0
+            && scan.successive_low == 0;
+        if !is_full_scan || !is_sequential {
+            return Err(Error::new(
+                "baseline JPEG requires one full interleaved scan",
+            ));
+        }
+        return Ok(());
+    }
+    if scan.spectral_start > scan.spectral_end || scan.spectral_end >= 64 {
+        return Err(Error::new("progressive spectral selection is out of range"));
+    }
+    if scan.spectral_start == 0 && scan.spectral_end != 0 {
+        return Err(Error::new(
+            "a progressive DC scan must end at coefficient zero",
+        ));
+    }
+    if scan.spectral_start > 0 && scan.components.len() != 1 {
+        return Err(Error::new(
+            "a progressive AC scan must contain one component",
+        ));
+    }
+    if scan.successive_high > 0 && scan.successive_low + 1 != scan.successive_high {
+        return Err(Error::new(
+            "progressive refinement must advance exactly one bit",
+        ));
+    }
+    if scan.successive_low > 13 {
+        return Err(Error::new("progressive approximation bit exceeds 13"));
     }
     Ok(())
 }
@@ -682,27 +954,98 @@ fn write_block(component: &mut FrameComponent, block_x: u32, block_y: u32, sampl
     }
 }
 
-fn allocate_component_plane(
-    component: &mut FrameComponent,
+struct ComponentStorageLayout {
+    width: u32,
+    height: u32,
     mcu_columns: u32,
     mcu_rows: u32,
+    max_horizontal_sampling: u8,
+    max_vertical_sampling: u8,
+    process: CodingProcess,
+}
+
+fn validate_progressive_storage(
+    components: &[FrameComponent],
+    layout: &ComponentStorageLayout,
+) -> Result<()> {
+    assert!(!components.is_empty());
+    assert!(components.len() <= COMPONENTS_MAX);
+
+    if layout.process == CodingProcess::Baseline {
+        return Ok(());
+    }
+    let mut byte_count = 0_u64;
+    for component in components {
+        let blocks = u64::from(layout.mcu_columns)
+            * u64::from(component.horizontal_sampling)
+            * u64::from(layout.mcu_rows)
+            * u64::from(component.vertical_sampling);
+        let component_bytes = blocks * 64 * size_of::<i32>() as u64;
+        byte_count = byte_count
+            .checked_add(component_bytes)
+            .ok_or_else(|| Error::new("progressive coefficient storage overflowed"))?;
+    }
+    if byte_count > PROGRESSIVE_COEFFICIENT_BYTES_MAX {
+        return Err(Error::new(
+            "progressive coefficient storage exceeds the 512 MiB limit",
+        ));
+    }
+    Ok(())
+}
+
+fn allocate_component_storage(
+    component: &mut FrameComponent,
+    layout: &ComponentStorageLayout,
 ) -> Result<()> {
     assert!(component.plane.is_empty());
     assert!(component.horizontal_sampling > 0);
 
-    let plane_width = mcu_columns
+    let block_columns = layout
+        .mcu_columns
         .checked_mul(u32::from(component.horizontal_sampling))
-        .and_then(|value| value.checked_mul(BLOCK_SIDE))
-        .ok_or_else(|| Error::new("component plane width overflowed"))?;
-    let plane_height = mcu_rows
+        .ok_or_else(|| Error::new("component block width overflowed"))?;
+    let block_rows = layout
+        .mcu_rows
         .checked_mul(u32::from(component.vertical_sampling))
-        .and_then(|value| value.checked_mul(BLOCK_SIDE))
+        .ok_or_else(|| Error::new("component block height overflowed"))?;
+    let plane_width = block_columns
+        .checked_mul(BLOCK_SIDE)
+        .ok_or_else(|| Error::new("component plane width overflowed"))?;
+    let plane_height = block_rows
+        .checked_mul(BLOCK_SIDE)
         .ok_or_else(|| Error::new("component plane height overflowed"))?;
     let sample_count = plane_width
         .checked_mul(plane_height)
         .ok_or_else(|| Error::new("component plane size overflowed"))?;
+    let data_width = layout
+        .width
+        .checked_mul(u32::from(component.horizontal_sampling))
+        .ok_or_else(|| Error::new("component data width overflowed"))?;
+    let data_height = layout
+        .height
+        .checked_mul(u32::from(component.vertical_sampling))
+        .ok_or_else(|| Error::new("component data height overflowed"))?;
+    let data_block_columns = divide_ceil(
+        data_width,
+        u32::from(layout.max_horizontal_sampling) * BLOCK_SIDE,
+    );
+    let data_block_rows = divide_ceil(
+        data_height,
+        u32::from(layout.max_vertical_sampling) * BLOCK_SIDE,
+    );
+
     component.plane_width = plane_width;
     component.plane = vec![0; sample_count as usize];
+    component.block_columns = block_columns;
+    component.block_rows = block_rows;
+    component.data_block_columns = data_block_columns;
+    component.data_block_rows = data_block_rows;
+    if layout.process == CodingProcess::Progressive {
+        let block_count = block_columns
+            .checked_mul(block_rows)
+            .ok_or_else(|| Error::new("component coefficient count overflowed"))?;
+        component.coefficients = vec![[0; 64]; block_count as usize];
+    }
     assert_eq!(component.plane.len(), sample_count as usize);
     Ok(())
 }
@@ -753,9 +1096,8 @@ fn validate_huffman_symbols(class: u8, symbols: &[u8]) -> Result<()> {
             return Err(Error::new("DC Huffman table contains a category above 11"));
         }
         if class == 1 {
-            let run = symbol >> 4;
             let category = symbol & 0x0f;
-            if category > 10 || (category == 0 && run != 0 && run != 15) {
+            if category > 10 {
                 return Err(Error::new("AC Huffman table contains an invalid symbol"));
             }
         }
@@ -767,11 +1109,7 @@ fn unsupported_frame_error(marker: u8) -> Error {
     assert!((0xc1..=0xcf).contains(&marker));
     assert_ne!(marker, MARKER_DHT);
 
-    if marker == 0xc2 {
-        Error::new("progressive JPEG is not supported yet; use an 8-bit baseline JPEG")
-    } else {
-        Error::new(format!("JPEG frame type FF{marker:02X} is not supported"))
-    }
+    Error::new(format!("JPEG frame type FF{marker:02X} is not supported"))
 }
 
 fn divide_ceil(value: u32, divisor: u32) -> u32 {
@@ -785,12 +1123,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_progressive_frame_with_a_specific_error() {
-        let jpeg = [0xff, 0xd8, 0xff, 0xc2];
-        let error = decode(&jpeg).unwrap_err();
+    fn decodes_progressive_spectral_and_refinement_scans() {
+        let jpeg = test_data::progressive_color_jpeg();
+        let image = decode(&jpeg).unwrap();
 
-        assert!(error.to_string().contains("progressive"));
-        assert!(error.to_string().contains("baseline"));
+        assert_eq!(image.dimensions(), (227, 149));
+        assert_eq!(image.rgba8().len(), 227 * 149 * 4);
+        assert_matches_reference_decoder(&jpeg, &image);
     }
 
     #[test]
@@ -846,5 +1185,28 @@ mod tests {
 
         let start = (y * image.width() as usize + x) * 4;
         &image.rgba8()[start..start + 4]
+    }
+
+    fn assert_matches_reference_decoder(jpeg: &[u8], image: &dyn Image) {
+        use std::sync::Arc;
+
+        let reference = gpui::Image::from_bytes(gpui::ImageFormat::Jpeg, jpeg.to_vec());
+        let renderer = gpui::SvgRenderer::new(Arc::new(()));
+        let rendered = reference.to_image_data(renderer).unwrap();
+        let reference_bgra = rendered.as_bytes(0).unwrap();
+        assert_eq!(reference_bgra.len(), image.rgba8().len());
+
+        let (actual_pixels, actual_remainder) = image.rgba8().as_chunks::<4>();
+        let (expected_pixels, expected_remainder) = reference_bgra.as_chunks::<4>();
+        assert!(actual_remainder.is_empty());
+        assert!(expected_remainder.is_empty());
+        let mut error_sum = 0_u64;
+        for (actual, expected) in actual_pixels.iter().zip(expected_pixels) {
+            error_sum += u64::from(actual[0].abs_diff(expected[2]));
+            error_sum += u64::from(actual[1].abs_diff(expected[1]));
+            error_sum += u64::from(actual[2].abs_diff(expected[0]));
+        }
+        let sample_count = u64::from(image.width()) * u64::from(image.height()) * 3;
+        assert!(error_sum / sample_count < 20);
     }
 }

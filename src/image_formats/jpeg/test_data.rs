@@ -17,11 +17,24 @@ const BASELINE_COLOR_JPEG_BASE64: &str = concat!(
 );
 
 pub(super) fn baseline_color_jpeg() -> Vec<u8> {
-    assert_eq!(BASELINE_COLOR_JPEG_BASE64.len() % 4, 0);
-    assert!(!BASELINE_COLOR_JPEG_BASE64.is_empty());
+    decode_base64(BASELINE_COLOR_JPEG_BASE64)
+}
 
-    let mut decoded = Vec::with_capacity(BASELINE_COLOR_JPEG_BASE64.len() / 4 * 3);
-    let (groups, remainder) = BASELINE_COLOR_JPEG_BASE64.as_bytes().as_chunks::<4>();
+pub(super) fn progressive_color_jpeg() -> Vec<u8> {
+    // Official libjpeg-turbo `testout_420_islow_prog.jpg` fixture.
+    decode_base64(include_str!("progressive_fixture.txt"))
+}
+
+pub(super) fn decode_base64(encoded: &str) -> Vec<u8> {
+    assert!(!encoded.is_empty());
+    assert!(encoded.is_ascii());
+
+    let compact: Vec<u8> = encoded
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect();
+    let mut decoded = Vec::with_capacity(compact.len() / 4 * 3);
+    let (groups, remainder) = compact.as_slice().as_chunks::<4>();
     assert!(remainder.is_empty());
     for group in groups {
         let first = u32::from(base64_value(group[0]));

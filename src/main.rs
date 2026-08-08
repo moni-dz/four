@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Context, Image as GpuiImage, ImageFormat, MouseButton, MouseDownEvent,
+    App, Bounds, Context, Image as GPUIImage, ImageFormat, MouseButton, MouseDownEvent,
     PathPromptOptions, Pixels, Point, SharedString, Window, WindowBounds, WindowControlArea,
     WindowOptions, deferred, div, img, prelude::*, px, rgb, size,
 };
@@ -30,13 +30,13 @@ const _: () = {
 };
 
 struct LoadedImage {
-    image: Arc<GpuiImage>,
+    image: Arc<GPUIImage>,
     status: SharedString,
 }
 
 struct Root {
     context_menu_position: Option<Point<Pixels>>,
-    image: Option<Arc<GpuiImage>>,
+    image: Option<Arc<GPUIImage>>,
     status: SharedString,
 }
 
@@ -56,7 +56,7 @@ impl Root {
             None => Self {
                 context_menu_position: None,
                 image: None,
-                status: "Right-click to open a baseline JPEG".into(),
+                status: "Right-click to open a JPEG".into(),
             },
         };
         assert!(root.context_menu_position.is_none());
@@ -87,7 +87,7 @@ impl Root {
             files: true,
             directories: false,
             multiple: false,
-            prompt: Some("Open a baseline JPEG".into()),
+            prompt: Some("Open a JPEG".into()),
         });
         cx.spawn_in(window, async move |root, cx| {
             let path = match paths.await {
@@ -256,7 +256,7 @@ fn load_jpeg(path: &Path) -> Result<LoadedImage, String> {
     let decoded = jpeg::decode(&bytes)
         .map_err(|error| format!("Could not decode {}: {error}", path.display()))?;
     let (width, height) = decoded.dimensions();
-    let image = Arc::new(GpuiImage::from_bytes(
+    let image = Arc::new(GPUIImage::from_bytes(
         ImageFormat::Bmp,
         encode_bmp(&decoded),
     ));
