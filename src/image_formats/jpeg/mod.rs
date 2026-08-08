@@ -1,3 +1,4 @@
+mod arithmetic;
 mod huffman;
 mod idct;
 mod progressive;
@@ -9,6 +10,7 @@ use std::array;
 use std::fmt;
 use std::num::NonZeroU32;
 
+use arithmetic::ConditioningTables;
 use exn::{ErrorExt, OptionExt};
 use huffman::HuffmanTable;
 use reader::{BitReader, Reader};
@@ -30,7 +32,10 @@ const MARKER_SOI: u8 = 0xd8;
 const MARKER_EOI: u8 = 0xd9;
 const MARKER_SOF0: u8 = 0xc0;
 const MARKER_SOF2: u8 = 0xc2;
+const MARKER_SOF9: u8 = 0xc9;
+const MARKER_SOF10: u8 = 0xca;
 const MARKER_DHT: u8 = 0xc4;
+const MARKER_DAC: u8 = 0xcc;
 const MARKER_DQT: u8 = 0xdb;
 const MARKER_DRI: u8 = 0xdd;
 const MARKER_SOS: u8 = 0xda;
@@ -94,6 +99,7 @@ pub enum JPEGLimit {
 /// The table class is retained so applications can identify the broken decoder dependency.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JPEGTableKind {
+    ArithmeticConditioning,
     ACHuffman,
     DCHuffman,
     Huffman,
@@ -104,7 +110,6 @@ pub enum JPEGTableKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedJPEG {
     AdobeColorTransform(u8),
-    ArithmeticCoding,
     ComponentCount(u8),
     FrameType(u8),
     Marker(u8),
@@ -193,9 +198,6 @@ fn write_unsupported_error(
                 "Adobe JPEG color transform {value} is not supported"
             )
         }
-        UnsupportedJPEG::ArithmeticCoding => {
-            formatter.write_str("arithmetic-coded JPEG is not supported")
-        }
         UnsupportedJPEG::ComponentCount(count) => write!(
             formatter,
             "JPEG component count {count} is unsupported; expected one or three"
@@ -213,7 +215,7 @@ fn write_unsupported_error(
     }
 }
 
-/// Decode an 8-bit Huffman-coded baseline or progressive JPEG without an image-decoding crate.
+/// Decode an 8-bit Huffman- or arithmetic-coded sequential or progressive JPEG.
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     assert!(bytes.len() <= isize::MAX as usize);
     Parser::<Headers>::new(bytes).decode()
@@ -227,6 +229,7 @@ struct Parser<'a, State> {
     quantization_tables: [Option<[u16; 64]>; QUANTIZATION_TABLES_MAX],
     dc_tables: [Option<HuffmanTable>; HUFFMAN_TABLES_MAX],
     ac_tables: [Option<HuffmanTable>; HUFFMAN_TABLES_MAX],
+    arithmetic_conditioning: ConditioningTables,
     restart_interval: u32,
     color_transform: ColorTransform,
     state: State,
@@ -237,6 +240,7 @@ struct Headers;
 struct FrameData {
     frame: Frame,
     coefficient_bits: [[Option<u8>; 64]; COMPONENTS_MAX],
+    component_scanned: [bool; COMPONENTS_MAX],
 }
 
 struct FrameReady {
@@ -289,6 +293,7 @@ impl<'a> Parser<'a, Headers> {
             quantization_tables: array::from_fn(|_| None),
             dc_tables: array::from_fn(|_| None),
             ac_tables: array::from_fn(|_| None),
+            arithmetic_conditioning: ConditioningTables::defaults(),
             restart_interval: 0,
             color_transform: ColorTransform::YCbCr,
             state: Headers,
@@ -311,15 +316,26 @@ impl<'a> Parser<'a, Headers> {
                 MARKER_DQT => self.parse_quantization_tables()?,
                 MARKER_SOF0 => {
                     return self
-                        .parse_frame(CodingProcess::Baseline)?
+                        .parse_frame(FrameMode::BaselineHuffman)?
                         .decode_until_first_scan();
                 }
                 MARKER_SOF2 => {
                     return self
-                        .parse_frame(CodingProcess::Progressive)?
+                        .parse_frame(FrameMode::ProgressiveHuffman)?
+                        .decode_until_first_scan();
+                }
+                MARKER_SOF9 => {
+                    return self
+                        .parse_frame(FrameMode::SequentialArithmetic)?
+                        .decode_until_first_scan();
+                }
+                MARKER_SOF10 => {
+                    return self
+                        .parse_frame(FrameMode::ProgressiveArithmetic)?
                         .decode_until_first_scan();
                 }
                 MARKER_DHT => self.parse_huffman_tables()?,
+                MARKER_DAC => self.parse_arithmetic_conditioning()?,
                 MARKER_DRI => self.parse_restart_interval()?,
                 MARKER_SOS => {
                     return Err(error(JPEGError::Frame(
@@ -334,13 +350,8 @@ impl<'a> Parser<'a, Headers> {
                     )));
                 }
                 MARKER_SOI => return Err(error(JPEGError::Marker("duplicate SOI marker"))),
-                0xc1 | 0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf => {
+                0xc1 | 0xc3 | 0xc5..=0xc7 | 0xcb | 0xcd..=0xcf => {
                     return Err(unsupported_frame_error(marker));
-                }
-                0xcc => {
-                    return Err(error(JPEGError::Unsupported(
-                        UnsupportedJPEG::ArithmeticCoding,
-                    )));
                 }
                 _ => return Err(unsupported_marker_error(marker)),
             }
@@ -348,7 +359,7 @@ impl<'a> Parser<'a, Headers> {
         }
     }
 
-    fn parse_frame(mut self, process: CodingProcess) -> Result<Parser<'a, FrameReady>> {
+    fn parse_frame(mut self, mode: FrameMode) -> Result<Parser<'a, FrameReady>> {
         assert_eq!(size_of::<Headers>(), 0);
         assert!(self.reader.remaining() <= isize::MAX as usize);
 
@@ -373,11 +384,12 @@ impl<'a> Parser<'a, Headers> {
         if segment.remaining() != 0 {
             return Err(error(JPEGError::Segment("SOF segment has trailing bytes")));
         }
-        let frame = Frame::new(width, height, components, process)?;
+        let frame = Frame::new(width, height, components, mode)?;
         Ok(self.map_state(|_headers| FrameReady {
             data: FrameData {
                 frame,
                 coefficient_bits: [[None; 64]; COMPONENTS_MAX],
+                component_scanned: [false; COMPONENTS_MAX],
             },
         }))
     }
@@ -397,6 +409,7 @@ impl<'a, State> Parser<'a, State> {
             quantization_tables: self.quantization_tables,
             dc_tables: self.dc_tables,
             ac_tables: self.ac_tables,
+            arithmetic_conditioning: self.arithmetic_conditioning,
             restart_interval: self.restart_interval,
             color_transform: self.color_transform,
             state,
@@ -483,6 +496,58 @@ impl<'a, State> Parser<'a, State> {
         Ok(())
     }
 
+    fn parse_arithmetic_conditioning(&mut self) -> Result<()> {
+        assert_eq!(self.arithmetic_conditioning.dc.len(), HUFFMAN_TABLES_MAX);
+        assert_eq!(self.arithmetic_conditioning.ac.len(), HUFFMAN_TABLES_MAX);
+
+        let mut segment = self.reader.segment()?;
+        if segment.remaining() == 0 || segment.remaining() % 2 != 0 {
+            return Err(error(JPEGError::Table(
+                JPEGTableKind::ArithmeticConditioning,
+                "DAC segment must contain one or more descriptor-value pairs",
+            )));
+        }
+        while segment.remaining() > 0 {
+            let descriptor = segment.read_u8()?;
+            let class = descriptor >> 4;
+            let table = usize::from(descriptor & 0x0f);
+            let value = segment.read_u8()?;
+            if class > 1 {
+                return Err(error(JPEGError::Table(
+                    JPEGTableKind::ArithmeticConditioning,
+                    "arithmetic conditioning table class is invalid",
+                )));
+            }
+            if table >= HUFFMAN_TABLES_MAX {
+                return Err(error(JPEGError::Table(
+                    JPEGTableKind::ArithmeticConditioning,
+                    "arithmetic conditioning table identifier is out of range",
+                )));
+            }
+            if class == 0 {
+                let lower = value & 0x0f;
+                let upper = value >> 4;
+                if lower > upper {
+                    return Err(error(JPEGError::Table(
+                        JPEGTableKind::ArithmeticConditioning,
+                        "DC arithmetic conditioning requires L <= U",
+                    )));
+                }
+                self.arithmetic_conditioning.dc[table] =
+                    arithmetic::DCConditioning { lower, upper };
+            } else {
+                if !(1..=63).contains(&value) {
+                    return Err(error(JPEGError::Table(
+                        JPEGTableKind::ArithmeticConditioning,
+                        "AC arithmetic conditioning must be in 1..=63",
+                    )));
+                }
+                self.arithmetic_conditioning.ac[table] = value;
+            }
+        }
+        Ok(())
+    }
+
     fn parse_restart_interval(&mut self) -> Result<()> {
         assert!(self.restart_interval <= u32::from(u16::MAX));
         assert!(self.reader.remaining() <= isize::MAX as usize);
@@ -533,6 +598,7 @@ impl<'a> Parser<'a, FrameReady> {
             self.state.data.coefficient_bits,
             [[None; 64]; COMPONENTS_MAX]
         );
+        assert_eq!(self.state.data.component_scanned, [false; COMPONENTS_MAX]);
         assert!(!self.state.data.frame.components.is_empty());
 
         let mut marker = self.reader.marker()?;
@@ -540,6 +606,7 @@ impl<'a> Parser<'a, FrameReady> {
             match marker {
                 MARKER_DQT => self.parse_quantization_tables()?,
                 MARKER_DHT => self.parse_huffman_tables()?,
+                MARKER_DAC => self.parse_arithmetic_conditioning()?,
                 MARKER_DRI => self.parse_restart_interval()?,
                 MARKER_SOS => {
                     let next_marker = self.parse_scan_and_decode(0)?;
@@ -555,18 +622,13 @@ impl<'a> Parser<'a, FrameReady> {
                     return Err(error(JPEGError::Scan("JPEG ended before its first scan")));
                 }
                 MARKER_SOI => return Err(error(JPEGError::Marker("duplicate SOI marker"))),
-                MARKER_SOF0 | MARKER_SOF2 => {
+                MARKER_SOF0 | MARKER_SOF2 | MARKER_SOF9 | MARKER_SOF10 => {
                     return Err(error(JPEGError::Frame(
                         "multiple JPEG frames are not supported",
                     )));
                 }
-                0xc1 | 0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf => {
+                0xc1 | 0xc3 | 0xc5..=0xc7 | 0xcb | 0xcd..=0xcf => {
                     return Err(unsupported_frame_error(marker));
-                }
-                0xcc => {
-                    return Err(error(JPEGError::Unsupported(
-                        UnsupportedJPEG::ArithmeticCoding,
-                    )));
                 }
                 _ => return Err(unsupported_marker_error(marker)),
             }
@@ -584,6 +646,7 @@ impl<'a> Parser<'a, Scanned> {
             match marker {
                 MARKER_DQT => self.parse_quantization_tables()?,
                 MARKER_DHT => self.parse_huffman_tables()?,
+                MARKER_DAC => self.parse_arithmetic_conditioning()?,
                 MARKER_DRI => self.parse_restart_interval()?,
                 MARKER_SOS => {
                     marker = self.parse_scan_and_decode(self.state.scan_count.get())?;
@@ -598,18 +661,13 @@ impl<'a> Parser<'a, Scanned> {
                 0xfe => self.skip_segment()?,
                 MARKER_EOI => return self.finish(),
                 MARKER_SOI => return Err(error(JPEGError::Marker("duplicate SOI marker"))),
-                MARKER_SOF0 | MARKER_SOF2 => {
+                MARKER_SOF0 | MARKER_SOF2 | MARKER_SOF9 | MARKER_SOF10 => {
                     return Err(error(JPEGError::Frame(
                         "multiple JPEG frames are not supported",
                     )));
                 }
-                0xc1 | 0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf => {
+                0xc1 | 0xc3 | 0xc5..=0xc7 | 0xcb | 0xcd..=0xcf => {
                     return Err(unsupported_frame_error(marker));
-                }
-                0xcc => {
-                    return Err(error(JPEGError::Unsupported(
-                        UnsupportedJPEG::ArithmeticCoding,
-                    )));
                 }
                 _ => return Err(unsupported_marker_error(marker)),
             }
@@ -622,7 +680,7 @@ impl<'a> Parser<'a, Scanned> {
         assert!(!self.state.data.frame.components.is_empty());
 
         let mut frame = self.state.data.frame;
-        if frame.process == CodingProcess::Progressive {
+        if frame.mode.process() == CodingProcess::Progressive {
             for component_index in 0..frame.components.len() {
                 if self.state.data.coefficient_bits[component_index][0].is_none() {
                     return Err(error(JPEGError::Scan(
@@ -631,6 +689,14 @@ impl<'a> Parser<'a, Scanned> {
                 }
             }
             frame.materialize_progressive(&self.quantization_tables)?;
+        } else {
+            for component_index in 0..frame.components.len() {
+                if !self.state.data.component_scanned[component_index] {
+                    return Err(error(JPEGError::Scan(
+                        "sequential JPEG is missing a component scan",
+                    )));
+                }
+            }
         }
         frame.into_image(self.color_transform)
     }
@@ -645,22 +711,39 @@ impl<'a, State: FramePhase> Parser<'a, State> {
             let mut segment = self.reader.segment()?;
             parse_scan_header(&mut segment, &self.state.data().frame)?
         };
-        let result = match self.state.data().frame.process {
-            CodingProcess::Baseline => self.decode_baseline_scan(&scan, scan_count)?,
-            CodingProcess::Progressive => self.decode_progressive_scan(&scan)?,
+        let mode = self.state.data().frame.mode;
+        let result = match mode {
+            FrameMode::BaselineHuffman => self.decode_huffman_sequential_scan(&scan, scan_count)?,
+            FrameMode::SequentialArithmetic => self.decode_arithmetic_sequential_scan(&scan)?,
+            FrameMode::ProgressiveHuffman => self.decode_huffman_progressive_scan(&scan)?,
+            FrameMode::ProgressiveArithmetic => self.decode_arithmetic_progressive_scan(&scan)?,
         };
         let (bytes_consumed, marker) = result;
         let entropy_length = self.reader.remaining();
         self.reader.advance(bytes_consumed)?;
         assert!(bytes_consumed <= entropy_length);
-        self.commit_progression(&scan);
+        if mode.process() == CodingProcess::Progressive {
+            self.commit_progression(&scan);
+        } else {
+            for component in &scan.components {
+                self.state.data_mut().component_scanned[component.frame_index] = true;
+            }
+        }
         Ok(marker)
     }
 
-    fn decode_baseline_scan(&mut self, scan: &ScanHeader, scan_count: u32) -> Result<(usize, u8)> {
+    fn decode_huffman_sequential_scan(
+        &mut self,
+        scan: &ScanHeader,
+        scan_count: u32,
+    ) -> Result<(usize, u8)> {
         assert_eq!(
             scan.components.len(),
             self.state.data().frame.components.len()
+        );
+        assert_eq!(
+            self.state.data().frame.mode.entropy(),
+            EntropyCoding::Huffman
         );
         assert!(scan.spectral_start == 0 && scan.spectral_end == 63);
 
@@ -675,15 +758,64 @@ impl<'a, State: FramePhase> Parser<'a, State> {
         decode_entropy(entropy, frame, &plans, self.restart_interval)
     }
 
-    fn decode_progressive_scan(&mut self, scan: &ScanHeader) -> Result<(usize, u8)> {
+    fn decode_arithmetic_sequential_scan(&mut self, scan: &ScanHeader) -> Result<(usize, u8)> {
+        assert!(!scan.components.is_empty());
+        assert!(scan.components.len() <= COMPONENTS_MAX);
+        assert_eq!(
+            self.state.data().frame.mode.entropy(),
+            EntropyCoding::Arithmetic
+        );
+
+        for component in &scan.components {
+            if self.state.data().component_scanned[component.frame_index] {
+                return Err(error(JPEGError::Scan(
+                    "sequential arithmetic component was decoded twice",
+                )));
+            }
+        }
+        let plans = self.build_arithmetic_sequential_plans(&scan.components)?;
+        let entropy = self.reader.remaining_slice();
+        let conditioning = self.arithmetic_conditioning;
+        let frame = &mut self.state.data_mut().frame;
+        arithmetic::decode_sequential(entropy, frame, &plans, &conditioning, self.restart_interval)
+    }
+
+    fn decode_huffman_progressive_scan(&mut self, scan: &ScanHeader) -> Result<(usize, u8)> {
         assert!(scan.spectral_start <= scan.spectral_end);
         assert!(scan.spectral_end < 64);
+        assert_eq!(
+            self.state.data().frame.mode.entropy(),
+            EntropyCoding::Huffman
+        );
 
         self.validate_progression(scan)?;
         let plans = self.build_progressive_plans(scan)?;
         let entropy = self.reader.remaining_slice();
         let frame = &mut self.state.data_mut().frame;
         progressive::decode_scan(entropy, frame, &plans, scan, self.restart_interval)
+    }
+
+    fn decode_arithmetic_progressive_scan(&mut self, scan: &ScanHeader) -> Result<(usize, u8)> {
+        assert!(scan.spectral_start <= scan.spectral_end);
+        assert!(scan.spectral_end < 64);
+        assert_eq!(
+            self.state.data().frame.mode.entropy(),
+            EntropyCoding::Arithmetic
+        );
+
+        self.validate_progression(scan)?;
+        let plans = self.build_arithmetic_progressive_plans(scan);
+        let entropy = self.reader.remaining_slice();
+        let conditioning = self.arithmetic_conditioning;
+        let frame = &mut self.state.data_mut().frame;
+        arithmetic::decode_progressive(
+            entropy,
+            frame,
+            &plans,
+            scan,
+            &conditioning,
+            self.restart_interval,
+        )
     }
 
     fn build_scan_plans(&self, scan: &[ScanComponent]) -> Result<Vec<ScanPlan>> {
@@ -725,10 +857,62 @@ impl<'a, State: FramePhase> Parser<'a, State> {
         Ok(plans)
     }
 
+    fn build_arithmetic_sequential_plans(
+        &self,
+        scan: &[ScanComponent],
+    ) -> Result<Vec<arithmetic::SequentialPlan>> {
+        let frame = &self.state.data().frame;
+        assert!(!scan.is_empty());
+        assert!(scan.len() <= COMPONENTS_MAX);
+
+        let mut plans = Vec::with_capacity(scan.len());
+        for component in scan {
+            let frame_component = &frame.components[component.frame_index];
+            let quantization = self.quantization_tables[frame_component.quantization_table]
+                .ok_or_raise(|| {
+                    JPEGError::Table(
+                        JPEGTableKind::Quantization,
+                        "arithmetic scan references a missing quantization table",
+                    )
+                })?;
+            plans.push(arithmetic::SequentialPlan {
+                frame_index: component.frame_index,
+                horizontal_sampling: frame_component.horizontal_sampling,
+                vertical_sampling: frame_component.vertical_sampling,
+                quantization,
+                dc_table: component.dc_table,
+                ac_table: component.ac_table,
+            });
+        }
+        Ok(plans)
+    }
+
+    fn build_arithmetic_progressive_plans(
+        &self,
+        scan: &ScanHeader,
+    ) -> Vec<arithmetic::ProgressivePlan> {
+        let frame = &self.state.data().frame;
+        assert!(!scan.components.is_empty());
+        assert!(scan.components.len() <= COMPONENTS_MAX);
+
+        let mut plans = Vec::with_capacity(scan.components.len());
+        for component in &scan.components {
+            let frame_component = &frame.components[component.frame_index];
+            plans.push(arithmetic::ProgressivePlan {
+                frame_index: component.frame_index,
+                horizontal_sampling: frame_component.horizontal_sampling,
+                vertical_sampling: frame_component.vertical_sampling,
+                dc_table: component.dc_table,
+                ac_table: component.ac_table,
+            });
+        }
+        plans
+    }
+
     fn build_progressive_plans(&self, scan: &ScanHeader) -> Result<Vec<ProgressivePlan>> {
         let frame = &self.state.data().frame;
         assert!(scan.components.len() <= COMPONENTS_MAX);
-        assert_eq!(frame.process, CodingProcess::Progressive);
+        assert_eq!(frame.mode.process(), CodingProcess::Progressive);
 
         let mut plans = Vec::with_capacity(scan.components.len());
         for component in &scan.components {
@@ -819,8 +1003,40 @@ enum ColorTransform {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum CodingProcess {
-    Baseline,
+    Sequential,
     Progressive,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EntropyCoding {
+    Huffman,
+    Arithmetic,
+}
+
+// The marker grammar admits exactly these four DCT modes. A single sum type prevents invalid
+// combinations such as baseline arithmetic coding from leaking into scan dispatch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameMode {
+    BaselineHuffman,
+    SequentialArithmetic,
+    ProgressiveHuffman,
+    ProgressiveArithmetic,
+}
+
+impl FrameMode {
+    const fn process(self) -> CodingProcess {
+        match self {
+            Self::BaselineHuffman | Self::SequentialArithmetic => CodingProcess::Sequential,
+            Self::ProgressiveHuffman | Self::ProgressiveArithmetic => CodingProcess::Progressive,
+        }
+    }
+
+    const fn entropy(self) -> EntropyCoding {
+        match self {
+            Self::BaselineHuffman | Self::ProgressiveHuffman => EntropyCoding::Huffman,
+            Self::SequentialArithmetic | Self::ProgressiveArithmetic => EntropyCoding::Arithmetic,
+        }
+    }
 }
 
 struct FrameComponent {
@@ -845,7 +1061,7 @@ struct Frame {
     max_horizontal_sampling: u8,
     max_vertical_sampling: u8,
     components: Vec<FrameComponent>,
-    process: CodingProcess,
+    mode: FrameMode,
 }
 
 impl Frame {
@@ -853,7 +1069,7 @@ impl Frame {
         width: u32,
         height: u32,
         mut components: Vec<FrameComponent>,
-        process: CodingProcess,
+        mode: FrameMode,
     ) -> Result<Self> {
         assert!(!components.is_empty());
         assert!(components.len() <= COMPONENTS_MAX);
@@ -880,7 +1096,7 @@ impl Frame {
             mcu_rows,
             max_horizontal_sampling,
             max_vertical_sampling,
-            process,
+            process: mode.process(),
         };
         validate_progressive_storage(&components, &storage)?;
         for component in &mut components {
@@ -894,7 +1110,7 @@ impl Frame {
             max_horizontal_sampling,
             max_vertical_sampling,
             components,
-            process,
+            mode,
         })
     }
 
@@ -902,7 +1118,7 @@ impl Frame {
         &mut self,
         quantization_tables: &[Option<[u16; 64]>; QUANTIZATION_TABLES_MAX],
     ) -> Result<()> {
-        assert_eq!(self.process, CodingProcess::Progressive);
+        assert_eq!(self.mode.process(), CodingProcess::Progressive);
         assert!(!self.components.is_empty());
 
         for component in &mut self.components {
@@ -1117,7 +1333,7 @@ fn parse_scan_header(segment: &mut Reader<'_>, frame: &Frame) -> Result<ScanHead
         let ac_table = usize::from(selectors & 0x0f);
         if dc_table >= HUFFMAN_TABLES_MAX || ac_table >= HUFFMAN_TABLES_MAX {
             return Err(error(JPEGError::Scan(
-                "scan Huffman table selector is out of range",
+                "scan entropy table selector is out of range",
             )));
         }
         components.push(ScanComponent {
@@ -1139,25 +1355,30 @@ fn parse_scan_header(segment: &mut Reader<'_>, frame: &Frame) -> Result<ScanHead
         successive_high: approximation >> 4,
         successive_low: approximation & 0x0f,
     };
-    validate_scan_header(&header, frame.process, frame.components.len())?;
+    validate_scan_header(&header, frame.mode, frame.components.len())?;
     Ok(header)
 }
 
 fn validate_scan_header(
     scan: &ScanHeader,
-    process: CodingProcess,
+    mode: FrameMode,
     frame_component_count: usize,
 ) -> Result<()> {
     assert!(!scan.components.is_empty());
     assert!(scan.components.len() <= COMPONENTS_MAX);
 
-    if process == CodingProcess::Baseline {
+    if mode.process() == CodingProcess::Sequential {
         let is_full_scan = scan.components.len() == frame_component_count;
         let is_sequential = scan.spectral_start == 0
             && scan.spectral_end == 63
             && scan.successive_high == 0
             && scan.successive_low == 0;
-        if !is_full_scan || !is_sequential {
+        if !is_sequential {
+            return Err(error(JPEGError::Scan(
+                "sequential JPEG scan parameters are invalid",
+            )));
+        }
+        if mode == FrameMode::BaselineHuffman && !is_full_scan {
             return Err(error(JPEGError::Scan(
                 "baseline JPEG requires one full interleaved scan",
             )));
@@ -1363,7 +1584,7 @@ fn validate_progressive_storage(
     assert!(!components.is_empty());
     assert!(components.len() <= COMPONENTS_MAX);
 
-    if layout.process == CodingProcess::Baseline {
+    if layout.process == CodingProcess::Sequential {
         return Ok(());
     }
     let mut byte_count = 0_u64;
@@ -1535,6 +1756,70 @@ mod tests {
         assert_eq!(image.dimensions(), (227, 149));
         assert_eq!(image.rgba8().len(), 227 * 149 * 4);
         assert_matches_reference_decoder(&jpeg, &image);
+    }
+
+    #[test]
+    fn decodes_sequential_arithmetic_scans() {
+        // This is libjpeg-turbo's arithmetic-coded interoperability fixture. Using an
+        // independently produced stream guards the QM state transitions and the JPEG
+        // coefficient contexts together; testing either layer alone would miss their seam.
+        let jpeg = test_data::sequential_arithmetic_jpeg();
+        let image = decode(&jpeg).unwrap();
+        let huffman = decode(&test_data::progressive_color_jpeg()).unwrap();
+
+        assert_eq!(image.dimensions(), (227, 149));
+        assert_eq!(image.rgba8().len(), 227 * 149 * 4);
+        // Both official fixtures were encoded from the same source with the same
+        // quantization. Their pixels must agree even though every entropy path differs.
+        assert_eq!(image.rgba8(), huffman.rgba8());
+    }
+
+    #[test]
+    fn decodes_progressive_arithmetic_refinement_scans() {
+        // The arithmetic and Huffman fixtures use the same source, DCT, scan script,
+        // sampling, and quantization. Equality therefore verifies SOF10 first-pass and
+        // refinement contexts without allowing the shared color pipeline any tolerance.
+        let jpeg = test_data::progressive_arithmetic_jpeg();
+        let image = decode(&jpeg).unwrap();
+        let huffman = decode(&test_data::progressive_color_jpeg()).unwrap();
+
+        assert_eq!(image.dimensions(), (227, 149));
+        assert_eq!(image.rgba8().len(), 227 * 149 * 4);
+        assert_eq!(image.rgba8(), huffman.rgba8());
+    }
+
+    #[test]
+    fn rejects_an_inverted_dc_arithmetic_conditioning_range() {
+        // L=1 and U=0 cannot describe a DC magnitude interval. Reject it at DAC so
+        // corrupt context thresholds never enter the entropy decoder.
+        let jpeg = [0xff, 0xd8, 0xff, 0xcc, 0x00, 0x04, 0x00, 0x01];
+        let error = decode(&jpeg).unwrap_err();
+
+        assert_eq!(
+            &*error,
+            &JPEGError::Table(
+                JPEGTableKind::ArithmeticConditioning,
+                "DC arithmetic conditioning requires L <= U",
+            )
+        );
+        assert!(error.to_string().contains("L <= U"));
+    }
+
+    #[test]
+    fn rejects_a_zero_ac_arithmetic_conditioning_value() {
+        // K=0 is outside the standard's 1..=63 interval and would collapse the
+        // AC magnitude-context split, so it is an input error rather than a default.
+        let jpeg = [0xff, 0xd8, 0xff, 0xcc, 0x00, 0x04, 0x10, 0x00];
+        let error = decode(&jpeg).unwrap_err();
+
+        assert_eq!(
+            &*error,
+            &JPEGError::Table(
+                JPEGTableKind::ArithmeticConditioning,
+                "AC arithmetic conditioning must be in 1..=63",
+            )
+        );
+        assert!(error.to_string().contains("1..=63"));
     }
 
     #[test]
