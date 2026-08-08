@@ -7,7 +7,9 @@ mod test_data;
 
 use std::array;
 use std::fmt;
+use std::num::NonZeroU32;
 
+use exn::{ErrorExt, OptionExt};
 use huffman::HuffmanTable;
 use reader::{BitReader, Reader};
 
@@ -48,54 +50,238 @@ const _: () = {
     assert!(HUFFMAN_TABLES_MAX == 4);
     assert!(QUANTIZATION_TABLES_MAX == HUFFMAN_TABLES_MAX);
     assert!(PIXELS_MAX >= DIMENSION_MAX as u64);
+    assert!(size_of::<NonZeroU32>() == size_of::<u32>());
     assert!(ZIGZAG_TO_NATURAL.len() == 64);
 };
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Error = exn::Exn<JPEGError>;
+pub type Result<T> = exn::Result<T, JPEGError>;
 
+/// A decoder failure classified by the JPEG grammar section that rejected the input.
+///
+/// Keeping the classification in the type lets callers choose a recovery policy without parsing
+/// display text. Static detail strings retain precise diagnostics without allocating on an error
+/// path, while values that callers may need are stored in dedicated variants below.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Error {
-    message: String,
+pub enum JPEGError {
+    ArithmeticOverflow(&'static str),
+    Entropy(&'static str),
+    ExpectedMarkerPrefix { context: &'static str, found: u8 },
+    Frame(&'static str),
+    LimitExceeded(JPEGLimit),
+    Marker(&'static str),
+    RestartMarkerMismatch { expected: u8, found: u8 },
+    Scan(&'static str),
+    Segment(&'static str),
+    Table(JPEGTableKind, &'static str),
+    UnexpectedEntropyMarker(u8),
+    UnexpectedEnd(&'static str),
+    UnexpectedMarker { context: &'static str, found: u8 },
+    Unsupported(UnsupportedJPEG),
 }
 
-impl Error {
-    fn new(message: impl Into<String>) -> Self {
-        let message = message.into();
-        assert!(!message.is_empty());
-        assert!(message.len() <= 1024);
-        Self { message }
-    }
+/// A bounded resource whose configured maximum was exceeded by the input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JPEGLimit {
+    Dimensions(u32),
+    FrameDataUnits(u8),
+    HuffmanSymbols(u16),
+    Pixels(u64),
+    ProgressiveCoefficientBytes(u64),
+    Scans(u32),
 }
 
-impl fmt::Display for Error {
+/// The table class is retained so applications can identify the broken decoder dependency.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JPEGTableKind {
+    ACHuffman,
+    DCHuffman,
+    Huffman,
+    Quantization,
+}
+
+/// A valid JPEG feature that this deliberately small decoder does not implement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnsupportedJPEG {
+    AdobeColorTransform(u8),
+    ArithmeticCoding,
+    ComponentCount(u8),
+    FrameType(u8),
+    Marker(u8),
+    SamplePrecision(u8),
+}
+
+impl fmt::Display for JPEGError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        assert!(!self.message.is_empty());
-        assert!(self.message.len() <= 1024);
-        formatter.write_str(&self.message)
+        match self {
+            Self::ArithmeticOverflow(detail)
+            | Self::Entropy(detail)
+            | Self::Frame(detail)
+            | Self::Marker(detail)
+            | Self::Scan(detail)
+            | Self::Segment(detail)
+            | Self::Table(_, detail)
+            | Self::UnexpectedEnd(detail) => formatter.write_str(detail),
+            Self::ExpectedMarkerPrefix { context, found } => {
+                write!(
+                    formatter,
+                    "expected a JPEG marker FF prefix {context}, found {found:02X}"
+                )
+            }
+            Self::LimitExceeded(limit) => write_limit_error(formatter, *limit),
+            Self::RestartMarkerMismatch { expected, found } => write!(
+                formatter,
+                "expected restart marker FF{expected:02X}, found FF{found:02X}"
+            ),
+            Self::UnexpectedEntropyMarker(marker) => {
+                write!(
+                    formatter,
+                    "unexpected marker FF{marker:02X} inside entropy data"
+                )
+            }
+            Self::UnexpectedMarker { context, found } => {
+                write!(formatter, "expected {context}, found FF{found:02X}")
+            }
+            Self::Unsupported(feature) => write_unsupported_error(formatter, *feature),
+        }
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for JPEGError {}
+
+/// Raise a leaf JPEG error at its actual validation site so `exn` records a useful location.
+#[track_caller]
+fn error(error: JPEGError) -> Error {
+    assert!(!error.to_string().is_empty());
+    assert!(size_of::<JPEGError>() > 0);
+    error.raise()
+}
+
+fn write_limit_error(formatter: &mut fmt::Formatter<'_>, limit: JPEGLimit) -> fmt::Result {
+    match limit {
+        JPEGLimit::Dimensions(max) => {
+            write!(formatter, "JPEG dimensions exceed the {max}-pixel limit")
+        }
+        JPEGLimit::FrameDataUnits(max) => {
+            write!(formatter, "frame has more than {max} data units per MCU")
+        }
+        JPEGLimit::HuffmanSymbols(max) => {
+            write!(formatter, "Huffman table has more than {max} symbols")
+        }
+        JPEGLimit::Pixels(max) => write!(
+            formatter,
+            "JPEG pixel count exceeds the {}-megapixel limit",
+            max / 1024 / 1024
+        ),
+        JPEGLimit::ProgressiveCoefficientBytes(max) => write!(
+            formatter,
+            "progressive coefficient storage exceeds the {} MiB limit",
+            max / 1024 / 1024
+        ),
+        JPEGLimit::Scans(max) => write!(formatter, "JPEG contains more than {max} scans"),
+    }
+}
+
+fn write_unsupported_error(
+    formatter: &mut fmt::Formatter<'_>,
+    feature: UnsupportedJPEG,
+) -> fmt::Result {
+    match feature {
+        UnsupportedJPEG::AdobeColorTransform(value) => {
+            write!(
+                formatter,
+                "Adobe JPEG color transform {value} is not supported"
+            )
+        }
+        UnsupportedJPEG::ArithmeticCoding => {
+            formatter.write_str("arithmetic-coded JPEG is not supported")
+        }
+        UnsupportedJPEG::ComponentCount(count) => write!(
+            formatter,
+            "JPEG component count {count} is unsupported; expected one or three"
+        ),
+        UnsupportedJPEG::FrameType(marker) => {
+            write!(formatter, "JPEG frame type FF{marker:02X} is not supported")
+        }
+        UnsupportedJPEG::Marker(marker) => {
+            write!(formatter, "unsupported JPEG marker FF{marker:02X}")
+        }
+        UnsupportedJPEG::SamplePrecision(precision) => write!(
+            formatter,
+            "JPEG sample precision {precision} is unsupported; expected 8"
+        ),
+    }
+}
 
 /// Decode an 8-bit Huffman-coded baseline or progressive JPEG without an image-decoding crate.
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     assert!(bytes.len() <= isize::MAX as usize);
-    Parser::new(bytes).decode()
+    Parser::<Headers>::new(bytes).decode()
 }
 
-struct Parser<'a> {
+// The parser phases make it impossible to decode entropy before a frame exists or to produce an
+// image before at least one scan has completed. JPEG table presence stays dynamic because the file
+// format permits tables to be redefined between scans; that is input state, not parser lifecycle.
+struct Parser<'a, State> {
     reader: Reader<'a>,
     quantization_tables: [Option<[u16; 64]>; QUANTIZATION_TABLES_MAX],
     dc_tables: [Option<HuffmanTable>; HUFFMAN_TABLES_MAX],
     ac_tables: [Option<HuffmanTable>; HUFFMAN_TABLES_MAX],
-    frame: Option<Frame>,
     restart_interval: u32,
     color_transform: ColorTransform,
-    coefficient_bits: [[Option<u8>; 64]; COMPONENTS_MAX],
-    scan_count: u32,
+    state: State,
 }
 
-impl<'a> Parser<'a> {
+struct Headers;
+
+struct FrameData {
+    frame: Frame,
+    coefficient_bits: [[Option<u8>; 64]; COMPONENTS_MAX],
+}
+
+struct FrameReady {
+    data: FrameData,
+}
+
+struct Scanned {
+    data: FrameData,
+    scan_count: NonZeroU32,
+}
+
+trait FramePhase {
+    fn data(&self) -> &FrameData;
+    fn data_mut(&mut self) -> &mut FrameData;
+}
+
+impl FramePhase for FrameReady {
+    fn data(&self) -> &FrameData {
+        assert!(!self.data.frame.components.is_empty());
+        assert!(self.data.frame.components.len() <= COMPONENTS_MAX);
+        &self.data
+    }
+
+    fn data_mut(&mut self) -> &mut FrameData {
+        assert!(!self.data.frame.components.is_empty());
+        assert!(self.data.frame.components.len() <= COMPONENTS_MAX);
+        &mut self.data
+    }
+}
+
+impl FramePhase for Scanned {
+    fn data(&self) -> &FrameData {
+        assert!(self.scan_count.get() <= SCANS_MAX);
+        assert!(!self.data.frame.components.is_empty());
+        &self.data
+    }
+
+    fn data_mut(&mut self) -> &mut FrameData {
+        assert!(self.scan_count.get() <= SCANS_MAX);
+        assert!(!self.data.frame.components.is_empty());
+        &mut self.data
+    }
+}
+
+impl<'a> Parser<'a, Headers> {
     fn new(bytes: &'a [u8]) -> Self {
         assert!(bytes.len() <= isize::MAX as usize);
         Self {
@@ -103,48 +289,117 @@ impl<'a> Parser<'a> {
             quantization_tables: array::from_fn(|_| None),
             dc_tables: array::from_fn(|_| None),
             ac_tables: array::from_fn(|_| None),
-            frame: None,
             restart_interval: 0,
-            color_transform: ColorTransform::Ycbcr,
-            coefficient_bits: [[None; 64]; COMPONENTS_MAX],
-            scan_count: 0,
+            color_transform: ColorTransform::YCbCr,
+            state: Headers,
         }
     }
 
     fn decode(mut self) -> Result<DecodedImage> {
-        assert!(self.frame.is_none());
         assert_eq!(self.restart_interval, 0);
 
-        if self.reader.marker()? != MARKER_SOI {
-            return Err(Error::new("JPEG does not begin with an SOI marker"));
+        let first_marker = self.reader.marker()?;
+        if first_marker != MARKER_SOI {
+            return Err(error(JPEGError::UnexpectedMarker {
+                context: "an SOI marker",
+                found: first_marker,
+            }));
         }
         let mut marker = self.reader.marker()?;
         loop {
             match marker {
                 MARKER_DQT => self.parse_quantization_tables()?,
-                MARKER_SOF0 => self.parse_frame(CodingProcess::Baseline)?,
-                MARKER_SOF2 => self.parse_frame(CodingProcess::Progressive)?,
+                MARKER_SOF0 => {
+                    return self
+                        .parse_frame(CodingProcess::Baseline)?
+                        .decode_until_first_scan();
+                }
+                MARKER_SOF2 => {
+                    return self
+                        .parse_frame(CodingProcess::Progressive)?
+                        .decode_until_first_scan();
+                }
                 MARKER_DHT => self.parse_huffman_tables()?,
                 MARKER_DRI => self.parse_restart_interval()?,
                 MARKER_SOS => {
-                    marker = self.parse_scan_and_decode()?;
-                    continue;
+                    return Err(error(JPEGError::Frame(
+                        "SOS marker appeared before a frame",
+                    )));
                 }
                 0xe0..=0xef => self.parse_application_segment(marker)?,
                 0xfe => self.skip_segment()?,
-                MARKER_EOI => return self.finish(),
-                MARKER_SOI => return Err(Error::new("duplicate SOI marker")),
+                MARKER_EOI => {
+                    return Err(error(JPEGError::Frame(
+                        "JPEG ended before defining a frame",
+                    )));
+                }
+                MARKER_SOI => return Err(error(JPEGError::Marker("duplicate SOI marker"))),
                 0xc1 | 0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf => {
                     return Err(unsupported_frame_error(marker));
                 }
-                0xcc => return Err(Error::new("arithmetic-coded JPEG is not supported")),
-                _ => {
-                    return Err(Error::new(format!(
-                        "unsupported JPEG marker FF{marker:02X}"
+                0xcc => {
+                    return Err(error(JPEGError::Unsupported(
+                        UnsupportedJPEG::ArithmeticCoding,
                     )));
                 }
+                _ => return Err(unsupported_marker_error(marker)),
             }
             marker = self.reader.marker()?;
+        }
+    }
+
+    fn parse_frame(mut self, process: CodingProcess) -> Result<Parser<'a, FrameReady>> {
+        assert_eq!(size_of::<Headers>(), 0);
+        assert!(self.reader.remaining() <= isize::MAX as usize);
+
+        let mut segment = self.reader.segment()?;
+        let precision = segment.read_u8()?;
+        if precision != 8 {
+            return Err(error(JPEGError::Unsupported(
+                UnsupportedJPEG::SamplePrecision(precision),
+            )));
+        }
+        let height = u32::from(segment.read_u16()?);
+        let width = u32::from(segment.read_u16()?);
+        validate_dimensions(width, height)?;
+        let component_count = usize::from(segment.read_u8()?);
+        if component_count != 1 && component_count != 3 {
+            return Err(error(JPEGError::Unsupported(
+                UnsupportedJPEG::ComponentCount(component_count as u8),
+            )));
+        }
+
+        let components = parse_frame_components(&mut segment, component_count)?;
+        if segment.remaining() != 0 {
+            return Err(error(JPEGError::Segment("SOF segment has trailing bytes")));
+        }
+        let frame = Frame::new(width, height, components, process)?;
+        Ok(self.map_state(|_headers| FrameReady {
+            data: FrameData {
+                frame,
+                coefficient_bits: [[None; 64]; COMPONENTS_MAX],
+            },
+        }))
+    }
+}
+
+impl<'a, State> Parser<'a, State> {
+    fn map_state<NextState>(
+        self,
+        transition: impl FnOnce(State) -> NextState,
+    ) -> Parser<'a, NextState> {
+        assert!(self.reader.remaining() <= isize::MAX as usize);
+        assert!(self.restart_interval <= u32::from(u16::MAX));
+
+        let state = transition(self.state);
+        Parser {
+            reader: self.reader,
+            quantization_tables: self.quantization_tables,
+            dc_tables: self.dc_tables,
+            ac_tables: self.ac_tables,
+            restart_interval: self.restart_interval,
+            color_transform: self.color_transform,
+            state,
         }
     }
 
@@ -158,10 +413,16 @@ impl<'a> Parser<'a> {
             let precision = descriptor >> 4;
             let table_index = usize::from(descriptor & 0x0f);
             if table_index >= QUANTIZATION_TABLES_MAX {
-                return Err(Error::new("quantization table index is out of range"));
+                return Err(error(JPEGError::Table(
+                    JPEGTableKind::Quantization,
+                    "quantization table index is out of range",
+                )));
             }
             if precision > 1 {
-                return Err(Error::new("quantization table precision is invalid"));
+                return Err(error(JPEGError::Table(
+                    JPEGTableKind::Quantization,
+                    "quantization table precision is invalid",
+                )));
             }
 
             let mut table = [0_u16; 64];
@@ -172,7 +433,10 @@ impl<'a> Parser<'a> {
                     segment.read_u16()?
                 };
                 if value == 0 {
-                    return Err(Error::new("quantization table contains a zero value"));
+                    return Err(error(JPEGError::Table(
+                        JPEGTableKind::Quantization,
+                        "quantization table contains a zero value",
+                    )));
                 }
                 table[natural_index] = value;
             }
@@ -191,7 +455,10 @@ impl<'a> Parser<'a> {
             let class = descriptor >> 4;
             let table_index = usize::from(descriptor & 0x0f);
             if class > 1 || table_index >= HUFFMAN_TABLES_MAX {
-                return Err(Error::new("Huffman table descriptor is invalid"));
+                return Err(error(JPEGError::Table(
+                    JPEGTableKind::Huffman,
+                    "Huffman table descriptor is invalid",
+                )));
             }
 
             let mut counts = [0_u8; 16];
@@ -200,7 +467,9 @@ impl<'a> Parser<'a> {
             }
             let symbol_count: usize = counts.iter().map(|count| usize::from(*count)).sum();
             if symbol_count > 256 {
-                return Err(Error::new("Huffman table has more than 256 symbols"));
+                return Err(error(JPEGError::LimitExceeded(JPEGLimit::HuffmanSymbols(
+                    256,
+                ))));
             }
             let symbols = segment.read_slice(symbol_count)?.to_vec();
             validate_huffman_symbols(class, &symbols)?;
@@ -214,40 +483,15 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
-    fn parse_frame(&mut self, process: CodingProcess) -> Result<()> {
-        if self.frame.is_some() {
-            return Err(Error::new("multiple JPEG frames are not supported"));
-        }
-        assert!(self.frame.is_none());
-        let mut segment = self.reader.segment()?;
-        if segment.read_u8()? != 8 {
-            return Err(Error::new("only 8-bit DCT JPEG samples are supported"));
-        }
-        let height = u32::from(segment.read_u16()?);
-        let width = u32::from(segment.read_u16()?);
-        validate_dimensions(width, height)?;
-        let component_count = usize::from(segment.read_u8()?);
-        if component_count != 1 && component_count != 3 {
-            return Err(Error::new(
-                "only grayscale and three-component JPEGs are supported",
-            ));
-        }
-
-        let components = parse_frame_components(&mut segment, component_count)?;
-        if segment.remaining() != 0 {
-            return Err(Error::new("SOF0 segment has trailing bytes"));
-        }
-        self.frame = Some(Frame::new(width, height, components, process)?);
-        Ok(())
-    }
-
     fn parse_restart_interval(&mut self) -> Result<()> {
         assert!(self.restart_interval <= u32::from(u16::MAX));
         assert!(self.reader.remaining() <= isize::MAX as usize);
 
         let mut segment = self.reader.segment()?;
         if segment.remaining() != 2 {
-            return Err(Error::new("DRI segment must contain exactly two bytes"));
+            return Err(error(JPEGError::Segment(
+                "DRI segment must contain exactly two bytes",
+            )));
         }
         self.restart_interval = u32::from(segment.read_u16()?);
         Ok(())
@@ -260,15 +504,15 @@ impl<'a> Parser<'a> {
         let mut segment = self.reader.segment()?;
         let bytes = segment.read_slice(segment.remaining())?;
         if marker == 0xe0 && bytes.starts_with(b"JFIF\0") {
-            self.color_transform = ColorTransform::Ycbcr;
+            self.color_transform = ColorTransform::YCbCr;
         }
         if marker == 0xee && bytes.starts_with(b"Adobe") && bytes.len() >= 12 {
             self.color_transform = match bytes[11] {
                 0 => ColorTransform::Rgb,
-                1 => ColorTransform::Ycbcr,
+                1 => ColorTransform::YCbCr,
                 value => {
-                    return Err(Error::new(format!(
-                        "Adobe JPEG color transform {value} is not supported"
+                    return Err(error(JPEGError::Unsupported(
+                        UnsupportedJPEG::AdobeColorTransform(value),
                     )));
                 }
             };
@@ -281,22 +525,128 @@ impl<'a> Parser<'a> {
         segment.read_slice(segment.remaining())?;
         Ok(())
     }
+}
 
-    fn parse_scan_and_decode(&mut self) -> Result<u8> {
-        if self.scan_count >= SCANS_MAX {
-            return Err(Error::new("JPEG contains more than 4096 scans"));
+impl<'a> Parser<'a, FrameReady> {
+    fn decode_until_first_scan(mut self) -> Result<DecodedImage> {
+        assert_eq!(
+            self.state.data.coefficient_bits,
+            [[None; 64]; COMPONENTS_MAX]
+        );
+        assert!(!self.state.data.frame.components.is_empty());
+
+        let mut marker = self.reader.marker()?;
+        loop {
+            match marker {
+                MARKER_DQT => self.parse_quantization_tables()?,
+                MARKER_DHT => self.parse_huffman_tables()?,
+                MARKER_DRI => self.parse_restart_interval()?,
+                MARKER_SOS => {
+                    let next_marker = self.parse_scan_and_decode(0)?;
+                    let parser = self.map_state(|ready| Scanned {
+                        data: ready.data,
+                        scan_count: NonZeroU32::MIN,
+                    });
+                    return parser.decode_after_scan(next_marker);
+                }
+                0xe0..=0xef => self.parse_application_segment(marker)?,
+                0xfe => self.skip_segment()?,
+                MARKER_EOI => {
+                    return Err(error(JPEGError::Scan("JPEG ended before its first scan")));
+                }
+                MARKER_SOI => return Err(error(JPEGError::Marker("duplicate SOI marker"))),
+                MARKER_SOF0 | MARKER_SOF2 => {
+                    return Err(error(JPEGError::Frame(
+                        "multiple JPEG frames are not supported",
+                    )));
+                }
+                0xc1 | 0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf => {
+                    return Err(unsupported_frame_error(marker));
+                }
+                0xcc => {
+                    return Err(error(JPEGError::Unsupported(
+                        UnsupportedJPEG::ArithmeticCoding,
+                    )));
+                }
+                _ => return Err(unsupported_marker_error(marker)),
+            }
+            marker = self.reader.marker()?;
+        }
+    }
+}
+
+impl<'a> Parser<'a, Scanned> {
+    fn decode_after_scan(mut self, mut marker: u8) -> Result<DecodedImage> {
+        assert!(self.state.scan_count.get() <= SCANS_MAX);
+        assert!(!self.state.data.frame.components.is_empty());
+
+        loop {
+            match marker {
+                MARKER_DQT => self.parse_quantization_tables()?,
+                MARKER_DHT => self.parse_huffman_tables()?,
+                MARKER_DRI => self.parse_restart_interval()?,
+                MARKER_SOS => {
+                    marker = self.parse_scan_and_decode(self.state.scan_count.get())?;
+                    self.state.scan_count = self
+                        .state
+                        .scan_count
+                        .checked_add(1)
+                        .expect("scan count was bounded before incrementing");
+                    continue;
+                }
+                0xe0..=0xef => self.parse_application_segment(marker)?,
+                0xfe => self.skip_segment()?,
+                MARKER_EOI => return self.finish(),
+                MARKER_SOI => return Err(error(JPEGError::Marker("duplicate SOI marker"))),
+                MARKER_SOF0 | MARKER_SOF2 => {
+                    return Err(error(JPEGError::Frame(
+                        "multiple JPEG frames are not supported",
+                    )));
+                }
+                0xc1 | 0xc3 | 0xc5..=0xc7 | 0xc9..=0xcb | 0xcd..=0xcf => {
+                    return Err(unsupported_frame_error(marker));
+                }
+                0xcc => {
+                    return Err(error(JPEGError::Unsupported(
+                        UnsupportedJPEG::ArithmeticCoding,
+                    )));
+                }
+                _ => return Err(unsupported_marker_error(marker)),
+            }
+            marker = self.reader.marker()?;
+        }
+    }
+
+    fn finish(self) -> Result<DecodedImage> {
+        assert!(self.state.scan_count.get() <= SCANS_MAX);
+        assert!(!self.state.data.frame.components.is_empty());
+
+        let mut frame = self.state.data.frame;
+        if frame.process == CodingProcess::Progressive {
+            for component_index in 0..frame.components.len() {
+                if self.state.data.coefficient_bits[component_index][0].is_none() {
+                    return Err(error(JPEGError::Scan(
+                        "progressive JPEG is missing a DC scan",
+                    )));
+                }
+            }
+            frame.materialize_progressive(&self.quantization_tables)?;
+        }
+        frame.into_image(self.color_transform)
+    }
+}
+
+impl<'a, State: FramePhase> Parser<'a, State> {
+    fn parse_scan_and_decode(&mut self, scan_count: u32) -> Result<u8> {
+        if scan_count >= SCANS_MAX {
+            return Err(error(JPEGError::LimitExceeded(JPEGLimit::Scans(SCANS_MAX))));
         }
         let scan = {
             let mut segment = self.reader.segment()?;
-            parse_scan_header(&mut segment, self.frame.as_ref())?
+            parse_scan_header(&mut segment, &self.state.data().frame)?
         };
-        let process = self
-            .frame
-            .as_ref()
-            .map(|frame| frame.process)
-            .ok_or_else(|| Error::new("SOS marker appeared before SOF0"))?;
-        let result = match process {
-            CodingProcess::Baseline => self.decode_baseline_scan(&scan)?,
+        let result = match self.state.data().frame.process {
+            CodingProcess::Baseline => self.decode_baseline_scan(&scan, scan_count)?,
             CodingProcess::Progressive => self.decode_progressive_scan(&scan)?,
         };
         let (bytes_consumed, marker) = result;
@@ -304,23 +654,24 @@ impl<'a> Parser<'a> {
         self.reader.advance(bytes_consumed)?;
         assert!(bytes_consumed <= entropy_length);
         self.commit_progression(&scan);
-        self.scan_count += 1;
         Ok(marker)
     }
 
-    fn decode_baseline_scan(&mut self, scan: &ScanHeader) -> Result<(usize, u8)> {
+    fn decode_baseline_scan(&mut self, scan: &ScanHeader, scan_count: u32) -> Result<(usize, u8)> {
         assert_eq!(
             scan.components.len(),
-            self.frame.as_ref().unwrap().components.len()
+            self.state.data().frame.components.len()
         );
         assert!(scan.spectral_start == 0 && scan.spectral_end == 63);
 
-        if self.scan_count != 0 {
-            return Err(Error::new("baseline JPEG contains more than one scan"));
+        if scan_count != 0 {
+            return Err(error(JPEGError::Scan(
+                "baseline JPEG contains more than one scan",
+            )));
         }
         let plans = self.build_scan_plans(&scan.components)?;
         let entropy = self.reader.remaining_slice();
-        let frame = self.frame.as_mut().expect("frame was checked");
+        let frame = &mut self.state.data_mut().frame;
         decode_entropy(entropy, frame, &plans, self.restart_interval)
     }
 
@@ -331,12 +682,12 @@ impl<'a> Parser<'a> {
         self.validate_progression(scan)?;
         let plans = self.build_progressive_plans(scan)?;
         let entropy = self.reader.remaining_slice();
-        let frame = self.frame.as_mut().expect("frame was checked");
+        let frame = &mut self.state.data_mut().frame;
         progressive::decode_scan(entropy, frame, &plans, scan, self.restart_interval)
     }
 
     fn build_scan_plans(&self, scan: &[ScanComponent]) -> Result<Vec<ScanPlan>> {
-        let frame = self.frame.as_ref().expect("frame was checked");
+        let frame = &self.state.data().frame;
         assert!(scan.len() <= COMPONENTS_MAX);
         assert_eq!(scan.len(), frame.components.len());
 
@@ -344,13 +695,24 @@ impl<'a> Parser<'a> {
         for component in scan {
             let frame_component = &frame.components[component.frame_index];
             let quantization = self.quantization_tables[frame_component.quantization_table]
-                .ok_or_else(|| Error::new("scan references a missing quantization table"))?;
-            let dc = self.dc_tables[component.dc_table]
-                .clone()
-                .ok_or_else(|| Error::new("scan references a missing DC Huffman table"))?;
-            let ac = self.ac_tables[component.ac_table]
-                .clone()
-                .ok_or_else(|| Error::new("scan references a missing AC Huffman table"))?;
+                .ok_or_raise(|| {
+                    JPEGError::Table(
+                        JPEGTableKind::Quantization,
+                        "scan references a missing quantization table",
+                    )
+                })?;
+            let dc = self.dc_tables[component.dc_table].clone().ok_or_raise(|| {
+                JPEGError::Table(
+                    JPEGTableKind::DCHuffman,
+                    "scan references a missing DC Huffman table",
+                )
+            })?;
+            let ac = self.ac_tables[component.ac_table].clone().ok_or_raise(|| {
+                JPEGError::Table(
+                    JPEGTableKind::ACHuffman,
+                    "scan references a missing AC Huffman table",
+                )
+            })?;
             plans.push(ScanPlan {
                 frame_index: component.frame_index,
                 horizontal_sampling: frame_component.horizontal_sampling,
@@ -364,33 +726,43 @@ impl<'a> Parser<'a> {
     }
 
     fn build_progressive_plans(&self, scan: &ScanHeader) -> Result<Vec<ProgressivePlan>> {
-        let frame = self.frame.as_ref().expect("frame was checked");
+        let frame = &self.state.data().frame;
         assert!(scan.components.len() <= COMPONENTS_MAX);
         assert_eq!(frame.process, CodingProcess::Progressive);
 
         let mut plans = Vec::with_capacity(scan.components.len());
         for component in &scan.components {
             let frame_component = &frame.components[component.frame_index];
-            let dc = if scan.spectral_start == 0 && scan.successive_high == 0 {
-                Some(self.dc_tables[component.dc_table].clone().ok_or_else(|| {
-                    Error::new("progressive DC scan references a missing Huffman table")
-                })?)
+            let entropy = if scan.spectral_start == 0 {
+                if scan.successive_high == 0 {
+                    let table = self.dc_tables[component.dc_table].clone().ok_or_raise(|| {
+                        JPEGError::Table(
+                            JPEGTableKind::DCHuffman,
+                            "progressive DC scan references a missing Huffman table",
+                        )
+                    })?;
+                    ProgressiveEntropy::DCFirst(table)
+                } else {
+                    ProgressiveEntropy::DCRefinement
+                }
             } else {
-                None
-            };
-            let ac = if scan.spectral_start > 0 {
-                Some(self.ac_tables[component.ac_table].clone().ok_or_else(|| {
-                    Error::new("progressive AC scan references a missing Huffman table")
-                })?)
-            } else {
-                None
+                let table = self.ac_tables[component.ac_table].clone().ok_or_raise(|| {
+                    JPEGError::Table(
+                        JPEGTableKind::ACHuffman,
+                        "progressive AC scan references a missing Huffman table",
+                    )
+                })?;
+                if scan.successive_high == 0 {
+                    ProgressiveEntropy::ACFirst(table)
+                } else {
+                    ProgressiveEntropy::ACRefinement(table)
+                }
             };
             plans.push(ProgressivePlan {
                 frame_index: component.frame_index,
                 horizontal_sampling: frame_component.horizontal_sampling,
                 vertical_sampling: frame_component.vertical_sampling,
-                dc,
-                ac,
+                entropy,
             });
         }
         Ok(plans)
@@ -401,24 +773,25 @@ impl<'a> Parser<'a> {
         assert!(scan.components.len() <= COMPONENTS_MAX);
 
         for component in &scan.components {
-            if scan.spectral_start > 0 && self.coefficient_bits[component.frame_index][0].is_none()
+            if scan.spectral_start > 0
+                && self.state.data().coefficient_bits[component.frame_index][0].is_none()
             {
-                return Err(Error::new(
+                return Err(error(JPEGError::Scan(
                     "progressive AC scan appeared before its DC scan",
-                ));
+                )));
             }
             for coefficient in scan.spectral_start..=scan.spectral_end {
-                let previous =
-                    self.coefficient_bits[component.frame_index][usize::from(coefficient)];
+                let previous = self.state.data().coefficient_bits[component.frame_index]
+                    [usize::from(coefficient)];
                 if scan.successive_high == 0 && previous.is_some() {
-                    return Err(Error::new(
+                    return Err(error(JPEGError::Scan(
                         "progressive coefficient band was initialized twice",
-                    ));
+                    )));
                 }
                 if scan.successive_high > 0 && previous != Some(scan.successive_high) {
-                    return Err(Error::new(
+                    return Err(error(JPEGError::Scan(
                         "progressive refinement has an inconsistent bit order",
-                    ));
+                    )));
                 }
             }
         }
@@ -431,35 +804,16 @@ impl<'a> Parser<'a> {
 
         for component in &scan.components {
             for coefficient in scan.spectral_start..=scan.spectral_end {
-                self.coefficient_bits[component.frame_index][usize::from(coefficient)] =
-                    Some(scan.successive_low);
+                self.state.data_mut().coefficient_bits[component.frame_index]
+                    [usize::from(coefficient)] = Some(scan.successive_low);
             }
         }
-    }
-
-    fn finish(mut self) -> Result<DecodedImage> {
-        if self.scan_count == 0 {
-            return Err(Error::new("JPEG ended before its first scan"));
-        }
-        let mut frame = self
-            .frame
-            .take()
-            .ok_or_else(|| Error::new("JPEG ended before defining a frame"))?;
-        if frame.process == CodingProcess::Progressive {
-            for component_index in 0..frame.components.len() {
-                if self.coefficient_bits[component_index][0].is_none() {
-                    return Err(Error::new("progressive JPEG is missing a DC scan"));
-                }
-            }
-            frame.materialize_progressive(&self.quantization_tables)?;
-        }
-        frame.into_image(self.color_transform)
     }
 }
 
 #[derive(Clone, Copy)]
 enum ColorTransform {
-    Ycbcr,
+    YCbCr,
     Rgb,
 }
 
@@ -552,16 +906,23 @@ impl Frame {
         assert!(!self.components.is_empty());
 
         for component in &mut self.components {
-            let quantization = quantization_tables[component.quantization_table]
-                .ok_or_else(|| Error::new("frame references a missing quantization table"))?;
+            let quantization =
+                quantization_tables[component.quantization_table].ok_or_raise(|| {
+                    JPEGError::Table(
+                        JPEGTableKind::Quantization,
+                        "frame references a missing quantization table",
+                    )
+                })?;
             let block_count = component
                 .block_columns
                 .checked_mul(component.block_rows)
-                .ok_or_else(|| Error::new("component block count overflowed"))?;
+                .ok_or_raise(|| {
+                    JPEGError::ArithmeticOverflow("component block count overflowed")
+                })?;
             if component.coefficients.len() != block_count as usize {
-                return Err(Error::new(
+                return Err(error(JPEGError::Frame(
                     "progressive coefficient plane has an invalid size",
-                ));
+                )));
             }
             for block_index in 0..block_count {
                 let quantized = component.coefficients[block_index as usize];
@@ -622,7 +983,9 @@ fn dequantize_block(values: &[i32; 64], quantization: &[u16; 64]) -> Result<[i32
     for index in 0..64 {
         coefficients[index] = values[index]
             .checked_mul(i32::from(quantization[index]))
-            .ok_or_else(|| Error::new("dequantized progressive coefficient overflowed"))?;
+            .ok_or_raise(|| {
+                JPEGError::ArithmeticOverflow("dequantized progressive coefficient overflowed")
+            })?;
     }
     Ok(coefficients)
 }
@@ -654,8 +1017,16 @@ struct ProgressivePlan {
     frame_index: usize,
     horizontal_sampling: u8,
     vertical_sampling: u8,
-    dc: Option<HuffmanTable>,
-    ac: Option<HuffmanTable>,
+    entropy: ProgressiveEntropy,
+}
+
+// Scan mode is selected by untrusted input, so an exhaustive sum type is the boundary equivalent
+// of type-state. Every mode owns exactly the Huffman table it can consume.
+enum ProgressiveEntropy {
+    DCFirst(HuffmanTable),
+    DCRefinement,
+    ACFirst(HuffmanTable),
+    ACRefinement(HuffmanTable),
 }
 
 fn parse_frame_components(
@@ -673,22 +1044,25 @@ fn parse_frame_components(
             .iter()
             .any(|component: &FrameComponent| component.identifier == identifier)
         {
-            return Err(Error::new("frame contains duplicate component identifiers"));
+            return Err(error(JPEGError::Frame(
+                "frame contains duplicate component identifiers",
+            )));
         }
         let sampling = segment.read_u8()?;
         let horizontal_sampling = sampling >> 4;
         let vertical_sampling = sampling & 0x0f;
         if !(1..=4).contains(&horizontal_sampling) || !(1..=4).contains(&vertical_sampling) {
-            return Err(Error::new(
+            return Err(error(JPEGError::Frame(
                 "component sampling factor is outside 1 through 4",
-            ));
+            )));
         }
         blocks_per_mcu += u32::from(horizontal_sampling) * u32::from(vertical_sampling);
         let quantization_table = usize::from(segment.read_u8()?);
         if quantization_table >= QUANTIZATION_TABLES_MAX {
-            return Err(Error::new(
+            return Err(error(JPEGError::Table(
+                JPEGTableKind::Quantization,
                 "component quantization table index is out of range",
-            ));
+            )));
         }
         components.push(FrameComponent {
             identifier,
@@ -705,18 +1079,22 @@ fn parse_frame_components(
         });
     }
     if blocks_per_mcu > 10 {
-        return Err(Error::new("frame has more than ten data units per MCU"));
+        return Err(error(JPEGError::LimitExceeded(JPEGLimit::FrameDataUnits(
+            10,
+        ))));
     }
     Ok(components)
 }
 
-fn parse_scan_header(segment: &mut Reader<'_>, frame: Option<&Frame>) -> Result<ScanHeader> {
-    assert!(frame.is_none_or(|frame| frame.components.len() <= COMPONENTS_MAX));
+fn parse_scan_header(segment: &mut Reader<'_>, frame: &Frame) -> Result<ScanHeader> {
+    assert!(!frame.components.is_empty());
+    assert!(frame.components.len() <= COMPONENTS_MAX);
 
-    let frame = frame.ok_or_else(|| Error::new("SOS marker appeared before SOF0"))?;
     let component_count = usize::from(segment.read_u8()?);
     if component_count == 0 || component_count > frame.components.len() {
-        return Err(Error::new("scan component count is out of range"));
+        return Err(error(JPEGError::Scan(
+            "scan component count is out of range",
+        )));
     }
     let mut components = Vec::with_capacity(component_count);
     for _ in 0..component_count {
@@ -725,18 +1103,22 @@ fn parse_scan_header(segment: &mut Reader<'_>, frame: Option<&Frame>) -> Result<
             .components
             .iter()
             .position(|component| component.identifier == identifier)
-            .ok_or_else(|| Error::new("scan references an unknown frame component"))?;
+            .ok_or_raise(|| JPEGError::Scan("scan references an unknown frame component"))?;
         if components
             .iter()
             .any(|component: &ScanComponent| component.frame_index == frame_index)
         {
-            return Err(Error::new("scan contains a duplicate component"));
+            return Err(error(JPEGError::Scan(
+                "scan contains a duplicate component",
+            )));
         }
         let selectors = segment.read_u8()?;
         let dc_table = usize::from(selectors >> 4);
         let ac_table = usize::from(selectors & 0x0f);
         if dc_table >= HUFFMAN_TABLES_MAX || ac_table >= HUFFMAN_TABLES_MAX {
-            return Err(Error::new("scan Huffman table selector is out of range"));
+            return Err(error(JPEGError::Scan(
+                "scan Huffman table selector is out of range",
+            )));
         }
         components.push(ScanComponent {
             frame_index,
@@ -748,7 +1130,7 @@ fn parse_scan_header(segment: &mut Reader<'_>, frame: Option<&Frame>) -> Result<
     let spectral_end = segment.read_u8()?;
     let approximation = segment.read_u8()?;
     if segment.remaining() != 0 {
-        return Err(Error::new("SOS segment has trailing bytes"));
+        return Err(error(JPEGError::Segment("SOS segment has trailing bytes")));
     }
     let header = ScanHeader {
         components,
@@ -776,32 +1158,36 @@ fn validate_scan_header(
             && scan.successive_high == 0
             && scan.successive_low == 0;
         if !is_full_scan || !is_sequential {
-            return Err(Error::new(
+            return Err(error(JPEGError::Scan(
                 "baseline JPEG requires one full interleaved scan",
-            ));
+            )));
         }
         return Ok(());
     }
     if scan.spectral_start > scan.spectral_end || scan.spectral_end >= 64 {
-        return Err(Error::new("progressive spectral selection is out of range"));
+        return Err(error(JPEGError::Scan(
+            "progressive spectral selection is out of range",
+        )));
     }
     if scan.spectral_start == 0 && scan.spectral_end != 0 {
-        return Err(Error::new(
+        return Err(error(JPEGError::Scan(
             "a progressive DC scan must end at coefficient zero",
-        ));
+        )));
     }
     if scan.spectral_start > 0 && scan.components.len() != 1 {
-        return Err(Error::new(
+        return Err(error(JPEGError::Scan(
             "a progressive AC scan must contain one component",
-        ));
+        )));
     }
     if scan.successive_high > 0 && scan.successive_low + 1 != scan.successive_high {
-        return Err(Error::new(
+        return Err(error(JPEGError::Scan(
             "progressive refinement must advance exactly one bit",
-        ));
+        )));
     }
     if scan.successive_low > 13 {
-        return Err(Error::new("progressive approximation bit exceeds 13"));
+        return Err(error(JPEGError::Scan(
+            "progressive approximation bit exceeds 13",
+        )));
     }
     Ok(())
 }
@@ -818,7 +1204,7 @@ fn decode_entropy(
     let mcu_count = frame
         .mcu_columns
         .checked_mul(frame.mcu_rows)
-        .ok_or_else(|| Error::new("MCU count overflowed"))?;
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("MCU count overflowed"))?;
     let mut reader = BitReader::new(entropy);
     let mut dc_predictors = [0_i32; COMPONENTS_MAX];
     let mut restart_index = 0_u8;
@@ -875,17 +1261,17 @@ fn decode_block(
     let mut coefficients = [0_i32; 64];
     let dc_category = plan.dc.decode(reader)?;
     if dc_category > 11 {
-        return Err(Error::new(
+        return Err(error(JPEGError::Entropy(
             "baseline DC coefficient category exceeds 11 bits",
-        ));
+        )));
     }
     let dc_difference = receive_extend(reader, dc_category)?;
     *dc_predictor = dc_predictor
         .checked_add(dc_difference)
-        .ok_or_else(|| Error::new("DC predictor overflowed"))?;
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("DC predictor overflowed"))?;
     coefficients[0] = dc_predictor
         .checked_mul(i32::from(plan.quantization[0]))
-        .ok_or_else(|| Error::new("dequantized DC coefficient overflowed"))?;
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("dequantized DC coefficient overflowed"))?;
 
     let mut zigzag_index = 1_usize;
     while zigzag_index < 64 {
@@ -897,25 +1283,31 @@ fn decode_block(
                 break;
             }
             if zero_run != 15 {
-                return Err(Error::new("invalid zero-size AC Huffman symbol"));
+                return Err(error(JPEGError::Entropy(
+                    "invalid zero-size AC Huffman symbol",
+                )));
             }
             zigzag_index += 16;
             continue;
         }
         if category > 10 {
-            return Err(Error::new(
+            return Err(error(JPEGError::Entropy(
                 "baseline AC coefficient category exceeds 10 bits",
-            ));
+            )));
         }
         zigzag_index += zero_run;
         if zigzag_index >= 64 {
-            return Err(Error::new("AC coefficient run extends past its block"));
+            return Err(error(JPEGError::Entropy(
+                "AC coefficient run extends past its block",
+            )));
         }
         let natural_index = ZIGZAG_TO_NATURAL[zigzag_index];
         let value = receive_extend(reader, category)?;
         coefficients[natural_index] = value
             .checked_mul(i32::from(plan.quantization[natural_index]))
-            .ok_or_else(|| Error::new("dequantized AC coefficient overflowed"))?;
+            .ok_or_raise(|| {
+                JPEGError::ArithmeticOverflow("dequantized AC coefficient overflowed")
+            })?;
         zigzag_index += 1;
     }
     Ok(coefficients)
@@ -981,14 +1373,14 @@ fn validate_progressive_storage(
             * u64::from(layout.mcu_rows)
             * u64::from(component.vertical_sampling);
         let component_bytes = blocks * 64 * size_of::<i32>() as u64;
-        byte_count = byte_count
-            .checked_add(component_bytes)
-            .ok_or_else(|| Error::new("progressive coefficient storage overflowed"))?;
+        byte_count = byte_count.checked_add(component_bytes).ok_or_raise(|| {
+            JPEGError::ArithmeticOverflow("progressive coefficient storage overflowed")
+        })?;
     }
     if byte_count > PROGRESSIVE_COEFFICIENT_BYTES_MAX {
-        return Err(Error::new(
-            "progressive coefficient storage exceeds the 512 MiB limit",
-        ));
+        return Err(error(JPEGError::LimitExceeded(
+            JPEGLimit::ProgressiveCoefficientBytes(PROGRESSIVE_COEFFICIENT_BYTES_MAX),
+        )));
     }
     Ok(())
 }
@@ -1003,28 +1395,28 @@ fn allocate_component_storage(
     let block_columns = layout
         .mcu_columns
         .checked_mul(u32::from(component.horizontal_sampling))
-        .ok_or_else(|| Error::new("component block width overflowed"))?;
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("component block width overflowed"))?;
     let block_rows = layout
         .mcu_rows
         .checked_mul(u32::from(component.vertical_sampling))
-        .ok_or_else(|| Error::new("component block height overflowed"))?;
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("component block height overflowed"))?;
     let plane_width = block_columns
         .checked_mul(BLOCK_SIDE)
-        .ok_or_else(|| Error::new("component plane width overflowed"))?;
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("component plane width overflowed"))?;
     let plane_height = block_rows
         .checked_mul(BLOCK_SIDE)
-        .ok_or_else(|| Error::new("component plane height overflowed"))?;
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("component plane height overflowed"))?;
     let sample_count = plane_width
         .checked_mul(plane_height)
-        .ok_or_else(|| Error::new("component plane size overflowed"))?;
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("component plane size overflowed"))?;
     let data_width = layout
         .width
         .checked_mul(u32::from(component.horizontal_sampling))
-        .ok_or_else(|| Error::new("component data width overflowed"))?;
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("component data width overflowed"))?;
     let data_height = layout
         .height
         .checked_mul(u32::from(component.vertical_sampling))
-        .ok_or_else(|| Error::new("component data height overflowed"))?;
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("component data height overflowed"))?;
     let data_block_columns = divide_ceil(
         data_width,
         u32::from(layout.max_horizontal_sampling) * BLOCK_SIDE,
@@ -1041,9 +1433,9 @@ fn allocate_component_storage(
     component.data_block_columns = data_block_columns;
     component.data_block_rows = data_block_rows;
     if layout.process == CodingProcess::Progressive {
-        let block_count = block_columns
-            .checked_mul(block_rows)
-            .ok_or_else(|| Error::new("component coefficient count overflowed"))?;
+        let block_count = block_columns.checked_mul(block_rows).ok_or_raise(|| {
+            JPEGError::ArithmeticOverflow("component coefficient count overflowed")
+        })?;
         component.coefficients = vec![[0; 64]; block_count as usize];
     }
     assert_eq!(component.plane.len(), sample_count as usize);
@@ -1053,7 +1445,7 @@ fn allocate_component_storage(
 fn convert_color(first: u8, second: u8, third: u8, transform: ColorTransform) -> [u8; 4] {
     match transform {
         ColorTransform::Rgb => [first, second, third, 255],
-        ColorTransform::Ycbcr => {
+        ColorTransform::YCbCr => {
             let luminance = f32::from(first);
             let blue_difference = f32::from(second) - 128.0;
             let red_difference = f32::from(third) - 128.0;
@@ -1072,17 +1464,17 @@ fn clamp_color(value: f32) -> u8 {
 
 fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     if width == 0 || height == 0 {
-        return Err(Error::new("JPEG dimensions must be nonzero"));
+        return Err(error(JPEGError::Frame("JPEG dimensions must be nonzero")));
     }
     if width > DIMENSION_MAX || height > DIMENSION_MAX {
-        return Err(Error::new(format!(
-            "JPEG dimensions exceed the {DIMENSION_MAX}-pixel limit"
-        )));
+        return Err(error(JPEGError::LimitExceeded(JPEGLimit::Dimensions(
+            DIMENSION_MAX,
+        ))));
     }
     if u64::from(width) * u64::from(height) > PIXELS_MAX {
-        return Err(Error::new(
-            "JPEG pixel count exceeds the 64-megapixel limit",
-        ));
+        return Err(error(JPEGError::LimitExceeded(JPEGLimit::Pixels(
+            PIXELS_MAX,
+        ))));
     }
     Ok(())
 }
@@ -1093,12 +1485,18 @@ fn validate_huffman_symbols(class: u8, symbols: &[u8]) -> Result<()> {
 
     for symbol in symbols {
         if class == 0 && *symbol > 11 {
-            return Err(Error::new("DC Huffman table contains a category above 11"));
+            return Err(error(JPEGError::Table(
+                JPEGTableKind::DCHuffman,
+                "DC Huffman table contains a category above 11",
+            )));
         }
         if class == 1 {
             let category = symbol & 0x0f;
             if category > 10 {
-                return Err(Error::new("AC Huffman table contains an invalid symbol"));
+                return Err(error(JPEGError::Table(
+                    JPEGTableKind::ACHuffman,
+                    "AC Huffman table contains an invalid symbol",
+                )));
             }
         }
     }
@@ -1109,7 +1507,14 @@ fn unsupported_frame_error(marker: u8) -> Error {
     assert!((0xc1..=0xcf).contains(&marker));
     assert_ne!(marker, MARKER_DHT);
 
-    Error::new(format!("JPEG frame type FF{marker:02X} is not supported"))
+    error(JPEGError::Unsupported(UnsupportedJPEG::FrameType(marker)))
+}
+
+fn unsupported_marker_error(marker: u8) -> Error {
+    assert_ne!(marker, 0x00);
+    assert_ne!(marker, 0xff);
+
+    error(JPEGError::Unsupported(UnsupportedJPEG::Marker(marker)))
 }
 
 fn divide_ceil(value: u32, divisor: u32) -> u32 {
@@ -1133,6 +1538,43 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_scan_before_the_frame_phase() {
+        let jpeg = [0xff, 0xd8, 0xff, 0xda];
+        let error = decode(&jpeg).unwrap_err();
+
+        assert_eq!(
+            &*error,
+            &JPEGError::Frame("SOS marker appeared before a frame")
+        );
+        assert!(error.to_string().contains("before a frame"));
+        assert!(!error.to_string().contains("entropy"));
+    }
+
+    #[test]
+    fn preserves_the_value_of_an_unsupported_marker() {
+        let jpeg = [0xff, 0xd8, 0xff, 0x01];
+        let error = decode(&jpeg).unwrap_err();
+
+        assert_eq!(
+            &*error,
+            &JPEGError::Unsupported(UnsupportedJPEG::Marker(0x01))
+        );
+        assert_eq!(error.to_string(), "unsupported JPEG marker FF01");
+    }
+
+    #[test]
+    fn rejects_end_of_image_before_the_scanned_phase() {
+        let jpeg = [
+            0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11,
+            0x00, 0xff, 0xd9,
+        ];
+        let error = decode(&jpeg).unwrap_err();
+
+        assert!(error.to_string().contains("before its first scan"));
+        assert!(!error.to_string().contains("Huffman"));
+    }
+
+    #[test]
     fn rejects_zero_dimensions_before_allocating() {
         let jpeg = [
             0xff, 0xd8, 0xff, 0xc0, 0x00, 0x0b, 0x08, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x11,
@@ -1151,6 +1593,8 @@ mod tests {
 
         assert!(error.to_string().contains("end"));
         assert!(!error.to_string().is_empty());
+        assert!(error.frame().location().file().ends_with("reader.rs"));
+        assert!(error.frame().children().is_empty());
     }
 
     #[test]

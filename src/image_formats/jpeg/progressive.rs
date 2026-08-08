@@ -1,8 +1,10 @@
 use super::reader::BitReader;
 use super::{
-    COMPONENTS_MAX, Error, Frame, FrameComponent, ProgressivePlan, Result, ScanHeader,
-    ZIGZAG_TO_NATURAL, receive_extend,
+    COMPONENTS_MAX, Frame, FrameComponent, JPEGError, ProgressiveEntropy, ProgressivePlan, Result,
+    ScanHeader, ZIGZAG_TO_NATURAL, error, receive_extend,
 };
+use crate::image_formats::jpeg::huffman::HuffmanTable;
+use exn::OptionExt;
 
 struct ScanState<'a> {
     reader: BitReader<'a>,
@@ -23,7 +25,7 @@ pub(super) fn decode_scan(
     let (mcu_columns, mcu_rows) = scan_dimensions(frame, plans);
     let mcu_count = mcu_columns
         .checked_mul(mcu_rows)
-        .ok_or_else(|| Error::new("progressive MCU count overflowed"))?;
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("progressive MCU count overflowed"))?;
     let mut state = ScanState {
         reader: BitReader::new(entropy),
         dc_predictors: [0; COMPONENTS_MAX],
@@ -44,7 +46,9 @@ pub(super) fn decode_scan(
         }
     }
     if state.eob_run != 0 {
-        return Err(Error::new("progressive EOB run extends past the scan"));
+        return Err(error(JPEGError::Entropy(
+            "progressive EOB run extends past the scan",
+        )));
     }
     state.reader.finish()
 }
@@ -104,14 +108,18 @@ fn coefficient_index(component: &FrameComponent, block_x: u32, block_y: u32) -> 
     assert!(component.block_rows > 0);
 
     if block_x >= component.block_columns || block_y >= component.block_rows {
-        return Err(Error::new("progressive block coordinate is out of range"));
+        return Err(error(JPEGError::Scan(
+            "progressive block coordinate is out of range",
+        )));
     }
     let index = block_y
         .checked_mul(component.block_columns)
         .and_then(|value| value.checked_add(block_x))
-        .ok_or_else(|| Error::new("progressive block index overflowed"))?;
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("progressive block index overflowed"))?;
     if index as usize >= component.coefficients.len() {
-        return Err(Error::new("progressive coefficient block is missing"));
+        return Err(error(JPEGError::Scan(
+            "progressive coefficient block is missing",
+        )));
     }
     Ok(index as usize)
 }
@@ -126,49 +134,56 @@ fn decode_block(
     assert!(predictor_index < COMPONENTS_MAX);
     assert!(scan.spectral_start <= scan.spectral_end);
 
-    if scan.spectral_start == 0 {
-        if scan.successive_high == 0 {
+    match &plan.entropy {
+        ProgressiveEntropy::DCFirst(table) => {
+            assert_eq!(scan.spectral_start, 0);
+            assert_eq!(scan.successive_high, 0);
             decode_dc_first(
                 state,
                 coefficients,
-                plan,
+                table,
                 scan.successive_low,
                 predictor_index,
             )
-        } else {
+        }
+        ProgressiveEntropy::DCRefinement => {
+            assert_eq!(scan.spectral_start, 0);
+            assert!(scan.successive_high > 0);
             decode_dc_refinement(state, coefficients, scan.successive_low)
         }
-    } else if scan.successive_high == 0 {
-        decode_ac_first(state, coefficients, plan, scan)
-    } else {
-        decode_ac_refinement(state, coefficients, plan, scan)
+        ProgressiveEntropy::ACFirst(table) => {
+            assert!(scan.spectral_start > 0);
+            assert_eq!(scan.successive_high, 0);
+            decode_ac_first(state, coefficients, table, scan)
+        }
+        ProgressiveEntropy::ACRefinement(table) => {
+            assert!(scan.spectral_start > 0);
+            assert!(scan.successive_high > 0);
+            decode_ac_refinement(state, coefficients, table, scan)
+        }
     }
 }
 
 fn decode_dc_first(
     state: &mut ScanState<'_>,
     coefficients: &mut [i32; 64],
-    plan: &ProgressivePlan,
+    table: &HuffmanTable,
     successive_low: u8,
     predictor_index: usize,
 ) -> Result<()> {
     assert!(successive_low <= 13);
     assert!(predictor_index < COMPONENTS_MAX);
 
-    let table = plan
-        .dc
-        .as_ref()
-        .ok_or_else(|| Error::new("progressive DC Huffman table is missing"))?;
     let category = table.decode(&mut state.reader)?;
     if category > 11 {
-        return Err(Error::new(
+        return Err(error(JPEGError::Entropy(
             "progressive DC coefficient category exceeds 11 bits",
-        ));
+        )));
     }
     let difference = receive_extend(&mut state.reader, category)?;
     let predictor = state.dc_predictors[predictor_index]
         .checked_add(difference)
-        .ok_or_else(|| Error::new("progressive DC predictor overflowed"))?;
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("progressive DC predictor overflowed"))?;
     state.dc_predictors[predictor_index] = predictor;
     coefficients[0] = scale_coefficient(predictor, successive_low)?;
     Ok(())
@@ -191,7 +206,7 @@ fn decode_dc_refinement(
 fn decode_ac_first(
     state: &mut ScanState<'_>,
     coefficients: &mut [i32; 64],
-    plan: &ProgressivePlan,
+    table: &HuffmanTable,
     scan: &ScanHeader,
 ) -> Result<()> {
     assert!(scan.spectral_start > 0);
@@ -201,10 +216,6 @@ fn decode_ac_first(
         state.eob_run -= 1;
         return Ok(());
     }
-    let table = plan
-        .ac
-        .as_ref()
-        .ok_or_else(|| Error::new("progressive AC Huffman table is missing"))?;
     let mut spectral = scan.spectral_start;
     while spectral <= scan.spectral_end {
         let symbol = table.decode(&mut state.reader)?;
@@ -213,9 +224,11 @@ fn decode_ac_first(
         if category > 0 {
             spectral = spectral
                 .checked_add(zero_run)
-                .ok_or_else(|| Error::new("progressive AC run overflowed"))?;
+                .ok_or_raise(|| JPEGError::ArithmeticOverflow("progressive AC run overflowed"))?;
             if spectral > scan.spectral_end {
-                return Err(Error::new("progressive AC run extends past its band"));
+                return Err(error(JPEGError::Entropy(
+                    "progressive AC run extends past its band",
+                )));
             }
             let value = receive_extend(&mut state.reader, category)?;
             coefficients[ZIGZAG_TO_NATURAL[usize::from(spectral)]] =
@@ -223,7 +236,9 @@ fn decode_ac_first(
             spectral += 1;
         } else if zero_run == 15 {
             if u16::from(spectral) + 15 > u16::from(scan.spectral_end) {
-                return Err(Error::new("progressive ZRL extends past its band"));
+                return Err(error(JPEGError::Entropy(
+                    "progressive ZRL extends past its band",
+                )));
             }
             spectral += 16;
         } else {
@@ -237,16 +252,12 @@ fn decode_ac_first(
 fn decode_ac_refinement(
     state: &mut ScanState<'_>,
     coefficients: &mut [i32; 64],
-    plan: &ProgressivePlan,
+    table: &HuffmanTable,
     scan: &ScanHeader,
 ) -> Result<()> {
     assert!(scan.spectral_start > 0);
     assert!(scan.successive_high > 0);
 
-    let table = plan
-        .ac
-        .as_ref()
-        .ok_or_else(|| Error::new("progressive AC Huffman table is missing"))?;
     let correction = 1_i32 << scan.successive_low;
     let mut spectral = scan.spectral_start;
     if state.eob_run == 0 {
@@ -270,9 +281,9 @@ fn decode_ac_refinement(
             if new_value != 0 {
                 coefficients[ZIGZAG_TO_NATURAL[usize::from(spectral)]] = new_value;
             }
-            spectral = spectral
-                .checked_add(1)
-                .ok_or_else(|| Error::new("progressive refinement index overflowed"))?;
+            spectral = spectral.checked_add(1).ok_or_raise(|| {
+                JPEGError::ArithmeticOverflow("progressive refinement index overflowed")
+            })?;
         }
     }
     if state.eob_run > 0 {
@@ -297,7 +308,9 @@ fn refinement_value(reader: &mut BitReader<'_>, category: u8, correction: i32) -
         return Ok(0);
     }
     if category != 1 {
-        return Err(Error::new("progressive AC refinement category must be one"));
+        return Err(error(JPEGError::Entropy(
+            "progressive AC refinement category must be one",
+        )));
     }
     if reader.read_bits(1)? != 0 {
         Ok(correction)
@@ -320,9 +333,9 @@ fn advance_refinement(
 
     loop {
         if *spectral > spectral_end {
-            return Err(Error::new(
+            return Err(error(JPEGError::Entropy(
                 "progressive refinement run extends past its band",
-            ));
+            )));
         }
         let coefficient = &mut coefficients[ZIGZAG_TO_NATURAL[usize::from(*spectral)]];
         if *coefficient != 0 {
@@ -377,7 +390,7 @@ fn refine_nonzero(
     };
     *coefficient = coefficient
         .checked_add(delta)
-        .ok_or_else(|| Error::new("progressive AC refinement overflowed"))?;
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("progressive AC refinement overflowed"))?;
     Ok(())
 }
 
@@ -388,7 +401,7 @@ fn read_eob_run(reader: &mut BitReader<'_>, additional_bits: u8) -> Result<u32> 
     let base = 1_u32 << additional_bits;
     let suffix = u32::from(reader.read_bits(additional_bits)?);
     base.checked_add(suffix)
-        .ok_or_else(|| Error::new("progressive EOB run overflowed"))
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("progressive EOB run overflowed"))
 }
 
 fn scale_coefficient(value: i32, successive_low: u8) -> Result<i32> {
@@ -397,5 +410,5 @@ fn scale_coefficient(value: i32, successive_low: u8) -> Result<i32> {
 
     value
         .checked_mul(1_i32 << successive_low)
-        .ok_or_else(|| Error::new("progressive coefficient overflowed"))
+        .ok_or_raise(|| JPEGError::ArithmeticOverflow("progressive coefficient overflowed"))
 }

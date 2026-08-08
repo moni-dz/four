@@ -1,4 +1,5 @@
-use super::{Error, Result};
+use super::{Error, JPEGError, Result, error};
+use exn::OptionExt;
 
 pub(super) struct Reader<'a> {
     bytes: &'a [u8],
@@ -33,9 +34,11 @@ impl<'a> Reader<'a> {
         let end = self
             .offset
             .checked_add(length)
-            .ok_or_else(|| Error::new("JPEG input offset overflowed"))?;
+            .ok_or_raise(|| JPEGError::ArithmeticOverflow("JPEG input offset overflowed"))?;
         if end > self.bytes.len() {
-            return Err(Error::new("JPEG input offset extends past the input"));
+            return Err(error(JPEGError::UnexpectedEnd(
+                "JPEG input offset extends past the input",
+            )));
         }
         self.offset = end;
         Ok(())
@@ -49,7 +52,7 @@ impl<'a> Reader<'a> {
             .bytes
             .get(self.offset)
             .copied()
-            .ok_or_else(|| Error::new("unexpected end of JPEG data"))?;
+            .ok_or_raise(|| JPEGError::UnexpectedEnd("unexpected end of JPEG data"))?;
         self.offset += 1;
         Ok(value)
     }
@@ -70,11 +73,11 @@ impl<'a> Reader<'a> {
         let end = self
             .offset
             .checked_add(length)
-            .ok_or_else(|| Error::new("JPEG segment length overflowed"))?;
+            .ok_or_raise(|| JPEGError::ArithmeticOverflow("JPEG segment length overflowed"))?;
         let slice = self
             .bytes
             .get(self.offset..end)
-            .ok_or_else(|| Error::new("JPEG segment extends past the input"))?;
+            .ok_or_raise(|| JPEGError::UnexpectedEnd("JPEG segment extends past the input"))?;
         self.offset = end;
         Ok(slice)
     }
@@ -85,7 +88,9 @@ impl<'a> Reader<'a> {
 
         let length = usize::from(self.read_u16()?);
         if length < 2 {
-            return Err(Error::new("JPEG segment length is smaller than its header"));
+            return Err(error(JPEGError::Segment(
+                "JPEG segment length is smaller than its header",
+            )));
         }
         Ok(Reader::new(self.read_slice(length - 2)?))
     }
@@ -94,15 +99,21 @@ impl<'a> Reader<'a> {
         assert!(self.offset <= self.bytes.len());
         assert!(self.bytes.len() <= isize::MAX as usize);
 
-        if self.read_u8()? != 0xff {
-            return Err(Error::new("expected a JPEG marker"));
+        let prefix = self.read_u8()?;
+        if prefix != 0xff {
+            return Err(error(JPEGError::ExpectedMarkerPrefix {
+                context: "in the JPEG marker stream",
+                found: prefix,
+            }));
         }
         let mut marker = self.read_u8()?;
         while marker == 0xff {
             marker = self.read_u8()?;
         }
         if marker == 0x00 {
-            return Err(Error::new("stuffed byte appeared outside entropy data"));
+            return Err(error(JPEGError::Marker(
+                "stuffed byte appeared outside entropy data",
+            )));
         }
         Ok(marker)
     }
@@ -222,11 +233,11 @@ impl<'a> BitReader<'a> {
         if self.bytes.get(self.offset) == Some(&0xff)
             && let Some(marker) = self.bytes.get(self.offset + 1)
         {
-            return Error::new(format!(
-                "unexpected marker FF{marker:02X} inside entropy data"
-            ));
+            return error(JPEGError::UnexpectedEntropyMarker(*marker));
         }
-        Error::new("unexpected end of JPEG entropy data")
+        error(JPEGError::UnexpectedEnd(
+            "unexpected end of JPEG entropy data",
+        ))
     }
 
     pub(super) fn restart(&mut self, expected: u8) -> Result<()> {
@@ -236,9 +247,10 @@ impl<'a> BitReader<'a> {
         self.discard_bits();
         let marker = self.raw_marker()?;
         if marker != expected {
-            return Err(Error::new(format!(
-                "expected restart marker FF{expected:02X}, found FF{marker:02X}"
-            )));
+            return Err(error(JPEGError::RestartMarkerMismatch {
+                expected,
+                found: marker,
+            }));
         }
         Ok(())
     }
@@ -257,15 +269,21 @@ impl<'a> BitReader<'a> {
         assert!(self.offset <= self.bytes.len());
         assert!(self.bits_remaining <= 23);
 
-        if self.raw_byte()? != 0xff {
-            return Err(Error::new("expected a marker after entropy data"));
+        let prefix = self.raw_byte()?;
+        if prefix != 0xff {
+            return Err(error(JPEGError::ExpectedMarkerPrefix {
+                context: "after entropy data",
+                found: prefix,
+            }));
         }
         let mut marker = self.raw_byte()?;
         while marker == 0xff {
             marker = self.raw_byte()?;
         }
         if marker == 0x00 {
-            return Err(Error::new("unexpected stuffed byte after entropy data"));
+            return Err(error(JPEGError::Entropy(
+                "unexpected stuffed byte after entropy data",
+            )));
         }
         Ok(marker)
     }
@@ -285,7 +303,7 @@ impl<'a> BitReader<'a> {
             .bytes
             .get(self.offset)
             .copied()
-            .ok_or_else(|| Error::new("unexpected end of JPEG entropy data"))?;
+            .ok_or_raise(|| JPEGError::UnexpectedEnd("unexpected end of JPEG entropy data"))?;
         self.offset += 1;
         Ok(byte)
     }

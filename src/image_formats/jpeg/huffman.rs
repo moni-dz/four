@@ -1,5 +1,6 @@
 use super::reader::BitReader;
-use super::{Error, Result};
+use super::{JPEGError, JPEGTableKind, Result, error};
+use exn::OptionExt;
 
 const HUFFMAN_BITS_MAX: usize = 16;
 const HUFFMAN_SYMBOLS_MAX: usize = 256;
@@ -21,9 +22,10 @@ impl HuffmanTable {
 
         let symbol_count: usize = counts.iter().map(|count| usize::from(*count)).sum();
         if symbol_count != symbols.len() {
-            return Err(Error::new(
+            return Err(error(JPEGError::Table(
+                JPEGTableKind::Huffman,
                 "Huffman symbol count does not match its code lengths",
-            ));
+            )));
         }
         validate_code_space(&counts)?;
         let lookup = build_lookup(&counts, &symbols);
@@ -61,16 +63,19 @@ impl HuffmanTable {
             let count = u32::from(self.counts[bit_length]);
             if code >= first_code && code < first_code + count {
                 let index = symbol_offset + (code - first_code) as usize;
-                return self
-                    .symbols
-                    .get(index)
-                    .copied()
-                    .ok_or_else(|| Error::new("Huffman symbol index is out of range"));
+                return self.symbols.get(index).copied().ok_or_raise(|| {
+                    JPEGError::Table(
+                        JPEGTableKind::Huffman,
+                        "Huffman symbol index is out of range",
+                    )
+                });
             }
             symbol_offset += count as usize;
             first_code = (first_code + count) << 1;
         }
-        Err(Error::new("entropy data contains an invalid Huffman code"))
+        Err(error(JPEGError::Entropy(
+            "entropy data contains an invalid Huffman code",
+        )))
     }
 }
 
@@ -115,7 +120,10 @@ fn validate_code_space(counts: &[u8; HUFFMAN_BITS_MAX]) -> Result<()> {
     for count in counts {
         available_codes = available_codes * 2 - i32::from(*count);
         if available_codes < 0 {
-            return Err(Error::new("Huffman table is oversubscribed"));
+            return Err(error(JPEGError::Table(
+                JPEGTableKind::Huffman,
+                "Huffman table is oversubscribed",
+            )));
         }
     }
     Ok(())

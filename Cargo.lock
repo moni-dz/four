@@ -1568,6 +1568,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "exn"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "84c8eaf8836c22a841ee5362e227dd09e5908b52fa2a9bc786cf153c0f344b99"
+
+[[package]]
 name = "exr"
 version = "1.74.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1764,6 +1770,7 @@ dependencies = [
 name = "four"
 version = "0.1.0"
 dependencies = [
+ "exn",
  "gpui",
  "gpui_platform",
  "multiversion",
