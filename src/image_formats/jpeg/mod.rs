@@ -11,6 +11,8 @@ use huffman::HuffmanTable;
 use reader::{BitReader, Reader};
 
 use super::DecodedImage;
+#[cfg(test)]
+use super::Image;
 
 const BLOCK_SIDE: u32 = 8;
 const COMPONENTS_MAX: usize = 3;
@@ -816,8 +818,8 @@ mod tests {
     fn decodes_a_subsampled_color_jpeg_end_to_end() {
         let image = decode(&test_data::baseline_color_jpeg()).unwrap();
 
-        assert_eq!((image.width, image.height), (16, 16));
-        assert_eq!(image.rgba.len(), 16 * 16 * 4);
+        assert_eq!(image.dimensions(), (16, 16));
+        assert_eq!(image.rgba8().len(), 16 * 16 * 4);
         assert_dominant(&image, 3, 3, 0);
         assert_dominant(&image, 12, 3, 1);
         assert_dominant(&image, 3, 12, 2);
@@ -825,9 +827,9 @@ mod tests {
         assert!(white[0] > 220 && white[1] > 220 && white[2] > 220);
     }
 
-    fn assert_dominant(image: &DecodedImage, x: usize, y: usize, channel: usize) {
-        assert!(x < image.width as usize);
-        assert!(y < image.height as usize);
+    fn assert_dominant(image: &dyn Image, x: usize, y: usize, channel: usize) {
+        assert!(x < image.width() as usize);
+        assert!(y < image.height() as usize);
 
         let pixel = pixel(image, x, y);
         assert!(pixel[channel] > 180);
@@ -838,11 +840,11 @@ mod tests {
         }
     }
 
-    fn pixel(image: &DecodedImage, x: usize, y: usize) -> &[u8] {
-        assert!(x < image.width as usize);
-        assert!(y < image.height as usize);
+    fn pixel(image: &dyn Image, x: usize, y: usize) -> &[u8] {
+        assert!(x < image.width() as usize);
+        assert!(y < image.height() as usize);
 
-        let start = (y * image.width as usize + x) * 4;
-        &image.rgba[start..start + 4]
+        let start = (y * image.width() as usize + x) * 4;
+        &image.rgba8()[start..start + 4]
     }
 }

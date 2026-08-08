@@ -5,13 +5,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Context, Image, ImageFormat, MouseButton, MouseDownEvent, PathPromptOptions,
-    Pixels, Point, SharedString, Window, WindowBounds, WindowControlArea, WindowOptions, deferred,
-    div, img, prelude::*, px, rgb, size,
+    App, Bounds, Context, Image as GpuiImage, ImageFormat, MouseButton, MouseDownEvent,
+    PathPromptOptions, Pixels, Point, SharedString, Window, WindowBounds, WindowControlArea,
+    WindowOptions, deferred, div, img, prelude::*, px, rgb, size,
 };
 use gpui_platform::application;
 
-use image_formats::jpeg;
+use image_formats::{Image as ImageData, encode_bmp, jpeg};
 
 const CONTEXT_MENU_HEIGHT: f32 = 80.0;
 const CONTEXT_MENU_WIDTH: f32 = 180.0;
@@ -28,13 +28,13 @@ const _: () = {
 };
 
 struct LoadedImage {
-    image: Arc<Image>,
+    image: Arc<GpuiImage>,
     status: SharedString,
 }
 
 struct Root {
     context_menu_position: Option<Point<Pixels>>,
-    image: Option<Arc<Image>>,
+    image: Option<Arc<GpuiImage>>,
     status: SharedString,
 }
 
@@ -253,9 +253,11 @@ fn load_jpeg(path: &Path) -> Result<LoadedImage, String> {
         fs::read(path).map_err(|error| format!("Could not read {}: {error}", path.display()))?;
     let decoded = jpeg::decode(&bytes)
         .map_err(|error| format!("Could not decode {}: {error}", path.display()))?;
-    let width = decoded.width;
-    let height = decoded.height;
-    let image = Arc::new(Image::from_bytes(ImageFormat::Bmp, decoded.into_bmp()));
+    let (width, height) = decoded.dimensions();
+    let image = Arc::new(GpuiImage::from_bytes(
+        ImageFormat::Bmp,
+        encode_bmp(&decoded),
+    ));
     let file_name = path
         .file_name()
         .map(|name| name.to_string_lossy())
