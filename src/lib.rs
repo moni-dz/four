@@ -1,10 +1,10 @@
 #![feature(portable_simd)]
 //! Decodes images into a small, format-independent RGBA representation.
 //!
-//! The crate provides GIF, JPEG, JPEG XL, PNG, and TIFF decoding into RGBA8 pixels. Maintained
-//! codecs handle ordinary formats while the handwritten JPEG implementation preserves arithmetic
-//! entropy decoding. Decoding is sans-I/O: callers supply encoded bytes and retain control over
-//! file, network, and resource policy.
+//! The crate provides GIF, JPEG, JPEG XL, JPEG XR, PNG, and TIFF decoding into RGBA8 pixels.
+//! Maintained codecs handle ordinary formats while the handwritten JPEG implementation preserves
+//! arithmetic entropy decoding. Decoding is sans-I/O: callers supply encoded bytes and retain
+//! control over file, network, and resource policy.
 
 // Every invariant names the exact expression in its panic message. Centralizing that mechanical
 // part prevents a future assertion from silently losing the diagnostic required by AGENTS.md.
@@ -59,4 +59,4 @@ macro_rules! invariant_ne {
 mod image_formats;
 
 #[doc(inline)]
-pub use image_formats::{DecodedImage, Image, encode_bmp, gif, jpeg, jpeg_xl, png, tiff};
+pub use image_formats::{DecodedImage, Image, encode_bmp, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};

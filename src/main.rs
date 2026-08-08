@@ -14,7 +14,7 @@ use gpui::{
 use gpui_platform::application;
 use mimalloc::MiMalloc;
 
-use four::{DecodedImage, encode_bmp, gif, jpeg, jpeg_xl, png, tiff};
+use four::{DecodedImage, encode_bmp, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
 
 // Keep invariant diagnostics consistent with the decoder crate while leaving test assertions free
 // to use the standard macros, where custom panic messages add little value.
@@ -456,6 +456,11 @@ impl ImageLoad<EncodedImage> {
         let extension_is_jpeg_xl = extension
             .as_deref()
             .is_some_and(|value| value.eq_ignore_ascii_case("jxl"));
+        let extension_is_hd_photo = extension.as_deref().is_some_and(|value| {
+            value.eq_ignore_ascii_case("jxr")
+                || value.eq_ignore_ascii_case("wdp")
+                || value.eq_ignore_ascii_case("hdp")
+        });
         let extension_is_png = extension
             .as_deref()
             .is_some_and(|value| value.eq_ignore_ascii_case("png"));
@@ -467,6 +472,9 @@ impl ImageLoad<EncodedImage> {
         });
         let image = if jpeg_xl::has_signature(&self.state.bytes) {
             jpeg_xl::decode(&self.state.bytes)
+                .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
+        } else if jpeg_xr::has_signature(&self.state.bytes) {
+            jpeg_xr::decode(&self.state.bytes)
                 .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
         } else if png::has_signature(&self.state.bytes) {
             png::decode(&self.state.bytes)
@@ -482,6 +490,9 @@ impl ImageLoad<EncodedImage> {
                 .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
         } else if extension_is_jpeg_xl {
             jpeg_xl::decode(&self.state.bytes)
+                .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
+        } else if extension_is_hd_photo {
+            jpeg_xr::decode(&self.state.bytes)
                 .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
         } else if extension_is_png {
             png::decode(&self.state.bytes)

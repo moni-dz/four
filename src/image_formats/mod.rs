@@ -3,6 +3,7 @@
 pub mod gif;
 pub mod jpeg;
 pub mod jpeg_xl;
+pub mod jpeg_xr;
 pub mod png;
 pub mod tiff;
 
