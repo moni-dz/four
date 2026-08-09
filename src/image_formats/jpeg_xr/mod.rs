@@ -2,8 +2,9 @@
 //!
 //! The JPEG XR reference codec produces pixels in their native WIC representation. Unsigned RGB
 //! and grayscale samples are normalized as sRGB. Fixed-point, half-float, floating-point, and RGBE
-//! samples are interpreted as linear scRGB, tone-mapped with a MaxCLL-aware shoulder curve,
-//! gamut-compressed without changing chromaticity, and encoded with the sRGB transfer function.
+//! samples are interpreted as linear scRGB, mapped component-wise with extended Reinhard using a
+//! `MaxCLL` white point, and encoded with the sRGB transfer function. Mapping is bypassed when the
+//! content peak already fits the SDR target range.
 //!
 //! `MaxCLL` is estimated from the 99.99th-percentile `max(R, G, B)` light level, rejecting isolated
 //! outliers at the cost of clipping the brightest 0.01% of a sufficiently large image.
@@ -19,7 +20,8 @@ use ::jpegxr::{
     BitDepthBits, ColorFormat, ImageDecode, JXRError, PixelFormat as CodecPixelFormat, PixelInfo,
 };
 use tonemapping::{
-    ColorChannel as ToneColorChannel, LinearRgb, LinearShoulder, MaxCllEstimator, ToneMapper,
+    Clamp, ColorChannel as ToneColorChannel, ExtendedReinhard, LinearRgb, MaxCllEstimator,
+    ToneMapper, WhitePoint,
 };
 
 use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
@@ -204,8 +206,9 @@ pub fn has_signature(bytes: impl AsRef<[u8]>) -> bool {
 /// Decodes a JPEG XR image and normalizes it to SDR RGBA8.
 ///
 /// Unsigned integer RGB and grayscale inputs retain their sRGB encoding. Linear-light HDR inputs
-/// use a `MaxCLL`-aware shoulder curve before conversion to sRGB. `MaxCLL` is estimated from the
-/// 99.99th-percentile brightest pixel to prevent isolated outliers from dimming the image.
+/// use extended Reinhard with a `MaxCLL` white point before conversion to sRGB. `MaxCLL` is
+/// estimated from the 99.99th-percentile brightest pixel to prevent isolated outliers from dimming
+/// the image. Mapping is bypassed when the content peak already fits the target range.
 /// Premultiplied inputs are returned with straight alpha.
 ///
 /// # Errors
@@ -497,10 +500,7 @@ fn normalize(
     } else {
         None
     };
-    let tone_mapper = hdr_metrics.map(|metrics| {
-        LinearShoulder::new(metrics.max_cll.relative_light_level())
-            .expect("estimated MaxCLL is finite and nonnegative")
-    });
+    let tone_mapper = hdr_metrics.and_then(|metrics| hdr_tone_mapper(metrics.max_cll));
     let mut rgba = Vec::with_capacity(output_len);
     let mut has_nonzero_alpha = false;
 
@@ -517,6 +517,8 @@ fn normalize(
             has_nonzero_alpha |= alpha > 0.0;
             let color = if let Some(mapper) = tone_mapper {
                 hdr_to_srgb8(color, &mapper)
+            } else if hdr_metrics.is_some() {
+                hdr_to_srgb8(color, &Clamp)
             } else {
                 color.map(normalized_to_u8)
             };
@@ -624,6 +626,15 @@ impl MaxCll {
         invariant!(self.nits >= 0.0);
         self.nits / SC_RGB_REFERENCE_WHITE_NITS
     }
+}
+
+fn hdr_tone_mapper(max_cll: MaxCll) -> Option<ExtendedReinhard> {
+    let max_cll = max_cll.relative_light_level();
+    (max_cll > 1.0).then(|| {
+        ExtendedReinhard::new(
+            WhitePoint::new(max_cll).expect("a positive finite MaxCLL is a valid white point"),
+        )
+    })
 }
 
 struct HDRMetricAccumulator {
@@ -1004,16 +1015,34 @@ mod tests {
 
     #[test]
     fn tone_mapper_output_is_encoded_as_srgb() {
-        let mapper = LinearShoulder::new(4.0).unwrap();
+        let mapper = ExtendedReinhard::new(WhitePoint::new(4.0).unwrap());
         assert_eq!(hdr_to_srgb8([0.0; 3], &mapper), [0; 3]);
         let reference_white = hdr_to_srgb8([1.0; 3], &mapper);
         let hdr_white = hdr_to_srgb8([4.0; 3], &mapper);
 
-        assert!(reference_white[0] >= 235 && reference_white[0] <= 245);
+        assert!(reference_white[0] >= 190 && reference_white[0] <= 195);
         assert!(hdr_white[0] > reference_white[0]);
         assert_eq!(hdr_white[0], u8::MAX);
         assert_eq!(reference_white[0], reference_white[1]);
         assert_eq!(hdr_white[1], hdr_white[2]);
+    }
+
+    #[test]
+    fn tone_mapping_is_bypassed_when_max_cll_fits_the_target() {
+        let fitting = MaxCll {
+            nits: SC_RGB_REFERENCE_WHITE_NITS,
+            channel: JPEGXRColorChannel::Red,
+        };
+        let hdr = MaxCll {
+            nits: 4.0 * SC_RGB_REFERENCE_WHITE_NITS,
+            channel: JPEGXRColorChannel::Red,
+        };
+
+        assert!(hdr_tone_mapper(fitting).is_none());
+        assert_eq!(
+            hdr_tone_mapper(hdr).map(|mapper| mapper.white_point().level()),
+            Some(4.0)
+        );
     }
 
     #[test]

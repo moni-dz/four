@@ -784,66 +784,6 @@ impl fmt::Display for CameraResponseError {
 
 impl std::error::Error for CameraResponseError {}
 
-/// Compresses highlights above a fixed knee using the content peak.
-///
-/// This operator preserves input luminance below `0.75`, maps `max_content_level` to `1.0`, and
-/// scales all channels together before fitting the result into the target gamut. It exists for the
-/// decoder integration that predates the named operators provided by this crate.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LinearShoulder {
-    max_content_level: f32,
-}
-
-impl LinearShoulder {
-    /// Creates an operator for a finite, nonnegative `max_content_level`.
-    ///
-    /// Returns `None` for negative or non-finite levels.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use tonemapping::LinearShoulder;
-    ///
-    /// assert!(LinearShoulder::new(4.0).is_some());
-    /// assert!(LinearShoulder::new(f32::NAN).is_none());
-    /// ```
-    #[must_use]
-    pub fn new(max_content_level: f32) -> Option<Self> {
-        (max_content_level.is_finite() && max_content_level >= 0.0)
-            .then_some(Self { max_content_level })
-    }
-}
-
-impl ToneMapper for LinearShoulder {
-    fn map(&self, color: LinearRgb) -> LinearRgb {
-        const KNEE: f32 = 0.75;
-
-        let luminance = color.luminance();
-        if luminance == 0.0 {
-            return LinearRgb::default();
-        }
-
-        let mapped_luminance = if self.max_content_level <= 1.0 || luminance <= KNEE {
-            luminance
-        } else {
-            let input_range = self.max_content_level - KNEE;
-            let output_range = 1.0 - KNEE;
-            let softness = input_range * output_range / (self.max_content_level - 1.0);
-            let distance = luminance - KNEE;
-            KNEE + distance / (1.0 + distance / softness)
-        };
-
-        let scale = mapped_luminance / luminance;
-        let mut mapped = color.0.map(|component| component * scale);
-        let peak = mapped.into_iter().fold(0.0_f32, f32::max);
-        if peak > 1.0 {
-            mapped = mapped.map(|component| component / peak);
-        }
-
-        LinearRgb::displayable(mapped)
-    }
-}
-
 fn sanitize_component(component: f32) -> f32 {
     if component.is_nan() || component <= 0.0 {
         0.0
@@ -864,28 +804,6 @@ mod tests {
         for (actual, expected) in actual.components().into_iter().zip(expected) {
             assert_approximately_equal(actual, expected);
         }
-    }
-
-    #[test]
-    fn shoulder_compresses_hdr_white_into_sdr() {
-        let mapper = LinearShoulder::new(4.0).unwrap();
-
-        assert_eq!(mapper.map(LinearRgb::default()), LinearRgb::default());
-        let reference_white = mapper.map(LinearRgb::new([1.0; 3]));
-        let hdr_white = mapper.map(LinearRgb::new([4.0; 3]));
-
-        assert!(reference_white.components()[0] > 0.85);
-        assert_eq!(hdr_white.components(), [1.0; 3]);
-    }
-
-    #[test]
-    fn shoulder_preserves_channel_order_during_gamut_compression() {
-        let mapper = LinearShoulder::new(4.0).unwrap();
-        let [red, green, blue] = mapper.map(LinearRgb::new([4.0, 2.0, 1.0])).components();
-
-        assert_eq!(red, 1.0);
-        assert!(red > green);
-        assert!(green > blue);
     }
 
     #[test]
