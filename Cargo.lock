@@ -1828,7 +1828,6 @@ dependencies = [
  "mimalloc",
  "multiversion",
  "png 0.18.1",
- "rayon",
  "tiff",
  "zune-jpeg",
 ]

@@ -188,13 +188,15 @@ fn assert_matches_reference_decoder(jpeg: &[u8], image: &dyn Image) {
 
 fn assert_images_close(actual: &dyn Image, expected: &dyn Image) {
     assert_eq!(actual.dimensions(), expected.dimensions());
-    let mut error_sum = 0_u64;
-    let mut maximum_error = 0_u8;
-    for (actual, expected) in actual.rgba8().iter().zip(expected.rgba8()) {
-        let error = actual.abs_diff(*expected);
-        error_sum += u64::from(error);
-        maximum_error = maximum_error.max(error);
-    }
+    let (error_sum, maximum_error) = actual
+        .rgba8()
+        .iter()
+        .zip(expected.rgba8())
+        .map(|(actual, expected)| actual.abs_diff(*expected))
+        .fold((0_u64, 0_u8), |(sum, maximum), error| {
+            (sum + u64::from(error), maximum.max(error))
+        });
+
     let sample_count = u64::try_from(actual.rgba8().len()).unwrap();
     assert!(
         error_sum / sample_count <= 3,

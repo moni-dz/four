@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use jxl_oxide::{AllocTracker, EnumColourEncoding, JxlImage, PixelFormat, RenderingIntent};
 
-use super::DecodedImage;
+use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
 
 use error::error;
 pub use error::{Error, JPEGXLError, JPEGXLLimit, Result};
@@ -24,8 +24,6 @@ pub const CONTAINER_SIGNATURE: [u8; 12] = [
 ];
 
 const DECODER_MEMORY_MAX: usize = 512 * 1024 * 1024;
-const DIMENSION_MAX: u32 = 16_384;
-const PIXELS_MAX: u64 = 64 * 1024 * 1024;
 
 /// Returns whether `bytes` begins with a standard JPEG XL signature.
 #[must_use]
@@ -57,16 +55,20 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
 
     let width = image.width();
     let height = image.height();
+    
     validate_dimensions(width, height)?;
+    
     if image.num_loaded_keyframes() == 0 {
         return Err(error(JPEGXLError::NoFrame));
     }
 
     image.request_color_encoding(EnumColourEncoding::srgb(RenderingIntent::Perceptual));
+    
     let pixel_format = image.pixel_format();
     let render = image
         .render_frame(0)
         .map_err(|source| codec_error(source.as_ref()))?;
+    
     let mut stream = render.stream();
     if stream.width() != width || stream.height() != height {
         return Err(error(JPEGXLError::Output(
@@ -76,11 +78,13 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
 
     let pixel_count = pixel_count(width, height)?;
     let channels = pixel_format.channels();
+    
     let sample_count = pixel_count.checked_mul(channels).ok_or_else(|| {
         error(JPEGXLError::Output(
             "JPEG XL rendered sample count exceeds usize",
         ))
     })?;
+    
     if usize::try_from(stream.channels()).ok() != Some(channels) {
         return Err(error(JPEGXLError::Output(
             "JPEG XL rendered channel count does not match its pixel format",
@@ -104,16 +108,19 @@ fn validate_dimensions(width: u32, height: u32) -> Result<()> {
             "JPEG XL dimensions must both be nonzero",
         )));
     }
+
     if width > DIMENSION_MAX || height > DIMENSION_MAX {
         return Err(error(JPEGXLError::LimitExceeded(JPEGXLLimit::Dimensions(
             DIMENSION_MAX,
         ))));
     }
+
     if u64::from(width) * u64::from(height) > PIXELS_MAX {
         return Err(error(JPEGXLError::LimitExceeded(JPEGXLLimit::Pixels(
             PIXELS_MAX,
         ))));
     }
+
     Ok(())
 }
 
@@ -150,9 +157,12 @@ fn normalize_rgba(
                     "JPEG XL RGB output has an invalid length",
                 )));
             }
-            for &[red, green, blue] in pixels {
-                rgba.extend_from_slice(&[red, green, blue, u8::MAX]);
-            }
+            rgba.extend(
+                pixels
+                    .iter()
+                    .flat_map(|&[red, green, blue]| [red, green, blue, u8::MAX]),
+            );
+
             Ok(rgba)
         }
         PixelFormat::Gray | PixelFormat::Graya | PixelFormat::Cmyk | PixelFormat::Cmyka => {
@@ -166,6 +176,7 @@ fn normalize_rgba(
 fn codec_error(source: &(dyn std::error::Error + Send + Sync + 'static)) -> Error {
     let detail = source.to_string();
     let lowercase_detail = detail.to_ascii_lowercase();
+    
     if lowercase_detail.contains("memory limit") || lowercase_detail.contains("out of memory") {
         error(JPEGXLError::LimitExceeded(JPEGXLLimit::DecoderMemory(
             DECODER_MEMORY_MAX,

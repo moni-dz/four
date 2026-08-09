@@ -429,14 +429,10 @@ fn decode_ac_refinement(
     invariant!(scan.successive_high > 0);
 
     let correction = 1_i32 << scan.successive_low;
-    let mut previous_end = scan.spectral_end;
-
-    while previous_end > 0 {
-        if coefficients[ZIGZAG_TO_NATURAL[usize::from(previous_end)]] != 0 {
-            break;
-        }
-        previous_end -= 1;
-    }
+    let previous_end = (1..=scan.spectral_end)
+        .rev()
+        .find(|&spectral| coefficients[ZIGZAG_TO_NATURAL[usize::from(spectral)]] != 0)
+        .unwrap_or(0);
 
     let mut spectral = scan.spectral_start;
 

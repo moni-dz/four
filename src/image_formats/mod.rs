@@ -8,6 +8,8 @@ pub mod png;
 pub mod tiff;
 
 const BMP_HEADER_BYTES: u32 = 54;
+const DIMENSION_MAX: u32 = 16_384;
+const PIXELS_MAX: u64 = 64 * 1024 * 1024;
 const RGBA_BYTES_PER_PIXEL: u32 = 4;
 
 /// The format-independent result consumed by the viewer.
@@ -34,8 +36,8 @@ pub trait Image: std::fmt::Debug + Send + Sync {
     fn dimensions(&self) -> (u32, u32) {
         let width = self.width();
         let height = self.height();
-        invariant!(width > 0);
-        invariant!(height > 0);
+        assert!(width > 0, "image width must be nonzero");
+        assert!(height > 0, "image height must be nonzero");
         (width, height)
     }
 }
@@ -134,7 +136,12 @@ pub fn encode_bmp(image: &impl Image) -> Vec<u8> {
         usize::try_from(pixel_bytes).expect("the validated decoded image allocation fits usize");
     let file_bytes_usize =
         usize::try_from(file_bytes).expect("the validated BMP allocation fits usize");
-    invariant_eq!(image.rgba8().len(), pixel_bytes_usize);
+    assert_eq!(
+        image.rgba8().len(),
+        pixel_bytes_usize,
+        "image RGBA byte count does not match its dimensions"
+    );
+
     let mut bmp = Vec::with_capacity(file_bytes_usize);
 
     bmp.extend_from_slice(b"BM");
@@ -154,9 +161,78 @@ pub fn encode_bmp(image: &impl Image) -> Vec<u8> {
         .rgba8()
         .as_chunks::<{ RGBA_BYTES_PER_PIXEL as usize }>();
     invariant_eq!(remainder.len(), 0);
-    for pixel in pixels {
-        bmp.extend_from_slice(&[pixel[2], pixel[1], pixel[0], pixel[3]]);
-    }
+    bmp.extend(
+        pixels
+            .iter()
+            .flat_map(|pixel| [pixel[2], pixel[1], pixel[0], pixel[3]]),
+    );
+
     invariant_eq!(bmp.len(), file_bytes_usize);
     bmp
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Image, encode_bmp};
+
+    #[derive(Debug)]
+    struct ContractTestImage {
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    }
+
+    impl Image for ContractTestImage {
+        fn width(&self) -> u32 {
+            self.width
+        }
+
+        fn height(&self) -> u32 {
+            self.height
+        }
+
+        fn rgba8(&self) -> &[u8] {
+            &self.rgba
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "image width must be nonzero")]
+    fn dimensions_reject_zero_width_implementations() {
+        let image = ContractTestImage {
+            width: 0,
+            height: 1,
+            rgba: Vec::new(),
+        };
+
+        let _dimensions = image.dimensions();
+    }
+
+    #[test]
+    #[should_panic(expected = "image RGBA byte count does not match its dimensions")]
+    fn bmp_encoding_rejects_inconsistent_image_implementations() {
+        let image = ContractTestImage {
+            width: 1,
+            height: 1,
+            rgba: vec![0; 3],
+        };
+
+        let _bmp = encode_bmp(&image);
+    }
+
+    #[test]
+    fn bmp_encoding_writes_top_down_bgra_pixels() {
+        let image = ContractTestImage {
+            width: 2,
+            height: 1,
+            rgba: vec![1, 2, 3, 4, 5, 6, 7, 8],
+        };
+
+        let bmp = encode_bmp(&image);
+
+        assert_eq!(&bmp[..2], b"BM");
+        assert_eq!(&bmp[18..22], &2_i32.to_le_bytes());
+        assert_eq!(&bmp[22..26], &(-1_i32).to_le_bytes());
+        assert_eq!(&bmp[54..], &[3, 2, 1, 4, 7, 6, 5, 8]);
+    }
 }

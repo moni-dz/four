@@ -17,7 +17,7 @@ use ::jpegxr::{
     BitDepthBits, ColorFormat, ImageDecode, JXRError, PixelFormat as CodecPixelFormat, PixelInfo,
 };
 
-use super::DecodedImage;
+use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
 use error::error;
 
 pub use error::{Error, JPEGXRError, JPEGXRLimit, Result};
@@ -25,12 +25,10 @@ pub use error::{Error, JPEGXRError, JPEGXRLimit, Result};
 /// The four-byte signature at the beginning of a JPEG XR file.
 pub const SIGNATURE: [u8; 4] = [0x49, 0x49, 0xbc, 0x01];
 
-const DIMENSION_MAX: u32 = 16_384;
 const MAX_CLL_HIGH_BINS: usize = 1 << 16;
 const MAX_CLL_LOW_BINS: usize = 1 << 15;
 const MAX_CLL_LOW_BITS: u32 = 15;
 const MAX_CLL_PERCENTILE_DENOMINATOR: u64 = 10_000;
-const PIXELS_MAX: u64 = 64 * 1024 * 1024;
 const SC_RGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 const SOURCE_BUFFER_MAX: usize = 512 * 1024 * 1024;
 const TONE_MAP_KNEE: f32 = 0.75;
@@ -258,24 +256,30 @@ impl PixelLayout {
                 return Err(unsupported(format, &format!("{other:?} color data")));
             }
         };
+
         let has_alpha = info.has_alpha();
         let source_channels = info.channels();
         let expected_channels = color_channels + usize::from(has_alpha);
+
         if encoding != SampleEncoding::Rgbe && source_channels != expected_channels {
             return Err(unsupported(
                 format,
                 "channel metadata is inconsistent with the color format",
             ));
         }
+
         if encoding == SampleEncoding::Rgbe && has_alpha {
             return Err(unsupported(format, "RGBE with alpha is not supported"));
         }
+
         let bits_per_pixel = info.bits_per_pixel();
         if !bits_per_pixel.is_multiple_of(8) {
             return Err(unsupported(format, "packed pixels are not supported"));
         }
+
         let bytes_per_pixel = bits_per_pixel / 8;
         let sample_bytes = encoding.bytes();
+
         if !bytes_per_pixel.is_multiple_of(sample_bytes)
             || bytes_per_pixel / sample_bytes < source_channels
         {
@@ -337,9 +341,7 @@ impl PixelLayout {
         };
         if self.premultiplied_alpha {
             if alpha > 0.0 {
-                for channel in &mut color {
-                    *channel /= alpha;
-                }
+                color = color.map(|channel| channel / alpha);
             } else {
                 color.fill(0.0);
             }
@@ -572,26 +574,31 @@ fn validate_dimensions(width: i32, height: i32) -> Result<(u32, u32)> {
     let height = u32::try_from(height).map_err(|_conversion_error| {
         error(JPEGXRError::Output("JPEG XR height must be positive"))
     })?;
+
     if width == 0 || height == 0 {
         return Err(error(JPEGXRError::Output(
             "JPEG XR dimensions must both be nonzero",
         )));
     }
+
     if width > DIMENSION_MAX || height > DIMENSION_MAX {
         return Err(error(JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions(
             DIMENSION_MAX,
         ))));
     }
+
     if u64::from(width) * u64::from(height) > PIXELS_MAX {
         return Err(error(JPEGXRError::LimitExceeded(JPEGXRLimit::Pixels(
             PIXELS_MAX,
         ))));
     }
+
     Ok((width, height))
 }
 
 fn decode_sample(bytes: &[u8], encoding: SampleEncoding) -> f32 {
     invariant_eq!(bytes.len(), encoding.bytes());
+
     match encoding {
         SampleEncoding::Unsigned8 => f32::from(bytes[0]) / f32::from(u8::MAX),
         SampleEncoding::Unsigned16 => {
@@ -621,6 +628,7 @@ fn half_to_f32(bits: u16) -> f32 {
     let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
     let exponent = (bits >> 10) & 0x1f;
     let mantissa = bits & 0x03ff;
+
     match exponent {
         0 if mantissa == 0 => sign * 0.0,
         0 => sign * f32::from(mantissa) * 2.0_f32.powi(-24),
@@ -639,10 +647,12 @@ fn decode_rgbe(pixel: &[u8]) -> Result<[f32; 3]> {
             "JPEG XR RGBE pixel is shorter than four bytes",
         )));
     }
+
     let exponent = pixel[3];
     if exponent == 0 {
         return Ok([0.0; 3]);
     }
+
     let scale = 2.0_f32.powi(i32::from(exponent) - 136);
     Ok([
         f32::from(pixel[0]) * scale,
@@ -662,11 +672,11 @@ fn tone_map(color: [f32; 3], max_cll: MaxCll) -> [u8; 3] {
     let luminance_scale = mapped_luminance / luminance;
     let mut mapped = linear.map(|channel| channel * luminance_scale);
     let peak = mapped[0].max(mapped[1]).max(mapped[2]);
+
     if peak > 1.0 {
-        for channel in &mut mapped {
-            *channel /= peak;
-        }
+        mapped = mapped.map(|channel| channel / peak);
     }
+
     mapped.map(|channel| normalized_to_u8(linear_to_srgb(channel)))
 }
 
@@ -784,11 +794,12 @@ mod tests {
             blue_first: false,
         };
         let mut source = Vec::with_capacity(10_000 * layout.bytes_per_pixel);
-        for value in std::iter::repeat_n(1.0_f32, 9_998).chain([4.0, 126.0]) {
-            for channel in [value; 3] {
-                source.extend_from_slice(&channel.to_ne_bytes());
-            }
-        }
+        source.extend(
+            std::iter::repeat_n(1.0_f32, 9_998)
+                .chain([4.0, 126.0])
+                .flat_map(|value| [value; 3])
+                .flat_map(f32::to_ne_bytes),
+        );
 
         let max_cll = MaxCll::estimate(&source, source.len(), layout).unwrap();
         let metadata = JPEGXRMetadata::new(layout, Some(max_cll));

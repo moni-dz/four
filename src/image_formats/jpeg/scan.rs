@@ -40,6 +40,7 @@ pub(super) fn parse_frame_components(
                 "frame contains duplicate component identifiers",
             )));
         }
+
         let sampling = segment.read_u8()?;
         let horizontal_sampling = sampling >> 4;
         let vertical_sampling = sampling & 0x0f;
@@ -48,7 +49,9 @@ pub(super) fn parse_frame_components(
                 "component sampling factor is outside 1 through 4",
             )));
         }
+
         blocks_per_mcu += u32::from(horizontal_sampling) * u32::from(vertical_sampling);
+        
         let quantization_table = usize::from(segment.read_u8()?);
         if quantization_table >= QUANTIZATION_TABLES_MAX {
             return Err(error(JPEGError::Table(
@@ -56,6 +59,7 @@ pub(super) fn parse_frame_components(
                 "component quantization table index is out of range",
             )));
         }
+
         components.push(FrameComponent {
             identifier,
             horizontal_sampling,
@@ -70,11 +74,13 @@ pub(super) fn parse_frame_components(
             coefficients: Vec::new(),
         });
     }
+
     if blocks_per_mcu > 10 {
         return Err(error(JPEGError::LimitExceeded(JPEGLimit::FrameDataUnits(
             10,
         ))));
     }
+
     Ok(components)
 }
 
@@ -88,6 +94,7 @@ pub(super) fn parse_scan_header(segment: &mut Reader<'_>, frame: &Frame) -> Resu
             "scan component count is out of range",
         )));
     }
+
     let mut components = Vec::with_capacity(component_count);
     for _ in 0..component_count {
         let identifier = segment.read_u8()?;
@@ -96,6 +103,7 @@ pub(super) fn parse_scan_header(segment: &mut Reader<'_>, frame: &Frame) -> Resu
             .iter()
             .position(|component| component.identifier == identifier)
             .ok_or_raise(|| JPEGError::Scan("scan references an unknown frame component"))?;
+
         if components
             .iter()
             .any(|component: &ScanComponent| component.frame_index == frame_index)
@@ -104,6 +112,7 @@ pub(super) fn parse_scan_header(segment: &mut Reader<'_>, frame: &Frame) -> Resu
                 "scan contains a duplicate component",
             )));
         }
+
         let selectors = segment.read_u8()?;
         let dc_table = usize::from(selectors >> 4);
         let ac_table = usize::from(selectors & 0x0f);
@@ -112,18 +121,21 @@ pub(super) fn parse_scan_header(segment: &mut Reader<'_>, frame: &Frame) -> Resu
                 "scan entropy table selector is out of range",
             )));
         }
+
         components.push(ScanComponent {
             frame_index,
             dc_table,
             ac_table,
         });
     }
+
     let spectral_start = segment.read_u8()?;
     let spectral_end = segment.read_u8()?;
     let approximation = segment.read_u8()?;
     if segment.remaining() != 0 {
         return Err(error(JPEGError::Segment("SOS segment has trailing bytes")));
     }
+
     let header = ScanHeader {
         components,
         spectral_start,
@@ -131,7 +143,9 @@ pub(super) fn parse_scan_header(segment: &mut Reader<'_>, frame: &Frame) -> Resu
         successive_high: approximation >> 4,
         successive_low: approximation & 0x0f,
     };
+    
     validate_scan_header(&header, frame.process)?;
+
     Ok(header)
 }
 
@@ -144,37 +158,45 @@ fn validate_scan_header(scan: &ScanHeader, process: CodingProcess) -> Result<()>
             && scan.spectral_end == 63
             && scan.successive_high == 0
             && scan.successive_low == 0;
+        
         if !is_sequential {
             return Err(error(JPEGError::Scan(
                 "sequential JPEG scan parameters are invalid",
             )));
         }
+        
         return Ok(());
     }
+    
     if scan.spectral_start > scan.spectral_end || scan.spectral_end >= 64 {
         return Err(error(JPEGError::Scan(
             "progressive spectral selection is out of range",
         )));
     }
+    
     if scan.spectral_start == 0 && scan.spectral_end != 0 {
         return Err(error(JPEGError::Scan(
             "a progressive DC scan must end at coefficient zero",
         )));
     }
+    
     if scan.spectral_start > 0 && scan.components.len() != 1 {
         return Err(error(JPEGError::Scan(
             "a progressive AC scan must contain one component",
         )));
     }
+    
     if scan.successive_high > 0 && scan.successive_low + 1 != scan.successive_high {
         return Err(error(JPEGError::Scan(
             "progressive refinement must advance exactly one bit",
         )));
     }
+    
     if scan.successive_low > 13 {
         return Err(error(JPEGError::Scan(
             "progressive approximation bit exceeds 13",
         )));
     }
+    
     Ok(())
 }

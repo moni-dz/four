@@ -83,9 +83,9 @@ impl Frame {
 
         validate_progressive_storage(&components, &storage)?;
 
-        for component in &mut components {
-            allocate_component_storage(component, &storage)?;
-        }
+        components
+            .iter_mut()
+            .try_for_each(|component| allocate_component_storage(component, &storage))?;
 
         Ok(Self {
             width,
@@ -250,17 +250,18 @@ fn validate_progressive_storage(
     if layout.process == CodingProcess::Sequential {
         return Ok(());
     }
-    let mut byte_count = 0_u64;
-    for component in components {
+    let byte_count = components.iter().try_fold(0_u64, |byte_count, component| {
         let blocks = u64::from(layout.mcu_columns)
             * u64::from(component.horizontal_sampling)
             * u64::from(layout.mcu_rows)
             * u64::from(component.vertical_sampling);
         let component_bytes = blocks * 64 * size_of::<i32>() as u64;
-        byte_count = byte_count.checked_add(component_bytes).ok_or_raise(|| {
+
+        byte_count.checked_add(component_bytes).ok_or_raise(|| {
             JPEGError::ArithmeticOverflow("progressive coefficient storage overflowed")
-        })?;
-    }
+        })
+    })?;
+
     if byte_count > PROGRESSIVE_COEFFICIENT_BYTES_MAX {
         return Err(error(JPEGError::LimitExceeded(
             JPEGLimit::ProgressiveCoefficientBytes(PROGRESSIVE_COEFFICIENT_BYTES_MAX),
@@ -355,15 +356,18 @@ pub(super) fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     if width == 0 || height == 0 {
         return Err(error(JPEGError::Frame("JPEG dimensions must be nonzero")));
     }
+
     if width > DIMENSION_MAX || height > DIMENSION_MAX {
         return Err(error(JPEGError::LimitExceeded(JPEGLimit::Dimensions(
             DIMENSION_MAX,
         ))));
     }
+
     if u64::from(width) * u64::from(height) > PIXELS_MAX {
         return Err(error(JPEGError::LimitExceeded(JPEGLimit::Pixels(
             PIXELS_MAX,
         ))));
     }
+
     Ok(())
 }

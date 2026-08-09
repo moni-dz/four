@@ -192,12 +192,12 @@ fn zlib_stored(data: &[u8]) -> Vec<u8> {
 
 fn adler32(bytes: &[u8]) -> u32 {
     const MODULUS: u32 = 65_521;
-    let mut a = 1_u32;
-    let mut b = 0_u32;
-    for &byte in bytes {
-        a = (a + u32::from(byte)) % MODULUS;
-        b = (b + a) % MODULUS;
-    }
+
+    let (a, b) = bytes.iter().fold((1_u32, 0_u32), |(a, b), &byte| {
+        let a = (a + u32::from(byte)) % MODULUS;
+        (a, (b + a) % MODULUS)
+    });
+
     b << 16 | a
 }
 

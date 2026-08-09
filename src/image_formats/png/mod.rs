@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use ::png::{BitDepth, ColorType, Decoder, Limits, Transformations};
 
-use super::DecodedImage;
+use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
 use error::error;
 
 pub use error::{Error, PNGError, PNGLimit, Result};
@@ -19,8 +19,6 @@ pub use error::{Error, PNGError, PNGLimit, Result};
 pub const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 
 const CODEC_MEMORY_MAX: usize = 320 * 1024 * 1024;
-const DIMENSION_MAX: u32 = 16_384;
-const PIXELS_MAX: u64 = 64 * 1024 * 1024;
 
 /// Returns whether `bytes` begin with the PNG signature.
 #[must_use]
@@ -63,6 +61,7 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
             "PNG codec could not determine the decoded buffer size",
         ))
     })?;
+    
     let rgba_size = rgba_size(width, height)?;
     if output_size > rgba_size {
         return Err(error(PNGError::LimitExceeded(PNGLimit::DecodedBytes(
@@ -74,22 +73,26 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
     let output = reader
         .next_frame(&mut pixel_buffer)
         .map_err(|source| codec_error(&source))?;
+    
     if output.width != width || output.height != height {
         return Err(error(PNGError::Output(
             "animated PNG subframes are not supported",
         )));
     }
+    
     if output.bit_depth != BitDepth::Eight {
         return Err(error(PNGError::Output(
             "PNG codec did not produce eight-bit samples",
         )));
     }
+    
     let used = output.buffer_size();
     let samples = pixel_buffer.get(..used).ok_or_else(|| {
         error(PNGError::Output(
             "PNG codec reported an invalid output length",
         ))
     })?;
+    
     let rgba = normalize_rgba(samples, output.color_type, width, height)?;
     Ok(DecodedImage::new(width, height, rgba))
 }
@@ -100,15 +103,18 @@ fn validate_dimensions(width: u32, height: u32) -> Result<()> {
             "PNG dimensions must both be nonzero",
         )));
     }
+
     if width > DIMENSION_MAX || height > DIMENSION_MAX {
         return Err(error(PNGError::LimitExceeded(PNGLimit::Dimensions(
             DIMENSION_MAX,
         ))));
     }
+
     let pixels = u64::from(width) * u64::from(height);
     if pixels > PIXELS_MAX {
         return Err(error(PNGError::LimitExceeded(PNGLimit::Pixels(PIXELS_MAX))));
     }
+
     Ok(())
 }
 
@@ -155,24 +161,27 @@ fn normalize_rgba(
     let mut rgba = Vec::with_capacity(pixel_count * 4);
     match color_type {
         ColorType::Grayscale => {
-            for &gray in samples {
-                rgba.extend_from_slice(&[gray, gray, gray, u8::MAX]);
-            }
+            rgba.extend(samples.iter().flat_map(|&gray| [gray, gray, gray, u8::MAX]));
         }
-        ColorType::GrayscaleAlpha => {
-            for sample in samples.as_chunks::<2>().0 {
-                rgba.extend_from_slice(&[sample[0], sample[0], sample[0], sample[1]]);
-            }
-        }
-        ColorType::Rgb => {
-            for sample in samples.as_chunks::<3>().0 {
-                rgba.extend_from_slice(&[sample[0], sample[1], sample[2], u8::MAX]);
-            }
-        }
+        ColorType::GrayscaleAlpha => rgba.extend(
+            samples
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .flat_map(|sample| [sample[0], sample[0], sample[0], sample[1]]),
+        ),
+        ColorType::Rgb => rgba.extend(
+            samples
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .flat_map(|sample| [sample[0], sample[1], sample[2], u8::MAX]),
+        ),
         ColorType::Rgba | ColorType::Indexed => {
             unreachable!("RGBA and indexed PNG outputs were handled before sample normalization")
         }
     }
+
     Ok(rgba)
 }
 

@@ -11,7 +11,7 @@ use std::io::Cursor;
 use ::tiff::ColorType;
 use ::tiff::decoder::{BufferLayoutPreference, Decoder, DecodingResult, Limits};
 
-use super::DecodedImage;
+use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
 use error::error;
 
 pub use error::{Error, Result, TIFFError, TIFFLimit};
@@ -26,8 +26,6 @@ pub const SIGNATURE_BIG_LE: [u8; 4] = *b"II+\0";
 pub const SIGNATURE_BIG_BE: [u8; 4] = *b"MM\0+";
 
 const CODEC_BUFFER_MAX: usize = 512 * 1024 * 1024;
-const DIMENSION_MAX: u32 = 16_384;
-const PIXELS_MAX: u64 = 64 * 1024 * 1024;
 
 /// Returns whether `bytes` begin with a classic TIFF or `BigTIFF` signature.
 #[must_use]
@@ -100,12 +98,12 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
 
 #[derive(Clone, Copy, Debug)]
 enum PixelKind {
-    Gray,
-    GrayAlpha,
-    Rgb,
-    Rgba,
-    Cmyk,
-    CmykAlpha,
+    Grayscale,
+    GrayscaleAlpha,
+    RGB,
+    RGBA,
+    CMYK,
+    CMYKA,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -118,23 +116,25 @@ struct PixelFormat {
 impl PixelFormat {
     fn from_color(color: ColorType) -> Result<Self> {
         let (kind, channels, bit_depth) = match color {
-            ColorType::Gray(depth) => (PixelKind::Gray, 1, depth),
-            ColorType::GrayA(depth) => (PixelKind::GrayAlpha, 2, depth),
-            ColorType::RGB(depth) => (PixelKind::Rgb, 3, depth),
-            ColorType::RGBA(depth) => (PixelKind::Rgba, 4, depth),
-            ColorType::CMYK(depth) => (PixelKind::Cmyk, 4, depth),
-            ColorType::CMYKA(depth) => (PixelKind::CmykAlpha, 5, depth),
+            ColorType::Gray(depth) => (PixelKind::Grayscale, 1, depth),
+            ColorType::GrayA(depth) => (PixelKind::GrayscaleAlpha, 2, depth),
+            ColorType::RGB(depth) => (PixelKind::RGB, 3, depth),
+            ColorType::RGBA(depth) => (PixelKind::RGBA, 4, depth),
+            ColorType::CMYK(depth) => (PixelKind::CMYK, 4, depth),
+            ColorType::CMYKA(depth) => (PixelKind::CMYKA, 5, depth),
             other => {
                 return Err(error(TIFFError::Unsupported(format!(
                     "color type {other:?} is not mapped to RGBA8"
                 ))));
             }
         };
+        
         if !(1..=64).contains(&bit_depth) {
             return Err(error(TIFFError::Unsupported(format!(
                 "{bit_depth}-bit integer samples are not supported"
             ))));
         }
+        
         Ok(Self {
             kind,
             channels,
@@ -162,6 +162,7 @@ impl SampleLayout {
             .plane_stride
             .ok_or_else(|| error(TIFFError::Output("TIFF codec omitted its plane stride")))?
             .get();
+
         if !row_stride_bytes.is_multiple_of(sample_bytes)
             || !plane_stride_bytes.is_multiple_of(sample_bytes)
             || !codec.complete_len.is_multiple_of(sample_bytes)
@@ -170,16 +171,19 @@ impl SampleLayout {
                 "TIFF codec returned a misaligned sample layout",
             )));
         }
+
         if codec.complete_len > samples.len().saturating_mul(sample_bytes) {
             return Err(error(TIFFError::Output(
                 "TIFF codec returned an incomplete planar buffer",
             )));
         }
+
         if codec.planes != 1 && codec.planes != channels {
             return Err(error(TIFFError::Output(
                 "TIFF plane count does not match its color channels",
             )));
         }
+
         Ok(Self {
             row_stride: row_stride_bytes / sample_bytes,
             plane_stride: plane_stride_bytes / sample_bytes,
@@ -208,17 +212,20 @@ fn validate_dimensions(width: u32, height: u32) -> Result<()> {
             "TIFF dimensions must both be nonzero",
         )));
     }
+
     if width > DIMENSION_MAX || height > DIMENSION_MAX {
         return Err(error(TIFFError::LimitExceeded(TIFFLimit::Dimensions(
             DIMENSION_MAX,
         ))));
     }
+
     let pixels = u64::from(width) * u64::from(height);
     if pixels > PIXELS_MAX {
         return Err(error(TIFFError::LimitExceeded(TIFFLimit::Pixels(
             PIXELS_MAX,
         ))));
     }
+
     Ok(())
 }
 
@@ -228,11 +235,13 @@ fn validate_raw_size(width: u32, height: u32, format: PixelFormat) -> Result<()>
         * u64::from(height)
         * u64::try_from(format.channels).expect("TIFF channel count fits u64")
         * sample_bytes;
+
     if bytes > CODEC_BUFFER_MAX as u64 {
         return Err(error(TIFFError::LimitExceeded(
             TIFFLimit::CodecBufferBytes(CODEC_BUFFER_MAX),
         )));
     }
+
     Ok(())
 }
 
@@ -263,25 +272,25 @@ fn normalize_unsigned<T: Copy>(
                 Ok(scale_sample(into_u64(value), format.bit_depth))
             };
             match format.kind {
-                PixelKind::Gray => {
+                PixelKind::Grayscale => {
                     let gray = sample(0)?;
                     rgba.extend_from_slice(&[gray, gray, gray, u8::MAX]);
                 }
-                PixelKind::GrayAlpha => {
+                PixelKind::GrayscaleAlpha => {
                     let gray = sample(0)?;
                     rgba.extend_from_slice(&[gray, gray, gray, sample(1)?]);
                 }
-                PixelKind::Rgb => {
+                PixelKind::RGB => {
                     rgba.extend_from_slice(&[sample(0)?, sample(1)?, sample(2)?, u8::MAX]);
                 }
-                PixelKind::Rgba => {
+                PixelKind::RGBA => {
                     rgba.extend_from_slice(&[sample(0)?, sample(1)?, sample(2)?, sample(3)?]);
                 }
-                PixelKind::Cmyk => {
+                PixelKind::CMYK => {
                     let rgb = cmyk_to_rgb(sample(0)?, sample(1)?, sample(2)?, sample(3)?);
                     rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], u8::MAX]);
                 }
-                PixelKind::CmykAlpha => {
+                PixelKind::CMYKA => {
                     let rgb = cmyk_to_rgb(sample(0)?, sample(1)?, sample(2)?, sample(3)?);
                     rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], sample(4)?]);
                 }

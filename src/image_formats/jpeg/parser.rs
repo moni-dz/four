@@ -276,6 +276,7 @@ impl<'a, State> Parser<'a, State> {
             self.arithmetic_conditioning.dc.len(),
             arithmetic::TABLES_MAX
         );
+        
         invariant_eq!(
             self.arithmetic_conditioning.ac.len(),
             arithmetic::TABLES_MAX
@@ -312,12 +313,14 @@ impl<'a, State> Parser<'a, State> {
             if class == 0 {
                 let lower = value & 0x0f;
                 let upper = value >> 4;
+                
                 if lower > upper {
                     return Err(error(JPEGError::Table(
                         JPEGTableKind::ArithmeticConditioning,
                         "DC arithmetic conditioning requires L <= U",
                     )));
                 }
+                
                 self.arithmetic_conditioning.dc[table] =
                     arithmetic::DCConditioning { lower, upper };
             } else {
@@ -327,6 +330,7 @@ impl<'a, State> Parser<'a, State> {
                         "AC arithmetic conditioning must be in 1..=63",
                     )));
                 }
+                
                 self.arithmetic_conditioning.ac[table] = value;
             }
         }
@@ -466,22 +470,23 @@ impl Parser<'_, Scanned> {
 
         let mut frame = self.state.data.frame;
         if frame.process == CodingProcess::Progressive {
-            for component_index in 0..frame.components.len() {
-                if self.state.data.coefficient_bits[component_index][0].is_none() {
-                    return Err(error(JPEGError::Scan(
-                        "progressive JPEG is missing a DC scan",
-                    )));
-                }
+            if self.state.data.coefficient_bits[..frame.components.len()]
+                .iter()
+                .any(|coefficients| coefficients[0].is_none())
+            {
+                return Err(error(JPEGError::Scan(
+                    "progressive JPEG is missing a DC scan",
+                )));
             }
+
             frame.materialize_progressive(&self.quantization_tables)?;
-        } else {
-            for component_index in 0..frame.components.len() {
-                if !self.state.data.component_scanned[component_index] {
-                    return Err(error(JPEGError::Scan(
-                        "sequential JPEG is missing a component scan",
-                    )));
-                }
-            }
+        } else if self.state.data.component_scanned[..frame.components.len()]
+            .iter()
+            .any(|scanned| !scanned)
+        {
+            return Err(error(JPEGError::Scan(
+                "sequential JPEG is missing a component scan",
+            )));
         }
 
         Ok(frame.into_image(self.color_transform))
@@ -526,13 +531,16 @@ impl<State: FramePhase> Parser<'_, State> {
         invariant!(scan.components.len() <= COMPONENTS_MAX);
         invariant_eq!(self.state.data().frame.process, CodingProcess::Sequential);
 
-        for component in &scan.components {
-            if self.state.data().component_scanned[component.frame_index] {
-                return Err(error(JPEGError::Scan(
-                    "sequential arithmetic component was decoded twice",
-                )));
-            }
+        if scan
+            .components
+            .iter()
+            .any(|component| self.state.data().component_scanned[component.frame_index])
+        {
+            return Err(error(JPEGError::Scan(
+                "sequential arithmetic component was decoded twice",
+            )));
         }
+
         let plans = self.build_arithmetic_sequential_plans(&scan.components)?;
         let entropy = self.reader.remaining_slice();
         let conditioning = self.arithmetic_conditioning;
@@ -568,26 +576,27 @@ impl<State: FramePhase> Parser<'_, State> {
         invariant!(!scan.is_empty());
         invariant!(scan.len() <= COMPONENTS_MAX);
 
-        let mut plans = Vec::with_capacity(scan.len());
-        for component in scan {
-            let frame_component = &frame.components[component.frame_index];
-            let quantization = self.quantization_tables[frame_component.quantization_table]
-                .ok_or_raise(|| {
-                    JPEGError::Table(
-                        JPEGTableKind::Quantization,
-                        "arithmetic scan references a missing quantization table",
-                    )
-                })?;
-            plans.push(arithmetic::SequentialPlan {
-                frame_index: component.frame_index,
-                horizontal_sampling: frame_component.horizontal_sampling,
-                vertical_sampling: frame_component.vertical_sampling,
-                quantization,
-                dc_table: component.dc_table,
-                ac_table: component.ac_table,
-            });
-        }
-        Ok(plans)
+        scan.iter()
+            .map(|component| {
+                let frame_component = &frame.components[component.frame_index];
+                let quantization = self.quantization_tables[frame_component.quantization_table]
+                    .ok_or_raise(|| {
+                        JPEGError::Table(
+                            JPEGTableKind::Quantization,
+                            "arithmetic scan references a missing quantization table",
+                        )
+                    })?;
+
+                Ok(arithmetic::SequentialPlan {
+                    frame_index: component.frame_index,
+                    horizontal_sampling: frame_component.horizontal_sampling,
+                    vertical_sampling: frame_component.vertical_sampling,
+                    quantization,
+                    dc_table: component.dc_table,
+                    ac_table: component.ac_table,
+                })
+            })
+            .collect()
     }
 
     fn build_arithmetic_progressive_plans(
@@ -598,18 +607,20 @@ impl<State: FramePhase> Parser<'_, State> {
         invariant!(!scan.components.is_empty());
         invariant!(scan.components.len() <= COMPONENTS_MAX);
 
-        let mut plans = Vec::with_capacity(scan.components.len());
-        for component in &scan.components {
-            let frame_component = &frame.components[component.frame_index];
-            plans.push(arithmetic::ProgressivePlan {
-                frame_index: component.frame_index,
-                horizontal_sampling: frame_component.horizontal_sampling,
-                vertical_sampling: frame_component.vertical_sampling,
-                dc_table: component.dc_table,
-                ac_table: component.ac_table,
-            });
-        }
-        plans
+        scan.components
+            .iter()
+            .map(|component| {
+                let frame_component = &frame.components[component.frame_index];
+
+                arithmetic::ProgressivePlan {
+                    frame_index: component.frame_index,
+                    horizontal_sampling: frame_component.horizontal_sampling,
+                    vertical_sampling: frame_component.vertical_sampling,
+                    dc_table: component.dc_table,
+                    ac_table: component.ac_table,
+                }
+            })
+            .collect()
     }
 
     fn validate_progression(&self, scan: &ScanHeader) -> Result<()> {
@@ -625,13 +636,15 @@ impl<State: FramePhase> Parser<'_, State> {
                 )));
             }
             for coefficient in scan.spectral_start..=scan.spectral_end {
-                let previous = self.state.data().coefficient_bits[component.frame_index]
-                    [usize::from(coefficient)];
+                let previous = self.state
+                    .data().coefficient_bits[component.frame_index][usize::from(coefficient)];
+                
                 if scan.successive_high == 0 && previous.is_some() {
                     return Err(error(JPEGError::Scan(
                         "progressive coefficient band was initialized twice",
                     )));
                 }
+                
                 if scan.successive_high > 0 && previous != Some(scan.successive_high) {
                     return Err(error(JPEGError::Scan(
                         "progressive refinement has an inconsistent bit order",
@@ -646,11 +659,11 @@ impl<State: FramePhase> Parser<'_, State> {
         invariant!(scan.spectral_start <= scan.spectral_end);
         invariant!(scan.components.len() <= COMPONENTS_MAX);
 
+        let coefficient_range = usize::from(scan.spectral_start)..=usize::from(scan.spectral_end);
         for component in &scan.components {
-            for coefficient in scan.spectral_start..=scan.spectral_end {
-                self.state.data_mut().coefficient_bits[component.frame_index]
-                    [usize::from(coefficient)] = Some(scan.successive_low);
-            }
+            self.state.data_mut().coefficient_bits[component.frame_index]
+                [coefficient_range.clone()]
+            .fill(Some(scan.successive_low));
         }
     }
 }
