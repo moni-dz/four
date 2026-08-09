@@ -109,6 +109,33 @@ impl ToneMapper for Clamp {
     }
 }
 
+/// Scales a scene white point to one before clamping.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScaledClamp {
+    white_point: WhitePoint,
+}
+
+impl ScaledClamp {
+    /// Creates a scaled clamp that maps `white_point` to one.
+    #[must_use]
+    pub const fn new(white_point: WhitePoint) -> Self {
+        Self { white_point }
+    }
+
+    /// Returns the scene white point mapped to the display maximum.
+    #[must_use]
+    pub const fn white_point(self) -> WhitePoint {
+        self.white_point
+    }
+}
+
+impl ToneMapper for ScaledClamp {
+    fn map(&self, color: LinearRgb) -> LinearRgb {
+        let divisor = self.white_point.level();
+        LinearRgb::displayable(color.components().map(|component| component / divisor))
+    }
+}
+
 /// Compresses highlights above a fixed knee using the content peak.
 ///
 /// This operator preserves input luminance below `0.75`, maps `max_content_level` to `1.0`, and
@@ -210,4 +237,12 @@ mod tests {
         assert_eq!(color.components(), [0.25, 1.0, 1.0]);
     }
 
+    #[test]
+    fn scaled_clamp_maps_its_white_point_to_one() {
+        let mapper = ScaledClamp::new(WhitePoint::new(4.0).unwrap());
+        let color = mapper.map(LinearRgb::new([1.0, 4.0, 8.0]));
+
+        assert_eq!(color.components(), [0.25, 1.0, 1.0]);
+        assert_eq!(mapper.white_point().level(), 4.0);
+    }
 }
