@@ -154,72 +154,79 @@ impl MetadataField {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SourceFormat {
-    Gif,
-    Jpeg,
-    JpegXl,
-    JpegXr,
-    Png,
-    Tiff,
+    GIF,
+    JPEG,
+    JPEGXL,
+    JPEGXR,
+    PNG,
+    TIFF,
 }
 
 impl SourceFormat {
     const fn label(self) -> &'static str {
         match self {
-            Self::Gif => "GIF",
-            Self::Jpeg => "JPEG",
-            Self::JpegXl => "JPEG XL",
-            Self::JpegXr => "JPEG XR",
-            Self::Png => "PNG",
-            Self::Tiff => "TIFF",
+            Self::GIF => "GIF",
+            Self::JPEG => "JPEG",
+            Self::JPEGXL => "JPEG XL",
+            Self::JPEGXR => "JPEG XR",
+            Self::PNG => "PNG",
+            Self::TIFF => "TIFF",
         }
     }
 
     fn detect(bytes: &[u8], extension: Option<&str>) -> Self {
         if jpeg_xl::has_signature(bytes) {
-            return Self::JpegXl;
-        }
-        if jpeg_xr::has_signature(bytes) {
-            return Self::JpegXr;
-        }
-        if png::has_signature(bytes) {
-            return Self::Png;
-        }
-        if gif::has_signature(bytes) {
-            return Self::Gif;
-        }
-        if tiff::has_signature(bytes) {
-            return Self::Tiff;
-        }
-        if bytes.starts_with(&jpeg::SIGNATURE) {
-            return Self::Jpeg;
+            return Self::JPEGXL;
         }
 
+        if jpeg_xr::has_signature(bytes) {
+            return Self::JPEGXR;
+        }
+
+        if png::has_signature(bytes) {
+            return Self::PNG;
+        }
+
+        if gif::has_signature(bytes) {
+            return Self::GIF;
+        }
+
+        if tiff::has_signature(bytes) {
+            return Self::TIFF;
+        }
+
+        if bytes.starts_with(&jpeg::SIGNATURE) {
+            return Self::JPEG;
+        }
+
+
         let extension = extension.map(str::to_ascii_lowercase);
+
         match extension.as_deref() {
-            Some("jxl") => Self::JpegXl,
-            Some("jxr" | "wdp" | "hdp") => Self::JpegXr,
-            Some("png") => Self::Png,
-            Some("gif") => Self::Gif,
-            Some("tif" | "tiff") => Self::Tiff,
-            _ => Self::Jpeg,
+            Some("jxl") => Self::JPEGXL,
+            Some("jxr" | "wdp" | "hdp") => Self::JPEGXR,
+            Some("png") => Self::PNG,
+            Some("gif") => Self::GIF,
+            Some("tif" | "tiff") => Self::TIFF,
+            _ => Self::JPEG,
         }
     }
 
     fn decode(self, bytes: &[u8], path: &Path) -> LoadResult<DecodedSource> {
         match self {
-            Self::Gif => gif::decode(bytes)
+            Self::GIF => gif::decode(bytes)
                 .or_raise(|| image_decode_error(path))
                 .map(DecodedSource::standard),
 
-            Self::Jpeg => jpeg::decode(bytes)
+            Self::JPEG => jpeg::decode(bytes)
                 .or_raise(|| image_decode_error(path))
                 .map(DecodedSource::standard),
 
-            Self::JpegXl => jpeg_xl::decode(bytes)
+            Self::JPEGXL => jpeg_xl::decode(bytes)
                 .or_raise(|| image_decode_error(path))
                 .map(DecodedSource::standard),
 
-            Self::JpegXr => jpeg_xr::decode_with_metadata(bytes)
+            Self::JPEGXR => jpeg_xr::decode_with_metadata(bytes)
                 .or_raise(|| image_decode_error(path))
                 .map(|decoded| {
                     let metadata = decoded.metadata();
@@ -229,11 +236,11 @@ impl SourceFormat {
                     }
                 }),
 
-            Self::Png => png::decode(bytes)
+            Self::PNG => png::decode(bytes)
                 .or_raise(|| image_decode_error(path))
                 .map(DecodedSource::standard),
 
-            Self::Tiff => tiff::decode(bytes)
+            Self::TIFF => tiff::decode(bytes)
                 .or_raise(|| image_decode_error(path))
                 .map(DecodedSource::standard),
         }
@@ -285,15 +292,19 @@ impl ImageLoad<SelectedImage> {
     fn read(self) -> LoadResult<ImageLoad<EncodedImage>> {
         let file = File::open(&self.path)
             .or_raise(|| LoadError::new(format!("Could not open {}", self.path.display())))?;
+
         let metadata = file
             .metadata()
             .or_raise(|| LoadError::new(format!("Could not inspect {}", self.path.display())))?;
         validate_image_file_size(&self.path, metadata.len())?;
+
         invariant!(metadata.len() <= IMAGE_FILE_BYTES_MAX);
 
         let capacity = usize::try_from(metadata.len())
             .expect("the validated image input limit fits every supported pointer width");
+
         let mut bytes = Vec::with_capacity(capacity);
+
         file.take(IMAGE_FILE_BYTES_MAX + 1)
             .read_to_end(&mut bytes)
             .or_raise(|| LoadError::new(format!("Could not read {}", self.path.display())))?;
@@ -315,10 +326,12 @@ impl ImageLoad<EncodedImage> {
 
         let byte_count = u64::try_from(self.state.bytes.len())
             .expect("the validated image input length fits u64");
+
         let extension = self.path.extension().map(|value| value.to_string_lossy());
         let source_format = SourceFormat::detect(&self.state.bytes, extension.as_deref());
         let decoded = source_format.decode(&self.state.bytes, &self.path)?;
         let image = decoded.image;
+
         invariant!(image.width() > 0);
         invariant!(image.height() > 0);
 
@@ -337,6 +350,7 @@ impl ImageLoad<EncodedImage> {
 impl ImageLoad<DecodedImageState> {
     fn present(self) -> LoadedImage {
         let (width, height) = self.state.image.dimensions();
+
         invariant!(width > 0);
         invariant!(height > 0);
 
@@ -370,6 +384,7 @@ fn display_parent(path: &Path) -> SharedString {
     };
 
     let parent = parent.as_os_str().to_string_lossy();
+
     if parent.is_empty() {
         SharedString::from(".")
     } else {
@@ -391,6 +406,7 @@ fn format_jpeg_xr_dynamic_range(metadata: jpeg_xr::JPEGXRMetadata) -> String {
     let dynamic_range = if metadata.is_hdr() { "HDR" } else { "SDR" };
     let channels = format_jpeg_xr_channels(metadata);
     let bits_per_channel = metadata.bits_per_channel();
+
     format!("{dynamic_range} ({channels} @ {bits_per_channel}-bpc)")
 }
 
@@ -399,9 +415,11 @@ fn jpeg_xr_metadata_fields(metadata: jpeg_xr::JPEGXRMetadata) -> Vec<MetadataFie
         "Dynamic Range",
         format_jpeg_xr_dynamic_range(metadata),
     )];
+
     if metadata.is_hdr() {
         fields.extend(jpeg_xr_hdr_fields(metadata));
     }
+
     fields
 }
 
@@ -554,12 +572,12 @@ mod tests {
 
     #[test]
     fn source_format_extensions_are_case_insensitive() {
-        assert_eq!(SourceFormat::detect(&[], Some("GIF")), SourceFormat::Gif);
-        assert_eq!(SourceFormat::detect(&[], Some("HDP")), SourceFormat::JpegXr);
-        assert_eq!(SourceFormat::detect(&[], Some("TIFF")), SourceFormat::Tiff);
+        assert_eq!(SourceFormat::detect(&[], Some("GIF")), SourceFormat::GIF);
+        assert_eq!(SourceFormat::detect(&[], Some("HDP")), SourceFormat::JPEGXR);
+        assert_eq!(SourceFormat::detect(&[], Some("TIFF")), SourceFormat::TIFF);
         assert_eq!(
             SourceFormat::detect(&[], Some("unknown")),
-            SourceFormat::Jpeg
+            SourceFormat::JPEG
         );
     }
 
@@ -567,7 +585,7 @@ mod tests {
     fn source_signature_takes_precedence_over_extension() {
         assert_eq!(
             SourceFormat::detect(&jpeg_xl::CODESTREAM_SIGNATURE, Some("png")),
-            SourceFormat::JpegXl
+            SourceFormat::JPEGXL
         );
     }
 }
