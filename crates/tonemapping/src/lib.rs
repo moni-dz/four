@@ -1,3 +1,4 @@
+#![feature(portable_simd)]
 //! Maps high-dynamic-range linear RGB colors into a displayable range.
 //!
 //! Tone-mapping operators accept [`LinearRgb`] values whose components are relative linear-light
@@ -31,12 +32,35 @@
 //! assert!(display_linear.components().into_iter().all(|value| (0.0..=1.0).contains(&value)));
 //! ```
 
+use multiversion::multiversion;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::fmt;
 use std::num::NonZeroUsize;
+use std::simd::{
+    Select, Simd,
+    cmp::{SimdPartialEq, SimdPartialOrd},
+    num::SimdFloat,
+};
 
 const REC709_LUMINANCE: [f64; 3] = [0.212_6, 0.715_2, 0.072_2];
+const TONE_MAPPING_LANES: usize = 4;
+const MAX_CLL_LANES: usize = 8;
+
+type F64x4 = Simd<f64, TONE_MAPPING_LANES>;
+type F32x8 = Simd<f32, MAX_CLL_LANES>;
+type I32x8 = Simd<i32, MAX_CLL_LANES>;
+
+const ACES_INPUT_MATRIX: [[f64; 3]; 3] = [
+    [0.597_19, 0.354_58, 0.048_23],
+    [0.076_00, 0.908_34, 0.015_66],
+    [0.028_40, 0.133_83, 0.837_77],
+];
+const ACES_OUTPUT_MATRIX: [[f64; 3]; 3] = [
+    [1.604_75, -0.531_08, -0.073_67],
+    [-0.102_08, 1.108_13, -0.006_05],
+    [-0.003_27, -0.072_76, 1.076_02],
+];
 
 /// Stores a finite, nonnegative linear RGB color.
 ///
@@ -57,36 +81,43 @@ impl LinearRgb {
     /// assert_eq!(color.components(), [2.0, 0.0, 0.0]);
     /// ```
     #[must_use]
+    #[inline]
     pub fn new(components: [f32; 3]) -> Self {
         Self(components.map(sanitize_component))
     }
 
     /// Returns the red, green, and blue components in that order.
     #[must_use]
+    #[inline]
     pub const fn components(self) -> [f32; 3] {
         self.0
     }
 
+    #[inline]
     fn components_f64(self) -> [f64; 3] {
         self.0.map(f64::from)
     }
 
     /// Returns linear Rec. 709 luminance.
     #[must_use]
+    #[inline]
     pub fn luminance(self) -> f32 {
         nonnegative_f64_to_f32(self.luminance_f64())
     }
 
+    #[inline]
     fn luminance_f64(self) -> f64 {
         REC709_LUMINANCE[0] * f64::from(self.0[0])
             + REC709_LUMINANCE[1] * f64::from(self.0[1])
             + REC709_LUMINANCE[2] * f64::from(self.0[2])
     }
 
+    #[inline]
     fn displayable(components: [f64; 3]) -> Self {
         Self(components.map(display_component))
     }
 
+    #[inline]
     fn max_component(self) -> PeakSample {
         let mut channel = ColorChannel::Red;
         if self.0[1] > self.0[channel.index()] {
@@ -120,6 +151,30 @@ pub trait ToneMapper {
     /// Maps `color` into finite `0.0..=1.0` display-linear components.
     #[must_use]
     fn map(&self, color: LinearRgb) -> LinearRgb;
+
+    /// Maps every color in `colors` in place.
+    ///
+    /// The default implementation calls [`ToneMapper::map`] for each color. Built-in operators may
+    /// override this method with a batch implementation while preserving the scalar result.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tonemapping::{Clamp, LinearRgb, ToneMapper};
+    ///
+    /// let mut colors = [LinearRgb::new([0.5, 1.0, 4.0]); 4];
+    /// Clamp.map_in_place(&mut colors);
+    ///
+    /// assert!(colors
+    ///     .into_iter()
+    ///     .all(|color| color.components() == [0.5, 1.0, 1.0]));
+    /// ```
+    #[inline]
+    fn map_in_place(&self, colors: &mut [LinearRgb]) {
+        for color in colors {
+            *color = self.map(*color);
+        }
+    }
 }
 
 /// Identifies a positive finite scene level that maps to display white.
@@ -168,6 +223,23 @@ impl ColorChannel {
             Self::Red => 0,
             Self::Green => 1,
             Self::Blue => 2,
+        }
+    }
+
+    const fn simd_code(self) -> i32 {
+        match self {
+            Self::Red => 0,
+            Self::Green => 1,
+            Self::Blue => 2,
+        }
+    }
+
+    fn from_simd_code(code: i32) -> Self {
+        match code {
+            0 => Self::Red,
+            1 => Self::Green,
+            2 => Self::Blue,
+            _ => unreachable!("SIMD peak channel must be in 0..=2, got {code}"),
         }
     }
 }
@@ -262,10 +334,35 @@ impl MaxCllEstimator {
     }
 
     /// Includes one active-image color in the `MaxCLL` estimate.
+    #[inline]
     pub fn observe(&mut self, color: LinearRgb) {
         self.observed = self.observed.saturating_add(1);
-        let peak = color.max_component();
+        self.retain_peak(color.max_component());
+    }
 
+    /// Includes active-image `colors` in the `MaxCLL` estimate.
+    ///
+    /// This produces the same estimate as calling [`MaxCllEstimator::observe`] in slice order.
+    pub fn observe_many(&mut self, colors: &[LinearRgb]) {
+        self.observed = self.observed.saturating_add(colors.len());
+
+        let fill_count = (self.retained - self.peaks.len()).min(colors.len());
+        for color in &colors[..fill_count] {
+            self.retain_peak(color.max_component());
+        }
+
+        let remaining = &colors[fill_count..];
+        if remaining.len() >= MAX_CLL_LANES {
+            observe_max_cll_candidates(self, remaining);
+        } else {
+            for color in remaining {
+                self.retain_peak(color.max_component());
+            }
+        }
+    }
+
+    #[inline]
+    fn retain_peak(&mut self, peak: PeakSample) {
         if self.peaks.len() < self.retained {
             self.peaks.push(Reverse(peak));
             return;
@@ -324,9 +421,7 @@ impl MaxCllEstimator {
 pub fn estimate_max_cll(colors: &[LinearRgb]) -> Option<MaxCll> {
     let pixel_count = NonZeroUsize::new(colors.len())?;
     let mut estimator = MaxCllEstimator::new(pixel_count);
-    for color in colors {
-        estimator.observe(*color);
-    }
+    estimator.observe_many(colors);
     estimator.finish().ok()
 }
 
@@ -381,14 +476,78 @@ impl Ord for PeakSample {
     }
 }
 
+// The heap threshold only rises once it is full. A lane that does not beat the threshold captured
+// at the start of its chunk therefore cannot become a candidate while earlier lanes are retained.
+#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+fn observe_max_cll_candidates(estimator: &mut MaxCllEstimator, colors: &[LinearRgb]) {
+    debug_assert_eq!(
+        estimator.peaks.len(),
+        estimator.retained,
+        "MaxCLL SIMD filtering requires a full retained-sample heap"
+    );
+
+    let (chunks, tail) = colors.as_chunks::<MAX_CLL_LANES>();
+    for chunk in chunks {
+        let red = F32x8::from_array(std::array::from_fn(|lane| chunk[lane].0[0]));
+        let green = F32x8::from_array(std::array::from_fn(|lane| chunk[lane].0[1]));
+        let blue = F32x8::from_array(std::array::from_fn(|lane| chunk[lane].0[2]));
+
+        let green_is_higher = green.simd_gt(red);
+        let mut levels = green_is_higher.select(green, red);
+        let mut channels = green_is_higher.select(I32x8::splat(1), I32x8::splat(0));
+        let blue_is_higher = blue.simd_gt(levels);
+        levels = blue_is_higher.select(blue, levels);
+        channels = blue_is_higher.select(I32x8::splat(2), channels);
+
+        let threshold = estimator
+            .peaks
+            .peek()
+            .expect("a full MaxCLL retained-sample heap has a threshold")
+            .0;
+        let threshold_levels = F32x8::splat(threshold.level);
+        let candidates = levels.simd_gt(threshold_levels)
+            | (levels.simd_eq(threshold_levels)
+                & channels.simd_gt(I32x8::splat(threshold.channel.simd_code())));
+        let candidate_lanes = candidates.to_array();
+        let levels = levels.to_array();
+        let channels = channels.to_array();
+
+        for lane in 0..MAX_CLL_LANES {
+            if candidate_lanes[lane] {
+                estimator.retain_peak(PeakSample {
+                    level: levels[lane],
+                    channel: ColorChannel::from_simd_code(channels[lane]),
+                });
+            }
+        }
+    }
+
+    for color in tail {
+        estimator.retain_peak(color.max_component());
+    }
+}
+
 /// Clamps every component to the displayable range.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct Clamp;
 
 impl ToneMapper for Clamp {
+    #[inline]
     fn map(&self, color: LinearRgb) -> LinearRgb {
-        LinearRgb::displayable(color.components_f64())
+        clamp_color(color)
     }
+
+    #[inline]
+    fn map_in_place(&self, colors: &mut [LinearRgb]) {
+        for color in colors {
+            *color = clamp_color(*color);
+        }
+    }
+}
+
+#[inline]
+fn clamp_color(color: LinearRgb) -> LinearRgb {
+    LinearRgb(color.0.map(display_component_f32))
 }
 
 /// Scales a scene white point to one before clamping.
@@ -412,6 +571,7 @@ impl ScaledClamp {
 }
 
 impl ToneMapper for ScaledClamp {
+    #[inline]
     fn map(&self, color: LinearRgb) -> LinearRgb {
         let divisor = f64::from(self.white_point.level());
         LinearRgb::displayable(color.components_f64().map(|component| component / divisor))
@@ -423,6 +583,7 @@ impl ToneMapper for ScaledClamp {
 pub struct Reinhard;
 
 impl ToneMapper for Reinhard {
+    #[inline]
     fn map(&self, color: LinearRgb) -> LinearRgb {
         LinearRgb::displayable(
             color
@@ -465,14 +626,28 @@ impl ExtendedReinhard {
 }
 
 impl ToneMapper for ExtendedReinhard {
+    #[inline]
     fn map(&self, color: LinearRgb) -> LinearRgb {
         let white_squared = f64::from(self.white_point.level()).powi(2);
-        LinearRgb::displayable(
-            color
-                .components_f64()
-                .map(|component| component * (1.0 + component / white_squared) / (1.0 + component)),
-        )
+        extended_reinhard(color, white_squared)
     }
+
+    #[inline]
+    fn map_in_place(&self, colors: &mut [LinearRgb]) {
+        let white_squared = f64::from(self.white_point.level()).powi(2);
+        for color in colors {
+            *color = extended_reinhard(*color, white_squared);
+        }
+    }
+}
+
+#[inline]
+fn extended_reinhard(color: LinearRgb, white_squared: f64) -> LinearRgb {
+    LinearRgb::displayable(
+        color
+            .components_f64()
+            .map(|component| component * (1.0 + component / white_squared) / (1.0 + component)),
+    )
 }
 
 /// Applies the simple Reinhard curve to luminance while retaining color ratios.
@@ -480,6 +655,7 @@ impl ToneMapper for ExtendedReinhard {
 pub struct LuminanceReinhard;
 
 impl ToneMapper for LuminanceReinhard {
+    #[inline]
     fn map(&self, color: LinearRgb) -> LinearRgb {
         let scale = 1.0 / (1.0 + color.luminance_f64());
         LinearRgb::displayable(color.components_f64().map(|component| component * scale))
@@ -559,6 +735,7 @@ impl ExtendedLuminanceReinhard {
 }
 
 impl ToneMapper for ExtendedLuminanceReinhard {
+    #[inline]
     fn map(&self, color: LinearRgb) -> LinearRgb {
         let luminance = color.luminance_f64();
         let white_squared = f64::from(self.white_point.luminance()).powi(2);
@@ -572,6 +749,7 @@ impl ToneMapper for ExtendedLuminanceReinhard {
 pub struct ReinhardJodie;
 
 impl ToneMapper for ReinhardJodie {
+    #[inline]
     fn map(&self, color: LinearRgb) -> LinearRgb {
         let components = color.components_f64();
         let luminance_scale = 1.0 / (1.0 + color.luminance_f64());
@@ -593,6 +771,7 @@ impl ToneMapper for ReinhardJodie {
 pub struct Uncharted2;
 
 impl ToneMapper for Uncharted2 {
+    #[inline]
     fn map(&self, color: LinearRgb) -> LinearRgb {
         let white_scale = 1.0 / uncharted2_partial(11.2);
         LinearRgb::displayable(
@@ -622,25 +801,76 @@ fn uncharted2_partial(value: f64) -> f64 {
 pub struct AcesFitted;
 
 impl ToneMapper for AcesFitted {
+    #[inline]
     fn map(&self, color: LinearRgb) -> LinearRgb {
-        const INPUT_MATRIX: [[f64; 3]; 3] = [
-            [0.597_19, 0.354_58, 0.048_23],
-            [0.076_00, 0.908_34, 0.015_66],
-            [0.028_40, 0.133_83, 0.837_77],
-        ];
-        const OUTPUT_MATRIX: [[f64; 3]; 3] = [
-            [1.604_75, -0.531_08, -0.073_67],
-            [-0.102_08, 1.108_13, -0.006_05],
-            [-0.003_27, -0.072_76, 1.076_02],
-        ];
+        aces_fitted(color)
+    }
 
-        let transformed = multiply_rgb(INPUT_MATRIX, color.components_f64());
+    #[inline]
+    fn map_in_place(&self, colors: &mut [LinearRgb]) {
+        let simd_len = colors.len() / TONE_MAPPING_LANES * TONE_MAPPING_LANES;
+        let (simd_colors, tail) = colors.split_at_mut(simd_len);
+        if !simd_colors.is_empty() {
+            aces_fitted_batch(simd_colors);
+        }
+        for color in tail {
+            *color = aces_fitted(*color);
+        }
+    }
+}
+
+#[inline]
+fn aces_fitted(color: LinearRgb) -> LinearRgb {
+    let transformed = multiply_rgb(ACES_INPUT_MATRIX, color.components_f64());
+    let fitted = transformed.map(|component| {
+        let numerator = component * (component + 0.024_578_6) - 0.000_090_537;
+        let denominator = component * (0.983_729 * component + 0.432_951) + 0.238_081;
+        numerator / denominator
+    });
+    LinearRgb::displayable(multiply_rgb(ACES_OUTPUT_MATRIX, fitted))
+}
+
+#[multiversion(targets("x86_64+avx2", "aarch64+neon"))]
+fn aces_fitted_batch(colors: &mut [LinearRgb]) {
+    let (chunks, tail) = colors.as_chunks_mut::<TONE_MAPPING_LANES>();
+    debug_assert!(
+        tail.is_empty(),
+        "fitted ACES SIMD input must contain complete four-pixel chunks"
+    );
+
+    for chunk in chunks {
+        let color = [0, 1, 2].map(|channel| {
+            F64x4::from_array(std::array::from_fn(|lane| {
+                f64::from(chunk[lane].0[channel])
+            }))
+        });
+        let transformed = ACES_INPUT_MATRIX.map(|row| {
+            (F64x4::splat(row[0]) * color[0] + F64x4::splat(row[1]) * color[1])
+                + F64x4::splat(row[2]) * color[2]
+        });
         let fitted = transformed.map(|component| {
-            let numerator = component * (component + 0.024_578_6) - 0.000_090_537;
-            let denominator = component * (0.983_729 * component + 0.432_951) + 0.238_081;
+            let numerator =
+                component * (component + F64x4::splat(0.024_578_6)) - F64x4::splat(0.000_090_537);
+            let denominator = component
+                * (F64x4::splat(0.983_729) * component + F64x4::splat(0.432_951))
+                + F64x4::splat(0.238_081);
             numerator / denominator
         });
-        LinearRgb::displayable(multiply_rgb(OUTPUT_MATRIX, fitted))
+        let mapped = ACES_OUTPUT_MATRIX.map(|row| {
+            (F64x4::splat(row[0]) * fitted[0] + F64x4::splat(row[1]) * fitted[1])
+                + F64x4::splat(row[2]) * fitted[2]
+        });
+        let mapped = mapped.map(|component| {
+            let zero = F64x4::splat(0.0);
+            let one = F64x4::splat(1.0);
+            let below = component.is_nan() | component.simd_le(zero);
+            let bounded = below.select(zero, component.simd_ge(one).select(one, component));
+            bounded.cast::<f32>().to_array()
+        });
+
+        for lane in 0..TONE_MAPPING_LANES {
+            chunk[lane] = LinearRgb([mapped[0][lane], mapped[1][lane], mapped[2][lane]]);
+        }
     }
 }
 
@@ -655,6 +885,7 @@ fn multiply_rgb(matrix: [[f64; 3]; 3], color: [f64; 3]) -> [f64; 3] {
 pub struct AcesApproximate;
 
 impl ToneMapper for AcesApproximate {
+    #[inline]
     fn map(&self, color: LinearRgb) -> LinearRgb {
         const A: f64 = 2.51;
         const B: f64 = 0.03;
@@ -799,6 +1030,7 @@ impl CameraToneMapper<'_> {
 }
 
 impl ToneMapper for CameraToneMapper<'_> {
+    #[inline]
     fn map(&self, color: LinearRgb) -> LinearRgb {
         let white = f64::from(self.white_point.level());
         let mapped = color.components_f64().map(|component| {
@@ -886,6 +1118,17 @@ fn sanitize_component(component: f32) -> f32 {
     }
 }
 
+#[inline]
+fn display_component_f32(component: f32) -> f32 {
+    if component.is_nan() || component <= 0.0 {
+        0.0
+    } else if component >= 1.0 {
+        1.0
+    } else {
+        component
+    }
+}
+
 #[allow(
     clippy::cast_possible_truncation,
     reason = "a finite display-linear component is clamped to the f32 unit interval before casting"
@@ -914,6 +1157,14 @@ fn nonnegative_f64_to_f32(value: f64) -> f32 {
 mod tests {
     use super::*;
 
+    struct DefaultBatchMapper;
+
+    impl ToneMapper for DefaultBatchMapper {
+        fn map(&self, color: LinearRgb) -> LinearRgb {
+            Reinhard.map(color)
+        }
+    }
+
     fn assert_approximately_equal(actual: f32, expected: f32) {
         assert!((actual - expected).abs() <= 1.0e-6);
     }
@@ -933,6 +1184,57 @@ mod tests {
         );
     }
 
+    fn batch_inputs() -> Vec<LinearRgb> {
+        let smallest_positive = f32::from_bits(1);
+        let below_one = f32::from_bits(1.0_f32.to_bits() - 1);
+        let above_one = f32::from_bits(1.0_f32.to_bits() + 1);
+        let palette = [
+            [0.0, smallest_positive, below_one],
+            [above_one, 0.18, 4.0],
+            [f32::MAX, 100_000.0, 0.25],
+            [4.0, 2.0, 1.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [32.0, 0.5, 8.0],
+            [0.01, 0.02, 0.03],
+        ];
+
+        (0..17)
+            .map(|index| LinearRgb::new(palette[index % palette.len()]))
+            .collect()
+    }
+
+    fn assert_batch_matches_scalar(mapper: &dyn ToneMapper, inputs: &[LinearRgb]) {
+        let expected: Vec<_> = inputs
+            .iter()
+            .copied()
+            .map(|color| mapper.map(color))
+            .collect();
+        let mut actual = inputs.to_vec();
+        mapper.map_in_place(&mut actual);
+
+        assert_eq!(actual.len(), expected.len());
+        for (actual, expected) in actual.into_iter().zip(expected) {
+            assert_eq!(
+                actual.components().map(f32::to_bits),
+                expected.components().map(f32::to_bits)
+            );
+        }
+    }
+
+    fn estimate_max_cll_scalarly(colors: &[LinearRgb]) -> MaxCll {
+        let mut estimator = MaxCllEstimator::new(
+            NonZeroUsize::new(colors.len()).expect("test MaxCLL input is nonempty"),
+        );
+        for color in colors {
+            estimator.observe(*color);
+        }
+        estimator
+            .finish()
+            .expect("the scalar test observes every declared pixel")
+    }
+
     #[test]
     fn linear_rgb_preserves_every_finite_nonnegative_component() {
         let color = LinearRgb::new([70_000.0, 100_000.0, f32::INFINITY]);
@@ -946,6 +1248,34 @@ mod tests {
         let color = Clamp.map(LinearRgb::new([0.25, 1.0, 4.0]));
 
         assert_eq!(color.components(), [0.25, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn bulk_mapping_matches_scalar_mapping_at_simd_boundaries() {
+        let inputs = batch_inputs();
+        let extended = ExtendedReinhard::new(WhitePoint::new(4.0).unwrap());
+        let mappers: [&dyn ToneMapper; 3] = [&Clamp, &extended, &AcesFitted];
+
+        for mapper in mappers {
+            for length in [0, 1, 3, 4, 5, 7, 8, 9, 17] {
+                assert_batch_matches_scalar(mapper, &inputs[..length]);
+            }
+        }
+    }
+
+    #[test]
+    fn bulk_extended_reinhard_preserves_extreme_f64_behavior() {
+        let inputs = batch_inputs();
+        for white_point in [f32::from_bits(1), 1.0, 4.0, f32::MAX] {
+            let mapper = ExtendedReinhard::new(WhitePoint::new(white_point).unwrap());
+            assert_batch_matches_scalar(&mapper, &inputs);
+        }
+    }
+
+    #[test]
+    fn tone_mapper_bulk_default_is_object_safe() {
+        let mapper: &dyn ToneMapper = &DefaultBatchMapper;
+        assert_batch_matches_scalar(mapper, &batch_inputs());
     }
 
     #[test]
@@ -1190,5 +1520,75 @@ mod tests {
             error.to_string(),
             "MaxCLL estimator expected 2 pixels but observed 1"
         );
+    }
+
+    #[test]
+    fn max_cll_batches_match_scalar_streams_at_percentile_boundaries() {
+        let palette = [
+            LinearRgb::new([1.0, 0.0, 0.0]),
+            LinearRgb::new([0.0, 2.0, 0.0]),
+            LinearRgb::new([0.0, 0.0, 3.0]),
+            LinearRgb::new([4.0, 1.0, 2.0]),
+            LinearRgb::new([0.25, 0.5, 0.75]),
+        ];
+
+        for pixel_count in [9_999, 10_000, 10_001] {
+            let colors: Vec<_> = (0..pixel_count)
+                .map(|index| palette[index % palette.len()])
+                .collect();
+            let expected = estimate_max_cll_scalarly(&colors);
+            let mut estimator = MaxCllEstimator::new(
+                NonZeroUsize::new(colors.len()).expect("test MaxCLL input is nonempty"),
+            );
+            for batch in colors.chunks(257) {
+                estimator.observe_many(batch);
+            }
+
+            assert_eq!(
+                estimator
+                    .finish()
+                    .expect("the batch test observes every declared pixel"),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn max_cll_batch_retains_channel_order_for_equal_levels() {
+        let colors = [
+            LinearRgb::new([5.0, 0.0, 0.0]),
+            LinearRgb::new([0.0, 5.0, 0.0]),
+            LinearRgb::new([0.0, 0.0, 5.0]),
+            LinearRgb::new([1.0; 3]),
+            LinearRgb::new([2.0; 3]),
+            LinearRgb::new([3.0; 3]),
+            LinearRgb::new([4.0; 3]),
+            LinearRgb::default(),
+            LinearRgb::new([0.5; 3]),
+        ];
+        let mut estimator =
+            MaxCllEstimator::new(NonZeroUsize::new(colors.len()).expect("test input is nonempty"));
+        estimator.observe_many(&colors);
+
+        let max_cll = estimator
+            .finish()
+            .expect("the batch test observes every declared pixel");
+        assert_eq!(max_cll.level(), 5.0);
+        assert_eq!(max_cll.channel(), ColorChannel::Blue);
+    }
+
+    #[test]
+    fn max_cll_batch_counts_lanes_filtered_below_the_threshold() {
+        let mut colors = vec![LinearRgb::new([10.0, 0.0, 0.0])];
+        colors.extend(std::iter::repeat_n(LinearRgb::new([1.0; 3]), 8));
+        let mut estimator =
+            MaxCllEstimator::new(NonZeroUsize::new(colors.len()).expect("test input is nonempty"));
+        estimator.observe_many(&colors);
+
+        let max_cll = estimator
+            .finish()
+            .expect("filtered lanes still count as observations");
+        assert_eq!(max_cll.level(), 10.0);
+        assert_eq!(max_cll.channel(), ColorChannel::Red);
     }
 }

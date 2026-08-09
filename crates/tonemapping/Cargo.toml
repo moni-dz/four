@@ -2,8 +2,14 @@
 name = "tonemapping"
 version = "0.1.0"
 edition = "2024"
-description = "Dependency-free tone-mapping operators for linear RGB colors"
+description = "Tone-mapping operators for linear RGB colors"
 publish = false
+
+[dependencies]
+multiversion = { workspace = true }
+
+[dev-dependencies]
+mimalloc = { workspace = true }
 
 [lints.rust]
 missing_debug_implementations = "warn"
@@ -16,3 +22,8 @@ pedantic = { level = "warn", priority = -1 }
 perf = { level = "warn", priority = -1 }
 style = { level = "warn", priority = -1 }
 suspicious = { level = "warn", priority = -1 }
+
+[[bench]]
+name = "bulk"
+harness = false
+test = false

@@ -10,6 +10,10 @@ default-members = [".", "crates/tonemapping"]
 members = ["crates/tonemapping"]
 resolver = "3"
 
+[workspace.dependencies]
+mimalloc = "0.1.48"
+multiversion = "0.8.0"
+
 [dependencies]
 exn = "0.3.1"
 gif = "0.14.2"
@@ -17,8 +21,8 @@ gpui = { git = "https://github.com/zed-industries/zed", rev = "38ca9106c5306ef93
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "38ca9106c5306ef93e52c35643df015a27f15b72", features = ["font-kit", "wayland", "x11"] }
 jxl-oxide = { version = "0.12.6", default-features = false, features = ["moxcms", "rayon"] }
 jpegxr = "0.3.1"
-multiversion = "0.8.0"
-mimalloc = "0.1.48"
+multiversion = { workspace = true }
+mimalloc = { workspace = true }
 png = "0.18.1"
 tiff = "0.11.3"
 tonemapping = { path = "crates/tonemapping" }
@@ -26,6 +30,14 @@ zune-jpeg = "0.5.15"
 
 [dev-dependencies]
 crc32fast = "1.5.0"
+
+[profile.bench]
+debug = 1
+
+[[bench]]
+name = "jpeg_xr"
+harness = false
+test = false
 
 [lints.rust]
 ambiguous_negative_literals = "warn"
