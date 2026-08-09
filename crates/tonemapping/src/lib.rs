@@ -136,6 +136,20 @@ impl ToneMapper for ScaledClamp {
     }
 }
 
+/// Applies the simple Reinhard curve independently to each component.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Reinhard;
+
+impl ToneMapper for Reinhard {
+    fn map(&self, color: LinearRgb) -> LinearRgb {
+        LinearRgb::displayable(
+            color
+                .components()
+                .map(|component| component / (1.0 + component)),
+        )
+    }
+}
+
 /// Compresses highlights above a fixed knee using the content peak.
 ///
 /// This operator preserves input luminance below `0.75`, maps `max_content_level` to `1.0`, and
@@ -208,6 +222,10 @@ fn sanitize_component(component: f32) -> f32 {
 mod tests {
     use super::*;
 
+    fn assert_approximately_equal(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() <= 1.0e-6);
+    }
+
     #[test]
     fn shoulder_compresses_hdr_white_into_sdr() {
         let mapper = LinearShoulder::new(4.0).unwrap();
@@ -244,5 +262,15 @@ mod tests {
 
         assert_eq!(color.components(), [0.25, 1.0, 1.0]);
         assert_eq!(mapper.white_point().level(), 4.0);
+    }
+
+    #[test]
+    fn reinhard_maps_reference_white_to_middle_gray() {
+        let color = Reinhard.map(LinearRgb::new([0.0, 0.18, 1.0]));
+        let [black, middle_gray, reference_white] = color.components();
+
+        assert_eq!(black, 0.0);
+        assert_approximately_equal(middle_gray, 0.152_542_37);
+        assert_eq!(reference_white, 0.5);
     }
 }
