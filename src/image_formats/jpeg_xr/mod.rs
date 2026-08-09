@@ -13,11 +13,14 @@
 mod error;
 
 use std::io::Cursor;
+use std::num::NonZeroUsize;
 
 use ::jpegxr::{
     BitDepthBits, ColorFormat, ImageDecode, JXRError, PixelFormat as CodecPixelFormat, PixelInfo,
 };
-use tonemapping::{LinearRgb, LinearShoulder, ToneMapper};
+use tonemapping::{
+    ColorChannel as ToneColorChannel, LinearRgb, LinearShoulder, MaxCllEstimator, ToneMapper,
+};
 
 use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
 use error::error;
@@ -27,10 +30,6 @@ pub use error::{Error, JPEGXRError, JPEGXRLimit, Result};
 /// The four-byte signature at the beginning of a JPEG XR file.
 pub const SIGNATURE: [u8; 4] = [0x49, 0x49, 0xbc, 0x01];
 
-const MAX_CLL_HIGH_BINS: usize = 1 << 16;
-const MAX_CLL_LOW_BINS: usize = 1 << 15;
-const MAX_CLL_LOW_BITS: u32 = 15;
-const MAX_CLL_PERCENTILE_DENOMINATOR: u64 = 10_000;
 const SC_RGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 const SOURCE_BUFFER_MAX: usize = 512 * 1024 * 1024;
 
@@ -53,14 +52,6 @@ impl JPEGXRColorChannel {
             Self::Red => 'R',
             Self::Green => 'G',
             Self::Blue => 'B',
-        }
-    }
-
-    const fn index(self) -> usize {
-        match self {
-            Self::Red => 0,
-            Self::Green => 1,
-            Self::Blue => 2,
         }
     }
 }
@@ -575,70 +566,52 @@ impl HDRMetrics {
         let pixels_per_row = row_stride / layout.bytes_per_pixel;
         let row_count = source.len() / row_stride;
 
-        let source_pixel_count = u64::try_from(
-            pixels_per_row
-                .checked_mul(row_count)
-                .expect("validated JPEG XR pixel count fits usize"),
-        )
-        .expect("validated JPEG XR pixel count fits u64");
+        let source_pixel_count = pixels_per_row
+            .checked_mul(row_count)
+            .expect("validated JPEG XR pixel count fits usize");
 
         invariant!(source_pixel_count > 0);
 
         let exclude_fully_transparent =
             layout.has_alpha && has_visible_alpha(source, row_stride, layout)?;
 
-        let mut high_histogram = vec![0_u32; MAX_CLL_HIGH_BINS];
         let mut accumulator = HDRMetricAccumulator::new();
 
         visit_pixels(source, row_stride, layout, |color, alpha| {
             if exclude_fully_transparent && alpha == 0.0 {
                 return;
             }
-            let (level, _channel) = max_rgb(color);
-            let (high, _low) = histogram_parts(level);
-            high_histogram[high] += 1;
             accumulator.observe(color);
         })?;
 
-        let pixel_count = accumulator.pixel_count;
+        let pixel_count = usize::try_from(accumulator.pixel_count)
+            .expect("the bounded JPEG XR pixel count fits usize");
 
         invariant!(pixel_count > 0);
         invariant!(pixel_count <= source_pixel_count);
 
-        let target_rank = pixel_count - pixel_count / MAX_CLL_PERCENTILE_DENOMINATOR;
-        let (high, count_before_high) = percentile_bin(&high_histogram, target_rank);
-
-        let mut low_histogram = vec![0_u32; MAX_CLL_LOW_BINS];
-        let mut low_channel_counts = vec![[0_u32; 3]; MAX_CLL_LOW_BINS];
+        let mut max_cll_estimator = MaxCllEstimator::new(
+            NonZeroUsize::new(pixel_count).expect("HDR metrics include at least one pixel"),
+        );
 
         visit_pixels(source, row_stride, layout, |color, alpha| {
             if exclude_fully_transparent && alpha == 0.0 {
                 return;
             }
-
-            let (level, channel) = max_rgb(color);
-            let (pixel_high, pixel_low) = histogram_parts(level);
-
-            if pixel_high == high {
-                low_histogram[pixel_low] += 1;
-                low_channel_counts[pixel_low][channel.index()] += 1;
-            }
+            max_cll_estimator.observe(LinearRgb::new(color));
         })?;
 
-        let rank_within_high = target_rank - count_before_high;
-        let (low, _count_before_low) = percentile_bin(&low_histogram, rank_within_high);
-        let channel = predominant_channel(low_channel_counts[low]);
-
-        let high = u32::try_from(high).expect("a MaxCLL high histogram index fits u32");
-        let low = u32::try_from(low).expect("a MaxCLL low histogram index fits u32");
-        let relative_light_level = f32::from_bits((high << MAX_CLL_LOW_BITS) | low);
+        let estimate = max_cll_estimator
+            .finish()
+            .expect("the MaxCLL pass visits the measured number of HDR pixels");
+        let relative_light_level = estimate.level();
 
         invariant!(relative_light_level.is_finite());
         invariant!(relative_light_level >= 0.0);
 
         let max_cll = MaxCll {
             nits: relative_light_level * SC_RGB_REFERENCE_WHITE_NITS,
-            channel,
+            channel: jpeg_xr_color_channel(estimate.channel()),
         };
 
         Ok(accumulator.finish(max_cll))
@@ -777,21 +750,11 @@ fn percentage_from_u32(part: u32, total: u32) -> f32 {
     (f64::from(part) * 100.0 / f64::from(total)) as f32
 }
 
-fn predominant_channel(counts: [u32; 3]) -> JPEGXRColorChannel {
-    let mut index = 0;
-    for candidate in 1..counts.len() {
-        if counts[candidate] > counts[index] {
-            index = candidate;
-        }
-    }
-
-    invariant!(counts[index] > 0);
-
-    match index {
-        0 => JPEGXRColorChannel::Red,
-        1 => JPEGXRColorChannel::Green,
-        2 => JPEGXRColorChannel::Blue,
-        _ => unreachable!("a three-channel MaxCLL tally has no other channel index"),
+const fn jpeg_xr_color_channel(channel: ToneColorChannel) -> JPEGXRColorChannel {
+    match channel {
+        ToneColorChannel::Red => JPEGXRColorChannel::Red,
+        ToneColorChannel::Green => JPEGXRColorChannel::Green,
+        ToneColorChannel::Blue => JPEGXRColorChannel::Blue,
     }
 }
 
@@ -836,53 +799,6 @@ fn has_visible_alpha(source: &[u8], row_stride: usize, layout: PixelLayout) -> R
         has_visible_alpha |= alpha > 0.0;
     })?;
     Ok(has_visible_alpha)
-}
-
-fn max_rgb(color: [f32; 3]) -> (f32, JPEGXRColorChannel) {
-    let color = LinearRgb::new(color).components();
-    let mut channel = JPEGXRColorChannel::Red;
-
-    if color[1] > color[channel.index()] {
-        channel = JPEGXRColorChannel::Green;
-    }
-
-    if color[2] > color[channel.index()] {
-        channel = JPEGXRColorChannel::Blue;
-    }
-
-    (color[channel.index()], channel)
-}
-
-fn histogram_parts(value: f32) -> (usize, usize) {
-    invariant!(value.is_finite());
-    invariant!(value >= 0.0);
-
-    let bits = value.to_bits();
-    let high = usize::try_from(bits >> MAX_CLL_LOW_BITS)
-        .expect("a positive f32 high-bit index fits usize");
-    let low_mask =
-        u32::try_from(MAX_CLL_LOW_BINS - 1).expect("the MaxCLL low histogram mask fits u32");
-    let low = usize::try_from(bits & low_mask).expect("an f32 low-bit index fits usize");
-    invariant!(high < MAX_CLL_HIGH_BINS);
-    invariant!(low < MAX_CLL_LOW_BINS);
-    (high, low)
-}
-
-fn percentile_bin(histogram: &[u32], target_rank: u64) -> (usize, u64) {
-    invariant!(target_rank > 0);
-
-    let mut count_before = 0_u64;
-    for (index, count) in histogram.iter().copied().enumerate() {
-        let count_after = count_before + u64::from(count);
-        if count_after >= target_rank {
-            return (index, count_before);
-        }
-        count_before = count_after;
-    }
-
-    panic!(
-        "MaxCLL histogram contains {count_before} samples, fewer than target rank {target_rank}"
-    );
 }
 
 fn validate_dimensions(width: i32, height: i32) -> Result<(u32, u32)> {

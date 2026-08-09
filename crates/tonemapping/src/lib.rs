@@ -5,6 +5,11 @@
 //! Operators return finite components in the inclusive range `0.0..=1.0`; transfer encoding and
 //! integer quantization remain the caller's responsibility.
 
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
+use std::fmt;
+use std::num::NonZeroUsize;
+
 const HDR_COMPONENT_MAX: f32 = 65_504.0;
 const REC709_LUMINANCE: [f32; 3] = [0.212_6, 0.715_2, 0.072_2];
 
@@ -48,6 +53,21 @@ impl LinearRgb {
 
     fn displayable(components: [f32; 3]) -> Self {
         Self(components.map(|component| component.clamp(0.0, 1.0)))
+    }
+
+    fn max_component(self) -> PeakSample {
+        let mut channel = ColorChannel::Red;
+        if self.0[1] > self.0[channel.index()] {
+            channel = ColorChannel::Green;
+        }
+        if self.0[2] > self.0[channel.index()] {
+            channel = ColorChannel::Blue;
+        }
+
+        PeakSample {
+            level: self.0[channel.index()],
+            channel,
+        }
     }
 }
 
@@ -96,6 +116,213 @@ impl WhitePoint {
     #[must_use]
     pub const fn level(self) -> f32 {
         self.0
+    }
+}
+
+/// Identifies the RGB component that determines a content-light level.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum ColorChannel {
+    /// Red determines the light level.
+    Red,
+    /// Green determines the light level.
+    Green,
+    /// Blue determines the light level.
+    Blue,
+}
+
+impl ColorChannel {
+    const fn index(self) -> usize {
+        match self {
+            Self::Red => 0,
+            Self::Green => 1,
+            Self::Blue => 2,
+        }
+    }
+}
+
+/// Stores a still image's 99.99th-percentile maximum content light level.
+///
+/// The level uses the same relative or absolute unit as the linear RGB input. It is selected from
+/// per-pixel `max(R, G, B)` values using the nearest-rank convention.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MaxCll {
+    level: f32,
+    channel: ColorChannel,
+}
+
+impl MaxCll {
+    /// Returns the 99.99th-percentile content level.
+    #[must_use]
+    pub const fn level(self) -> f32 {
+        self.level
+    }
+
+    /// Returns the component that determines the selected content level.
+    #[must_use]
+    pub const fn channel(self) -> ColorChannel {
+        self.channel
+    }
+
+    /// Returns this content level as a white point when it is nonzero.
+    #[must_use]
+    pub fn white_point(self) -> Option<WhitePoint> {
+        WhitePoint::new(self.level)
+    }
+}
+
+/// Reports a mismatch between declared and observed `MaxCLL` pixel counts.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct MaxCllPixelCountError {
+    expected: usize,
+    observed: usize,
+}
+
+impl MaxCllPixelCountError {
+    /// Returns the pixel count declared when the estimator was created.
+    #[must_use]
+    pub const fn expected(self) -> usize {
+        self.expected
+    }
+
+    /// Returns the number of colors passed to the estimator.
+    #[must_use]
+    pub const fn observed(self) -> usize {
+        self.observed
+    }
+}
+
+impl fmt::Display for MaxCllPixelCountError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "MaxCLL estimator expected {} pixels but observed {}",
+            self.expected, self.observed
+        )
+    }
+}
+
+impl std::error::Error for MaxCllPixelCountError {}
+
+/// Computes nearest-rank p99.99 `MaxCLL` from a stream of linear RGB colors.
+///
+/// The estimator retains only the brightest `floor(pixel_count / 10_000) + 1` samples. Declaring
+/// the count up front therefore bounds memory while producing the same result as sorting all
+/// per-pixel `max(R, G, B)` values.
+#[derive(Debug)]
+pub struct MaxCllEstimator {
+    expected: NonZeroUsize,
+    retained: usize,
+    observed: usize,
+    peaks: BinaryHeap<Reverse<PeakSample>>,
+}
+
+impl MaxCllEstimator {
+    /// Creates an estimator for exactly `pixel_count` active-image pixels.
+    #[must_use]
+    pub fn new(pixel_count: NonZeroUsize) -> Self {
+        let retained = pixel_count.get() / 10_000 + 1;
+        Self {
+            expected: pixel_count,
+            retained,
+            observed: 0,
+            peaks: BinaryHeap::with_capacity(retained),
+        }
+    }
+
+    /// Includes one active-image color in the `MaxCLL` estimate.
+    pub fn observe(&mut self, color: LinearRgb) {
+        self.observed = self.observed.saturating_add(1);
+        let peak = color.max_component();
+
+        if self.peaks.len() < self.retained {
+            self.peaks.push(Reverse(peak));
+            return;
+        }
+
+        if let Some(mut threshold) = self.peaks.peek_mut() {
+            if peak > threshold.0 {
+                *threshold = Reverse(peak);
+            }
+        } else {
+            self.peaks.push(Reverse(peak));
+        }
+    }
+
+    /// Finishes the estimate after exactly the declared number of observations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MaxCllPixelCountError`] when the observed pixel count differs from the count passed
+    /// to [`MaxCllEstimator::new`].
+    pub fn finish(self) -> Result<MaxCll, MaxCllPixelCountError> {
+        if self.observed != self.expected.get() {
+            return Err(MaxCllPixelCountError {
+                expected: self.expected.get(),
+                observed: self.observed,
+            });
+        }
+
+        let peak = self.peaks.peek().map_or(
+            PeakSample {
+                level: 0.0,
+                channel: ColorChannel::Red,
+            },
+            |peak| peak.0,
+        );
+        Ok(MaxCll {
+            level: peak.level,
+            channel: peak.channel,
+        })
+    }
+}
+
+/// Estimates p99.99 `MaxCLL` for a complete still-image color slice.
+///
+/// Returns `None` when `colors` is empty.
+///
+/// # Examples
+///
+/// ```
+/// use tonemapping::{LinearRgb, estimate_max_cll};
+///
+/// let colors = [LinearRgb::new([1.0, 2.0, 4.0])];
+/// assert_eq!(estimate_max_cll(&colors).map(|value| value.level()), Some(4.0));
+/// ```
+#[must_use]
+pub fn estimate_max_cll(colors: &[LinearRgb]) -> Option<MaxCll> {
+    let pixel_count = NonZeroUsize::new(colors.len())?;
+    let mut estimator = MaxCllEstimator::new(pixel_count);
+    for color in colors {
+        estimator.observe(*color);
+    }
+    estimator.finish().ok()
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PeakSample {
+    level: f32,
+    channel: ColorChannel,
+}
+
+impl PartialEq for PeakSample {
+    fn eq(&self, other: &Self) -> bool {
+        self.level.to_bits() == other.level.to_bits() && self.channel == other.channel
+    }
+}
+
+impl Eq for PeakSample {}
+
+impl PartialOrd for PeakSample {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for PeakSample {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.level
+            .total_cmp(&other.level)
+            .then_with(|| self.channel.cmp(&other.channel))
     }
 }
 
@@ -272,5 +499,40 @@ mod tests {
         assert_eq!(black, 0.0);
         assert_approximately_equal(middle_gray, 0.152_542_37);
         assert_eq!(reference_white, 0.5);
+    }
+
+    #[test]
+    fn max_cll_rejects_the_brightest_point_zero_one_percent() {
+        let mut colors = vec![LinearRgb::new([1.0; 3]); 9_998];
+        colors.extend([LinearRgb::new([4.0; 3]), LinearRgb::new([126.0; 3])]);
+
+        let max_cll = estimate_max_cll(&colors).unwrap();
+
+        assert_eq!(max_cll.level(), 4.0);
+        assert_eq!(max_cll.channel(), ColorChannel::Red);
+        assert_eq!(max_cll.white_point().map(WhitePoint::level), Some(4.0));
+    }
+
+    #[test]
+    fn max_cll_uses_max_rgb_instead_of_luminance() {
+        let max_cll = estimate_max_cll(&[LinearRgb::new([0.0, 0.0, 5.0])]).unwrap();
+
+        assert_eq!(max_cll.level(), 5.0);
+        assert_eq!(max_cll.channel(), ColorChannel::Blue);
+    }
+
+    #[test]
+    fn max_cll_reports_incomplete_pixel_streams() {
+        let mut estimator = MaxCllEstimator::new(NonZeroUsize::new(2).unwrap());
+        estimator.observe(LinearRgb::new([1.0; 3]));
+
+        let error = estimator.finish().unwrap_err();
+
+        assert_eq!(error.expected(), 2);
+        assert_eq!(error.observed(), 1);
+        assert_eq!(
+            error.to_string(),
+            "MaxCLL estimator expected 2 pixels but observed 1"
+        );
     }
 }
