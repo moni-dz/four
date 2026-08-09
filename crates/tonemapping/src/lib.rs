@@ -431,6 +431,75 @@ impl ToneMapper for LuminanceReinhard {
     }
 }
 
+/// Identifies a positive finite luminance that maps to display white.
+///
+/// This type is distinct from [`MaxCll`], which is computed from `max(R, G, B)` rather than
+/// luminance.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LuminanceWhitePoint(WhitePoint);
+
+impl LuminanceWhitePoint {
+    /// Creates a white point from a positive finite luminance.
+    ///
+    /// Returns `None` when `luminance` is zero, negative, or non-finite.
+    #[must_use]
+    pub fn new(luminance: f32) -> Option<Self> {
+        WhitePoint::new(luminance).map(Self)
+    }
+
+    /// Returns the linear luminance represented by this white point.
+    #[must_use]
+    pub const fn luminance(self) -> f32 {
+        self.0.level()
+    }
+}
+
+/// Estimates a p99.99 luminance white point for a complete still image.
+///
+/// This applies the paper's spatial outlier-rejection percentile to Rec. 709 luminance. It is an
+/// analogous statistic for luminance-based curves, not `MaxCLL`.
+#[must_use]
+pub fn estimate_luminance_white_point(colors: &[LinearRgb]) -> Option<LuminanceWhitePoint> {
+    let pixel_count = colors.len();
+    if pixel_count == 0 {
+        return None;
+    }
+
+    let mut luminances: Vec<_> = colors.iter().map(|color| color.luminance()).collect();
+    let rank_index = pixel_count - pixel_count / 10_000 - 1;
+    let (_lower, luminance, _upper) = luminances.select_nth_unstable_by(rank_index, f32::total_cmp);
+    LuminanceWhitePoint::new(*luminance)
+}
+
+/// Applies extended Reinhard to luminance while retaining color ratios.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExtendedLuminanceReinhard {
+    white_point: LuminanceWhitePoint,
+}
+
+impl ExtendedLuminanceReinhard {
+    /// Creates an operator with the supplied luminance `white_point`.
+    #[must_use]
+    pub const fn new(white_point: LuminanceWhitePoint) -> Self {
+        Self { white_point }
+    }
+
+    /// Returns the luminance mapped to display white.
+    #[must_use]
+    pub const fn white_point(self) -> LuminanceWhitePoint {
+        self.white_point
+    }
+}
+
+impl ToneMapper for ExtendedLuminanceReinhard {
+    fn map(&self, color: LinearRgb) -> LinearRgb {
+        let luminance = color.luminance();
+        let white_squared = self.white_point.luminance().powi(2);
+        let scale = (1.0 + luminance / white_squared) / (1.0 + luminance);
+        LinearRgb::displayable(color.components().map(|component| component * scale))
+    }
+}
+
 /// Compresses highlights above a fixed knee using the content peak.
 ///
 /// This operator preserves input luminance below `0.75`, maps `max_content_level` to `1.0`, and
@@ -587,6 +656,28 @@ mod tests {
             output.luminance(),
             input.luminance() / (1.0 + input.luminance()),
         );
+    }
+
+    #[test]
+    fn extended_luminance_reinhard_uses_a_luminance_white_point() {
+        let white_point = LuminanceWhitePoint::new(4.0).unwrap();
+        let mapper = ExtendedLuminanceReinhard::new(white_point);
+        let [red, green, blue] = mapper.map(LinearRgb::new([1.0, 0.5, 0.25])).components();
+
+        assert_approximately_equal(red, 0.652_772_3);
+        assert_approximately_equal(green, 0.326_386_15);
+        assert_approximately_equal(blue, 0.163_193_08);
+        assert_eq!(mapper.white_point().luminance(), 4.0);
+    }
+
+    #[test]
+    fn luminance_white_point_rejects_the_brightest_outlier() {
+        let mut colors = vec![LinearRgb::new([1.0; 3]); 9_998];
+        colors.extend([LinearRgb::new([4.0; 3]), LinearRgb::new([126.0; 3])]);
+
+        let white_point = estimate_luminance_white_point(&colors).unwrap();
+
+        assert_approximately_equal(white_point.luminance(), 4.0);
     }
 
     #[test]
