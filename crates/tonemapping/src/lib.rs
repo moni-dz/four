@@ -581,6 +581,27 @@ fn multiply_rgb(matrix: [[f32; 3]; 3], color: [f32; 3]) -> [f32; 3] {
     matrix.map(|row| row[0] * color[0] + row[1] * color[1] + row[2] * color[2])
 }
 
+/// Applies Krzysztof Narkowicz's scalar ACES approximation component-wise.
+///
+/// The input is pre-exposed by `0.6`, matching the article's comparison with the fitted transform.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AcesApproximate;
+
+impl ToneMapper for AcesApproximate {
+    fn map(&self, color: LinearRgb) -> LinearRgb {
+        const A: f32 = 2.51;
+        const B: f32 = 0.03;
+        const C: f32 = 2.43;
+        const D: f32 = 0.59;
+        const E: f32 = 0.14;
+
+        LinearRgb::displayable(color.components().map(|component| {
+            let exposed = component * 0.6;
+            exposed * (A * exposed + B) / (exposed * (C * exposed + D) + E)
+        }))
+    }
+}
+
 /// Compresses highlights above a fixed knee using the content peak.
 ///
 /// This operator preserves input luminance below `0.75`, maps `max_content_level` to `1.0`, and
@@ -807,6 +828,17 @@ mod tests {
             AcesFitted.map(LinearRgb::new([0.0, 0.0, 1.0])),
             [0.0, 0.0, 0.601_758_84],
         );
+    }
+
+    #[test]
+    fn aces_approximate_includes_the_article_pre_exposure() {
+        let [middle_gray, reference_white, clipped] = AcesApproximate
+            .map(LinearRgb::new([0.18, 1.0, 100.0]))
+            .components();
+
+        assert_approximately_equal(middle_gray, 0.140_119_57);
+        assert_approximately_equal(reference_white, 0.673_290_5);
+        assert_eq!(clipped, 1.0);
     }
 
     #[test]
