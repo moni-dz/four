@@ -4,20 +4,44 @@
 //! levels. A component of `1.0` conventionally represents the target display's reference white.
 //! Operators return finite components in the inclusive range `0.0..=1.0`; transfer encoding and
 //! integer quantization remain the caller's responsibility.
+//!
+//! [`Clamp`] and [`ScaledClamp`] provide clipping baselines. The Reinhard family includes
+//! component-wise, luminance-preserving, white-point, and Reinhard-Jodie variants. [`Uncharted2`],
+//! [`AcesFitted`], and [`AcesApproximate`] provide filmic curves, while [`CameraResponse`] applies
+//! a caller-supplied normalized camera-response lookup table.
+//!
+//! [`estimate_max_cll`] and [`MaxCllEstimator`] select the nearest-rank 99.99th percentile of
+//! per-pixel `max(R, G, B)`. Inputs determine the unit: absolute-nit inputs produce `MaxCLL` in nits,
+//! while relative inputs produce a relative light level. Luminance-based Reinhard uses the
+//! distinct [`estimate_luminance_white_point`] statistic.
+//!
+//! # Example
+//!
+//! ```
+//! use tonemapping::{ExtendedReinhard, LinearRgb, ToneMapper, estimate_max_cll};
+//!
+//! let pixels = [
+//!     LinearRgb::new([0.5, 1.0, 2.0]),
+//!     LinearRgb::new([1.0, 2.0, 4.0]),
+//! ];
+//! let max_cll = estimate_max_cll(&pixels).expect("the image is not empty");
+//! let mapper = ExtendedReinhard::from_max_cll(max_cll).expect("the image is not black");
+//! let display_linear = mapper.map(pixels[0]);
+//!
+//! assert!(display_linear.components().into_iter().all(|value| (0.0..=1.0).contains(&value)));
+//! ```
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::fmt;
 use std::num::NonZeroUsize;
 
-const HDR_COMPONENT_MAX: f32 = 65_504.0;
-const REC709_LUMINANCE: [f32; 3] = [0.212_6, 0.715_2, 0.072_2];
+const REC709_LUMINANCE: [f64; 3] = [0.212_6, 0.715_2, 0.072_2];
 
 /// Stores a finite, nonnegative linear RGB color.
 ///
-/// Construction replaces negative and `NaN` components with zero. Positive infinity and finite
-/// values above the largest finite binary16 value are limited to `65_504`, which keeps subsequent
-/// tone-mapping arithmetic bounded for common HDR interchange formats.
+/// Construction replaces negative and `NaN` components with zero and positive infinity with
+/// `f32::MAX`. Every finite nonnegative `f32` is preserved.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LinearRgb([f32; 3]);
 
@@ -43,16 +67,24 @@ impl LinearRgb {
         self.0
     }
 
+    fn components_f64(self) -> [f64; 3] {
+        self.0.map(f64::from)
+    }
+
     /// Returns linear Rec. 709 luminance.
     #[must_use]
     pub fn luminance(self) -> f32 {
-        REC709_LUMINANCE[0] * self.0[0]
-            + REC709_LUMINANCE[1] * self.0[1]
-            + REC709_LUMINANCE[2] * self.0[2]
+        nonnegative_f64_to_f32(self.luminance_f64())
     }
 
-    fn displayable(components: [f32; 3]) -> Self {
-        Self(components.map(|component| component.clamp(0.0, 1.0)))
+    fn luminance_f64(self) -> f64 {
+        REC709_LUMINANCE[0] * f64::from(self.0[0])
+            + REC709_LUMINANCE[1] * f64::from(self.0[1])
+            + REC709_LUMINANCE[2] * f64::from(self.0[2])
+    }
+
+    fn displayable(components: [f64; 3]) -> Self {
+        Self(components.map(display_component))
     }
 
     fn max_component(self) -> PeakSample {
@@ -304,6 +336,29 @@ struct PeakSample {
     channel: ColorChannel,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct OrderedLevel(f32);
+
+impl PartialEq for OrderedLevel {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for OrderedLevel {}
+
+impl PartialOrd for OrderedLevel {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedLevel {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
 impl PartialEq for PeakSample {
     fn eq(&self, other: &Self) -> bool {
         self.level.to_bits() == other.level.to_bits() && self.channel == other.channel
@@ -332,7 +387,7 @@ pub struct Clamp;
 
 impl ToneMapper for Clamp {
     fn map(&self, color: LinearRgb) -> LinearRgb {
-        LinearRgb::displayable(color.components())
+        LinearRgb::displayable(color.components_f64())
     }
 }
 
@@ -358,8 +413,8 @@ impl ScaledClamp {
 
 impl ToneMapper for ScaledClamp {
     fn map(&self, color: LinearRgb) -> LinearRgb {
-        let divisor = self.white_point.level();
-        LinearRgb::displayable(color.components().map(|component| component / divisor))
+        let divisor = f64::from(self.white_point.level());
+        LinearRgb::displayable(color.components_f64().map(|component| component / divisor))
     }
 }
 
@@ -371,7 +426,7 @@ impl ToneMapper for Reinhard {
     fn map(&self, color: LinearRgb) -> LinearRgb {
         LinearRgb::displayable(
             color
-                .components()
+                .components_f64()
                 .map(|component| component / (1.0 + component)),
         )
     }
@@ -411,10 +466,10 @@ impl ExtendedReinhard {
 
 impl ToneMapper for ExtendedReinhard {
     fn map(&self, color: LinearRgb) -> LinearRgb {
-        let white_squared = self.white_point.level().powi(2);
+        let white_squared = f64::from(self.white_point.level()).powi(2);
         LinearRgb::displayable(
             color
-                .components()
+                .components_f64()
                 .map(|component| component * (1.0 + component / white_squared) / (1.0 + component)),
         )
     }
@@ -426,8 +481,8 @@ pub struct LuminanceReinhard;
 
 impl ToneMapper for LuminanceReinhard {
     fn map(&self, color: LinearRgb) -> LinearRgb {
-        let scale = 1.0 / (1.0 + color.luminance());
-        LinearRgb::displayable(color.components().map(|component| component * scale))
+        let scale = 1.0 / (1.0 + color.luminance_f64());
+        LinearRgb::displayable(color.components_f64().map(|component| component * scale))
     }
 }
 
@@ -465,10 +520,22 @@ pub fn estimate_luminance_white_point(colors: &[LinearRgb]) -> Option<LuminanceW
         return None;
     }
 
-    let mut luminances: Vec<_> = colors.iter().map(|color| color.luminance()).collect();
-    let rank_index = pixel_count - pixel_count / 10_000 - 1;
-    let (_lower, luminance, _upper) = luminances.select_nth_unstable_by(rank_index, f32::total_cmp);
-    LuminanceWhitePoint::new(*luminance)
+    let retained = pixel_count / 10_000 + 1;
+    let mut luminances = BinaryHeap::with_capacity(retained);
+    for color in colors {
+        let luminance = OrderedLevel(color.luminance());
+        if luminances.len() < retained {
+            luminances.push(Reverse(luminance));
+        } else if let Some(mut threshold) = luminances.peek_mut()
+            && luminance > threshold.0
+        {
+            *threshold = Reverse(luminance);
+        }
+    }
+
+    luminances
+        .peek()
+        .and_then(|luminance| LuminanceWhitePoint::new(luminance.0.0))
 }
 
 /// Applies extended Reinhard to luminance while retaining color ratios.
@@ -493,10 +560,10 @@ impl ExtendedLuminanceReinhard {
 
 impl ToneMapper for ExtendedLuminanceReinhard {
     fn map(&self, color: LinearRgb) -> LinearRgb {
-        let luminance = color.luminance();
-        let white_squared = self.white_point.luminance().powi(2);
+        let luminance = color.luminance_f64();
+        let white_squared = f64::from(self.white_point.luminance()).powi(2);
         let scale = (1.0 + luminance / white_squared) / (1.0 + luminance);
-        LinearRgb::displayable(color.components().map(|component| component * scale))
+        LinearRgb::displayable(color.components_f64().map(|component| component * scale))
     }
 }
 
@@ -506,8 +573,8 @@ pub struct ReinhardJodie;
 
 impl ToneMapper for ReinhardJodie {
     fn map(&self, color: LinearRgb) -> LinearRgb {
-        let components = color.components();
-        let luminance_scale = 1.0 / (1.0 + color.luminance());
+        let components = color.components_f64();
+        let luminance_scale = 1.0 / (1.0 + color.luminance_f64());
         let component_mapped = components.map(|component| component / (1.0 + component));
         let luminance_mapped = components.map(|component| component * luminance_scale);
         let blended = std::array::from_fn(|index| {
@@ -530,19 +597,19 @@ impl ToneMapper for Uncharted2 {
         let white_scale = 1.0 / uncharted2_partial(11.2);
         LinearRgb::displayable(
             color
-                .components()
+                .components_f64()
                 .map(|component| uncharted2_partial(component * 2.0) * white_scale),
         )
     }
 }
 
-fn uncharted2_partial(value: f32) -> f32 {
-    const A: f32 = 0.15;
-    const B: f32 = 0.50;
-    const C: f32 = 0.10;
-    const D: f32 = 0.20;
-    const E: f32 = 0.02;
-    const F: f32 = 0.30;
+fn uncharted2_partial(value: f64) -> f64 {
+    const A: f64 = 0.15;
+    const B: f64 = 0.50;
+    const C: f64 = 0.10;
+    const D: f64 = 0.20;
+    const E: f64 = 0.02;
+    const F: f64 = 0.30;
 
     ((value * (A * value + C * B) + D * E) / (value * (A * value + B) + D * F)) - E / F
 }
@@ -556,18 +623,18 @@ pub struct AcesFitted;
 
 impl ToneMapper for AcesFitted {
     fn map(&self, color: LinearRgb) -> LinearRgb {
-        const INPUT_MATRIX: [[f32; 3]; 3] = [
+        const INPUT_MATRIX: [[f64; 3]; 3] = [
             [0.597_19, 0.354_58, 0.048_23],
             [0.076_00, 0.908_34, 0.015_66],
             [0.028_40, 0.133_83, 0.837_77],
         ];
-        const OUTPUT_MATRIX: [[f32; 3]; 3] = [
+        const OUTPUT_MATRIX: [[f64; 3]; 3] = [
             [1.604_75, -0.531_08, -0.073_67],
             [-0.102_08, 1.108_13, -0.006_05],
             [-0.003_27, -0.072_76, 1.076_02],
         ];
 
-        let transformed = multiply_rgb(INPUT_MATRIX, color.components());
+        let transformed = multiply_rgb(INPUT_MATRIX, color.components_f64());
         let fitted = transformed.map(|component| {
             let numerator = component * (component + 0.024_578_6) - 0.000_090_537;
             let denominator = component * (0.983_729 * component + 0.432_951) + 0.238_081;
@@ -577,7 +644,7 @@ impl ToneMapper for AcesFitted {
     }
 }
 
-fn multiply_rgb(matrix: [[f32; 3]; 3], color: [f32; 3]) -> [f32; 3] {
+fn multiply_rgb(matrix: [[f64; 3]; 3], color: [f64; 3]) -> [f64; 3] {
     matrix.map(|row| row[0] * color[0] + row[1] * color[1] + row[2] * color[2])
 }
 
@@ -589,13 +656,13 @@ pub struct AcesApproximate;
 
 impl ToneMapper for AcesApproximate {
     fn map(&self, color: LinearRgb) -> LinearRgb {
-        const A: f32 = 2.51;
-        const B: f32 = 0.03;
-        const C: f32 = 2.43;
-        const D: f32 = 0.59;
-        const E: f32 = 0.14;
+        const A: f64 = 2.51;
+        const B: f64 = 0.03;
+        const C: f64 = 2.43;
+        const D: f64 = 0.59;
+        const E: f64 = 0.14;
 
-        LinearRgb::displayable(color.components().map(|component| {
+        LinearRgb::displayable(color.components_f64().map(|component| {
             let exposed = component * 0.6;
             exposed * (A * exposed + B) / (exposed * (C * exposed + D) + E)
         }))
@@ -604,8 +671,9 @@ impl ToneMapper for AcesApproximate {
 
 /// Stores a normalized camera response function sampled as a lookup table.
 ///
-/// Irradiance samples must be strictly increasing within `0.0..=1.0`. Intensity samples must be
-/// nondecreasing within the same range. Mapping uses linear interpolation between adjacent samples.
+/// Irradiance samples must run from zero to one and be strictly increasing. Intensity samples must
+/// run from zero to one and be nondecreasing. Mapping uses linear interpolation between adjacent
+/// samples.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CameraResponse {
     irradiance: Box<[f32]>,
@@ -618,7 +686,8 @@ impl CameraResponse {
     /// # Errors
     ///
     /// Returns [`CameraResponseError`] when the arrays have different lengths, contain fewer than
-    /// two samples, contain non-finite or out-of-range values, or are not ordered as required.
+    /// two samples, do not span normalized black through white, contain non-finite or out-of-range
+    /// values, or are not ordered as required.
     pub fn new(
         irradiance: impl Into<Box<[f32]>>,
         intensity: impl Into<Box<[f32]>>,
@@ -654,6 +723,21 @@ impl CameraResponse {
             }
         }
 
+        #[allow(
+            clippy::float_cmp,
+            reason = "normalized camera curves must contain the exact conventional endpoints"
+        )]
+        if irradiance[0] != 0.0 || irradiance[irradiance.len() - 1] != 1.0 {
+            return Err(CameraResponseError::IrradianceEndpoints);
+        }
+        #[allow(
+            clippy::float_cmp,
+            reason = "normalized camera curves must contain the exact conventional endpoints"
+        )]
+        if intensity[0] != 0.0 || intensity[intensity.len() - 1] != 1.0 {
+            return Err(CameraResponseError::IntensityEndpoints);
+        }
+
         Ok(Self {
             irradiance,
             intensity,
@@ -678,21 +762,21 @@ impl CameraResponse {
         }
     }
 
-    fn intensity_at(&self, irradiance: f32) -> f32 {
+    fn intensity_at(&self, irradiance: f64) -> f64 {
         match self
             .irradiance
-            .binary_search_by(|sample| sample.total_cmp(&irradiance))
+            .binary_search_by(|sample| f64::from(*sample).total_cmp(&irradiance))
         {
-            Ok(index) => self.intensity[index],
-            Err(0) => self.intensity[0],
-            Err(upper) if upper == self.irradiance.len() => self.intensity[upper - 1],
+            Ok(index) => f64::from(self.intensity[index]),
+            Err(0) => f64::from(self.intensity[0]),
+            Err(upper) if upper == self.irradiance.len() => f64::from(self.intensity[upper - 1]),
             Err(upper) => {
                 let lower = upper - 1;
-                let low_irradiance = self.irradiance[lower];
-                let high_irradiance = self.irradiance[upper];
+                let low_irradiance = f64::from(self.irradiance[lower]);
+                let high_irradiance = f64::from(self.irradiance[upper]);
                 let position = (irradiance - low_irradiance) / (high_irradiance - low_irradiance);
-                let low_intensity = self.intensity[lower];
-                let high_intensity = self.intensity[upper];
+                let low_intensity = f64::from(self.intensity[lower]);
+                let high_intensity = f64::from(self.intensity[upper]);
                 low_intensity * (1.0 - position) + high_intensity * position
             }
         }
@@ -716,8 +800,8 @@ impl CameraToneMapper<'_> {
 
 impl ToneMapper for CameraToneMapper<'_> {
     fn map(&self, color: LinearRgb) -> LinearRgb {
-        let white = self.white_point.level();
-        let mapped = color.components().map(|component| {
+        let white = f64::from(self.white_point.level());
+        let mapped = color.components_f64().map(|component| {
             let irradiance = (component / white).clamp(0.0, 1.0);
             self.response.intensity_at(irradiance)
         });
@@ -745,6 +829,10 @@ pub enum CameraResponseError {
     IntensityOutOfRange(usize),
     /// An intensity sample is lower than its predecessor.
     IntensityDecreases(usize),
+    /// The irradiance domain does not start at zero and end at one.
+    IrradianceEndpoints,
+    /// The intensity range does not start at zero and end at one.
+    IntensityEndpoints,
 }
 
 impl fmt::Display for CameraResponseError {
@@ -778,6 +866,12 @@ impl fmt::Display for CameraResponseError {
             Self::IntensityDecreases(index) => {
                 write!(formatter, "camera intensity sample {index} decreases")
             }
+            Self::IrradianceEndpoints => {
+                formatter.write_str("camera irradiance must start at zero and end at one")
+            }
+            Self::IntensityEndpoints => {
+                formatter.write_str("camera intensity must start at zero and end at one")
+            }
         }
     }
 }
@@ -788,8 +882,32 @@ fn sanitize_component(component: f32) -> f32 {
     if component.is_nan() || component <= 0.0 {
         0.0
     } else {
-        component.min(HDR_COMPONENT_MAX)
+        component.min(f32::MAX)
     }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a finite display-linear component is clamped to the f32 unit interval before casting"
+)]
+fn display_component(component: f64) -> f32 {
+    if component.is_nan() || component <= 0.0 {
+        0.0
+    } else if component >= 1.0 {
+        1.0
+    } else {
+        component as f32
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "finite nonnegative luminance is saturated to the public f32 scalar range"
+)]
+fn nonnegative_f64_to_f32(value: f64) -> f32 {
+    debug_assert!(value.is_finite());
+    debug_assert!(value >= 0.0);
+    value.min(f64::from(f32::MAX)) as f32
 }
 
 #[cfg(test)]
@@ -804,6 +922,23 @@ mod tests {
         for (actual, expected) in actual.components().into_iter().zip(expected) {
             assert_approximately_equal(actual, expected);
         }
+    }
+
+    fn assert_displayable(color: LinearRgb) {
+        assert!(
+            color
+                .components()
+                .into_iter()
+                .all(|component| component.is_finite() && (0.0..=1.0).contains(&component))
+        );
+    }
+
+    #[test]
+    fn linear_rgb_preserves_every_finite_nonnegative_component() {
+        let color = LinearRgb::new([70_000.0, 100_000.0, f32::INFINITY]);
+
+        assert_eq!(color.components(), [70_000.0, 100_000.0, f32::MAX]);
+        assert!(color.luminance().is_finite());
     }
 
     #[test]
@@ -850,6 +985,35 @@ mod tests {
         let black = estimate_max_cll(&[LinearRgb::default()]).unwrap();
 
         assert!(ExtendedReinhard::from_max_cll(black).is_none());
+    }
+
+    #[test]
+    fn tone_mappers_remain_finite_at_extreme_hdr_levels() {
+        let smallest_positive = f32::from_bits(1);
+        let tiny = WhitePoint::new(smallest_positive).unwrap();
+        let tiny_luminance = LuminanceWhitePoint::new(smallest_positive).unwrap();
+        let extended = ExtendedReinhard::new(tiny);
+        let extended_luminance = ExtendedLuminanceReinhard::new(tiny_luminance);
+        let camera_response = CameraResponse::new(vec![0.0, 1.0], vec![0.0, 1.0]).unwrap();
+        let camera = camera_response.tone_mapper(tiny);
+        let mappers: [&dyn ToneMapper; 11] = [
+            &Clamp,
+            &ScaledClamp::new(tiny),
+            &Reinhard,
+            &extended,
+            &LuminanceReinhard,
+            &extended_luminance,
+            &ReinhardJodie,
+            &Uncharted2,
+            &AcesFitted,
+            &AcesApproximate,
+            &camera,
+        ];
+
+        for mapper in mappers {
+            assert_displayable(mapper.map(LinearRgb::new([0.0, f32::MAX, 100_000.0])));
+            assert_eq!(mapper.map(LinearRgb::default()), LinearRgb::default());
+        }
     }
 
     #[test]
@@ -975,6 +1139,14 @@ mod tests {
             CameraResponse::new(vec![0.0, 0.5, 1.0], vec![0.0, 0.75, 0.5]).unwrap_err(),
             CameraResponseError::IntensityDecreases(2)
         );
+        assert_eq!(
+            CameraResponse::new(vec![0.1, 1.0], vec![0.0, 1.0]).unwrap_err(),
+            CameraResponseError::IrradianceEndpoints
+        );
+        assert_eq!(
+            CameraResponse::new(vec![0.0, 1.0], vec![0.1, 1.0]).unwrap_err(),
+            CameraResponseError::IntensityEndpoints
+        );
     }
 
     #[test]
@@ -994,6 +1166,14 @@ mod tests {
         let max_cll = estimate_max_cll(&[LinearRgb::new([0.0, 0.0, 5.0])]).unwrap();
 
         assert_eq!(max_cll.level(), 5.0);
+        assert_eq!(max_cll.channel(), ColorChannel::Blue);
+    }
+
+    #[test]
+    fn max_cll_preserves_float32_levels_above_binary16_range() {
+        let max_cll = estimate_max_cll(&[LinearRgb::new([70_000.0, 0.0, 100_000.0])]).unwrap();
+
+        assert_eq!(max_cll.level(), 100_000.0);
         assert_eq!(max_cll.channel(), ColorChannel::Blue);
     }
 

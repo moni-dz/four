@@ -6,6 +6,7 @@ description = "A minimal GPUI image viewer with bounded image decoders"
 publish = false
 
 [workspace]
+default-members = [".", "crates/tonemapping"]
 members = ["crates/tonemapping"]
 resolver = "3"
 

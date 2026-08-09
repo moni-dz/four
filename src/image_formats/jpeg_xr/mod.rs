@@ -123,20 +123,18 @@ impl JPEGXRMetadata {
     /// Returns the estimated maximum content light level in nits for HDR sources.
     ///
     /// The estimate is the 99.99th-percentile `max(R, G, B)` light level. SDR sources return
-    /// `None` because they do not pass through the HDR tone-mapping pipeline.
+    /// `None` because they do not pass through the HDR tone-mapping pipeline. A finite result above
+    /// the `f32` range saturates at `f32::MAX`.
     #[must_use]
-    pub const fn max_cll_nits(self) -> Option<f32> {
-        match self.hdr_metrics {
-            Some(metrics) => Some(metrics.max_cll.nits),
-            None => None,
-        }
+    pub fn max_cll_nits(self) -> Option<f32> {
+        self.hdr_metrics.map(|metrics| metrics.max_cll.nits())
     }
 
     /// Returns the estimated maximum content light level in scRGB units for HDR sources.
     #[must_use]
     pub fn max_cll_scrgb(self) -> Option<f32> {
-        self.max_cll_nits()
-            .map(|nits| nits / SC_RGB_REFERENCE_WHITE_NITS)
+        self.hdr_metrics
+            .map(|metrics| metrics.max_cll.relative_light_level())
     }
 
     /// Returns the color channel that determines the percentile `MaxCLL` value.
@@ -546,7 +544,7 @@ struct NormalizedImage {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct MaxCll {
-    nits: f32,
+    relative_light_level: f32,
     channel: JPEGXRColorChannel,
 }
 
@@ -574,24 +572,22 @@ impl HDRMetrics {
 
         invariant!(source_pixel_count > 0);
 
-        let exclude_fully_transparent =
-            layout.has_alpha && has_visible_alpha(source, row_stride, layout)?;
-
-        let mut accumulator = HDRMetricAccumulator::new();
-
-        visit_pixels(source, row_stride, layout, |color, alpha| {
-            if exclude_fully_transparent && alpha == 0.0 {
-                return;
-            }
-            accumulator.observe(color);
-        })?;
-
-        let pixel_count = usize::try_from(accumulator.pixel_count)
-            .expect("the bounded JPEG XR pixel count fits usize");
+        let visible_alpha_pixels = if layout.has_alpha {
+            visible_alpha_pixel_count(source, row_stride, layout)?
+        } else {
+            source_pixel_count
+        };
+        let exclude_fully_transparent = layout.has_alpha && visible_alpha_pixels > 0;
+        let pixel_count = if exclude_fully_transparent {
+            visible_alpha_pixels
+        } else {
+            source_pixel_count
+        };
 
         invariant!(pixel_count > 0);
         invariant!(pixel_count <= source_pixel_count);
 
+        let mut accumulator = HDRMetricAccumulator::new();
         let mut max_cll_estimator = MaxCllEstimator::new(
             NonZeroUsize::new(pixel_count).expect("HDR metrics include at least one pixel"),
         );
@@ -600,19 +596,26 @@ impl HDRMetrics {
             if exclude_fully_transparent && alpha == 0.0 {
                 return;
             }
+            accumulator.observe(color);
             max_cll_estimator.observe(LinearRgb::new(color));
         })?;
 
+        invariant_eq!(
+            usize::try_from(accumulator.pixel_count)
+                .expect("the bounded JPEG XR pixel count fits usize"),
+            pixel_count
+        );
+
         let estimate = max_cll_estimator
             .finish()
-            .expect("the MaxCLL pass visits the measured number of HDR pixels");
+            .expect("the HDR metrics pass visits the measured number of pixels");
         let relative_light_level = estimate.level();
 
         invariant!(relative_light_level.is_finite());
         invariant!(relative_light_level >= 0.0);
 
         let max_cll = MaxCll {
-            nits: relative_light_level * SC_RGB_REFERENCE_WHITE_NITS,
+            relative_light_level,
             channel: jpeg_xr_color_channel(estimate.channel()),
         };
 
@@ -622,9 +625,15 @@ impl HDRMetrics {
 
 impl MaxCll {
     fn relative_light_level(self) -> f32 {
-        invariant!(self.nits.is_finite());
-        invariant!(self.nits >= 0.0);
-        self.nits / SC_RGB_REFERENCE_WHITE_NITS
+        invariant!(self.relative_light_level.is_finite());
+        invariant!(self.relative_light_level >= 0.0);
+        self.relative_light_level
+    }
+
+    fn nits(self) -> f32 {
+        nonnegative_f64_to_f32(
+            f64::from(self.relative_light_level) * f64::from(SC_RGB_REFERENCE_WHITE_NITS),
+        )
     }
 }
 
@@ -727,9 +736,9 @@ fn sanitize_metric_sample(value: f32) -> f64 {
     if value.is_nan() {
         0.0
     } else if value == f32::INFINITY {
-        65_504.0
+        f64::from(f32::MAX)
     } else if value == f32::NEG_INFINITY {
-        -65_504.0
+        -f64::from(f32::MAX)
     } else {
         f64::from(value)
     }
@@ -802,14 +811,22 @@ fn visit_pixels(
     Ok(())
 }
 
-fn has_visible_alpha(source: &[u8], row_stride: usize, layout: PixelLayout) -> Result<bool> {
+fn visible_alpha_pixel_count(
+    source: &[u8],
+    row_stride: usize,
+    layout: PixelLayout,
+) -> Result<usize> {
     invariant!(layout.has_alpha);
 
-    let mut has_visible_alpha = false;
+    let mut visible_pixels = 0_usize;
     visit_pixels(source, row_stride, layout, |_color, alpha| {
-        has_visible_alpha |= alpha > 0.0;
+        if alpha > 0.0 {
+            visible_pixels = visible_pixels
+                .checked_add(1)
+                .expect("validated JPEG XR pixel count fits usize");
+        }
     })?;
-    Ok(has_visible_alpha)
+    Ok(visible_pixels)
 }
 
 fn validate_dimensions(width: i32, height: i32) -> Result<(u32, u32)> {
@@ -1030,11 +1047,11 @@ mod tests {
     #[test]
     fn tone_mapping_is_bypassed_when_max_cll_fits_the_target() {
         let fitting = MaxCll {
-            nits: SC_RGB_REFERENCE_WHITE_NITS,
+            relative_light_level: 1.0,
             channel: JPEGXRColorChannel::Red,
         };
         let hdr = MaxCll {
-            nits: 4.0 * SC_RGB_REFERENCE_WHITE_NITS,
+            relative_light_level: 4.0,
             channel: JPEGXRColorChannel::Red,
         };
 
@@ -1059,7 +1076,7 @@ mod tests {
         let metrics = HDRMetrics::estimate(&source, source.len(), layout).unwrap();
         let metadata = JPEGXRMetadata::new(layout, Some(metrics));
 
-        assert_eq!(metrics.max_cll.nits, 320.0);
+        assert_eq!(metrics.max_cll.nits(), 320.0);
         assert!(metadata.is_hdr());
         assert_eq!(metadata.bits_per_channel(), 32);
         assert_eq!(metadata.color_channels(), 3);
@@ -1102,6 +1119,17 @@ mod tests {
     }
 
     #[test]
+    fn max_cll_preserves_float32_levels_above_binary16_range() {
+        let source = float_rgb_source(&[[70_000.0, 0.0, 100_000.0]]);
+        let metrics = HDRMetrics::estimate(&source, source.len(), float_rgb_layout()).unwrap();
+        let metadata = JPEGXRMetadata::new(float_rgb_layout(), Some(metrics));
+
+        assert_eq!(metadata.max_cll_scrgb(), Some(100_000.0));
+        assert_eq!(metadata.max_cll_nits(), Some(8_000_000.0));
+        assert_eq!(metadata.max_cll_channel(), Some(JPEGXRColorChannel::Blue));
+    }
+
+    #[test]
     fn normalization_quantizes_alpha_to_eight_bits() {
         let layout = float_rgba_layout();
         let source: Vec<u8> = std::iter::repeat_n([0.01_f32, 0.01, 0.01, 0.5], 16)
@@ -1121,7 +1149,7 @@ mod tests {
 
         let metrics = HDRMetrics::estimate(&source, source.len(), layout).unwrap();
 
-        assert_eq!(metrics.max_cll.nits, SC_RGB_REFERENCE_WHITE_NITS);
+        assert_eq!(metrics.max_cll.nits(), SC_RGB_REFERENCE_WHITE_NITS);
         assert_eq!(metrics.max_luminance_nits, SC_RGB_REFERENCE_WHITE_NITS);
         assert_eq!(metrics.average_luminance_nits, SC_RGB_REFERENCE_WHITE_NITS);
         assert_eq!(metrics.min_luminance_nits, SC_RGB_REFERENCE_WHITE_NITS);
@@ -1137,7 +1165,7 @@ mod tests {
         let metrics = HDRMetrics::estimate(&source, source.len(), layout).unwrap();
         let rgba = normalize(&source, 2, 1, 32, layout).unwrap().rgba;
 
-        assert_eq!(metrics.max_cll.nits, 4.0 * SC_RGB_REFERENCE_WHITE_NITS);
+        assert_eq!(metrics.max_cll.nits(), 4.0 * SC_RGB_REFERENCE_WHITE_NITS);
         assert_eq!(metrics.max_cll.channel, JPEGXRColorChannel::Blue);
         assert!(
             rgba.iter()
