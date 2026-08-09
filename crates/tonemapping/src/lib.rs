@@ -547,6 +547,40 @@ fn uncharted2_partial(value: f32) -> f32 {
     ((value * (A * value + C * B) + D * E) / (value * (A * value + B) + D * F)) - E / F
 }
 
+/// Applies Stephen Hill's fitted ACES reference and display transform.
+///
+/// This compact fit uses the article's linear sRGB input and output matrices. It is a practical
+/// filmic curve rather than a complete Academy Color Encoding System pipeline.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AcesFitted;
+
+impl ToneMapper for AcesFitted {
+    fn map(&self, color: LinearRgb) -> LinearRgb {
+        const INPUT_MATRIX: [[f32; 3]; 3] = [
+            [0.597_19, 0.354_58, 0.048_23],
+            [0.076_00, 0.908_34, 0.015_66],
+            [0.028_40, 0.133_83, 0.837_77],
+        ];
+        const OUTPUT_MATRIX: [[f32; 3]; 3] = [
+            [1.604_75, -0.531_08, -0.073_67],
+            [-0.102_08, 1.108_13, -0.006_05],
+            [-0.003_27, -0.072_76, 1.076_02],
+        ];
+
+        let transformed = multiply_rgb(INPUT_MATRIX, color.components());
+        let fitted = transformed.map(|component| {
+            let numerator = component * (component + 0.024_578_6) - 0.000_090_537;
+            let denominator = component * (0.983_729 * component + 0.432_951) + 0.238_081;
+            numerator / denominator
+        });
+        LinearRgb::displayable(multiply_rgb(OUTPUT_MATRIX, fitted))
+    }
+}
+
+fn multiply_rgb(matrix: [[f32; 3]; 3], color: [f32; 3]) -> [f32; 3] {
+    matrix.map(|row| row[0] * color[0] + row[1] * color[1] + row[2] * color[2])
+}
+
 /// Compresses highlights above a fixed knee using the content peak.
 ///
 /// This operator preserves input luminance below `0.75`, maps `max_content_level` to `1.0`, and
@@ -621,6 +655,12 @@ mod tests {
 
     fn assert_approximately_equal(actual: f32, expected: f32) {
         assert!((actual - expected).abs() <= 1.0e-6);
+    }
+
+    fn assert_components_close(actual: LinearRgb, expected: [f32; 3]) {
+        for (actual, expected) in actual.components().into_iter().zip(expected) {
+            assert_approximately_equal(actual, expected);
+        }
     }
 
     #[test]
@@ -751,6 +791,22 @@ mod tests {
         assert_approximately_equal(middle_gray, 0.128_338_45);
         assert_approximately_equal(reference_white, 0.492_918_55);
         assert_eq!(filmic_white, 1.0);
+    }
+
+    #[test]
+    fn aces_fitted_uses_the_reference_matrix_orientation() {
+        assert_components_close(
+            AcesFitted.map(LinearRgb::new([1.0, 0.0, 0.0])),
+            [0.688_027_86, 0.0, 0.002_639_006_8],
+        );
+        assert_components_close(
+            AcesFitted.map(LinearRgb::new([0.0, 1.0, 0.0])),
+            [0.101_613_28, 0.623_659, 0.028_843_72],
+        );
+        assert_components_close(
+            AcesFitted.map(LinearRgb::new([0.0, 0.0, 1.0])),
+            [0.0, 0.0, 0.601_758_84],
+        );
     }
 
     #[test]
