@@ -377,6 +377,49 @@ impl ToneMapper for Reinhard {
     }
 }
 
+/// Applies the white-point Reinhard curve independently to each component.
+///
+/// Components at the white point map to one, while brighter components clip at the display
+/// boundary. For a still image, [`MaxCll`] supplies the p99.99 `max(R, G, B)` white point described
+/// by Smith and Zink's outlier-rejection method.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExtendedReinhard {
+    white_point: WhitePoint,
+}
+
+impl ExtendedReinhard {
+    /// Creates an extended Reinhard operator with `white_point`.
+    #[must_use]
+    pub const fn new(white_point: WhitePoint) -> Self {
+        Self { white_point }
+    }
+
+    /// Creates an operator from a nonzero p99.99 `MaxCLL` estimate.
+    ///
+    /// Returns `None` for an entirely black image, whose `MaxCLL` is zero.
+    #[must_use]
+    pub fn from_max_cll(max_cll: MaxCll) -> Option<Self> {
+        max_cll.white_point().map(Self::new)
+    }
+
+    /// Returns the scene white point mapped to the display maximum.
+    #[must_use]
+    pub const fn white_point(self) -> WhitePoint {
+        self.white_point
+    }
+}
+
+impl ToneMapper for ExtendedReinhard {
+    fn map(&self, color: LinearRgb) -> LinearRgb {
+        let white_squared = self.white_point.level().powi(2);
+        LinearRgb::displayable(
+            color
+                .components()
+                .map(|component| component * (1.0 + component / white_squared) / (1.0 + component)),
+        )
+    }
+}
+
 /// Compresses highlights above a fixed knee using the content peak.
 ///
 /// This operator preserves input luminance below `0.75`, maps `max_content_level` to `1.0`, and
@@ -499,6 +542,26 @@ mod tests {
         assert_eq!(black, 0.0);
         assert_approximately_equal(middle_gray, 0.152_542_37);
         assert_eq!(reference_white, 0.5);
+    }
+
+    #[test]
+    fn extended_reinhard_maps_the_percentile_white_point_to_one() {
+        let colors = [LinearRgb::new([4.0, 2.0, 1.0])];
+        let max_cll = estimate_max_cll(&colors).unwrap();
+        let mapper = ExtendedReinhard::from_max_cll(max_cll).unwrap();
+        let [white, middle, low] = mapper.map(colors[0]).components();
+
+        assert_eq!(white, 1.0);
+        assert_approximately_equal(middle, 0.75);
+        assert_approximately_equal(low, 0.531_25);
+        assert_eq!(mapper.white_point().level(), 4.0);
+    }
+
+    #[test]
+    fn extended_reinhard_rejects_a_zero_white_point() {
+        let black = estimate_max_cll(&[LinearRgb::default()]).unwrap();
+
+        assert!(ExtendedReinhard::from_max_cll(black).is_none());
     }
 
     #[test]
