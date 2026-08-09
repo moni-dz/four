@@ -500,6 +500,24 @@ impl ToneMapper for ExtendedLuminanceReinhard {
     }
 }
 
+/// Blends component-wise and luminance-based Reinhard results per component.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ReinhardJodie;
+
+impl ToneMapper for ReinhardJodie {
+    fn map(&self, color: LinearRgb) -> LinearRgb {
+        let components = color.components();
+        let luminance_scale = 1.0 / (1.0 + color.luminance());
+        let component_mapped = components.map(|component| component / (1.0 + component));
+        let luminance_mapped = components.map(|component| component * luminance_scale);
+        let blended = std::array::from_fn(|index| {
+            let weight = component_mapped[index];
+            luminance_mapped[index] * (1.0 - weight) + component_mapped[index] * weight
+        });
+        LinearRgb::displayable(blended)
+    }
+}
+
 /// Compresses highlights above a fixed knee using the content peak.
 ///
 /// This operator preserves input luminance below `0.75`, maps `max_content_level` to `1.0`, and
@@ -678,6 +696,21 @@ mod tests {
         let white_point = estimate_luminance_white_point(&colors).unwrap();
 
         assert_approximately_equal(white_point.luminance(), 4.0);
+    }
+
+    #[test]
+    fn reinhard_jodie_blends_luminance_and_component_curves() {
+        let [red, green, blue] = ReinhardJodie
+            .map(LinearRgb::new([1.0, 0.5, 0.25]))
+            .components();
+
+        assert_approximately_equal(red, 0.564_811_9);
+        assert_approximately_equal(green, 0.320_985_7);
+        assert_approximately_equal(blue, 0.165_924_76);
+        assert_eq!(
+            ReinhardJodie.map(LinearRgb::new([1.0; 3])),
+            Reinhard.map(LinearRgb::new([1.0; 3]))
+        );
     }
 
     #[test]
