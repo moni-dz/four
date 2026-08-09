@@ -51,7 +51,7 @@ pub(super) fn parse_frame_components(
         }
 
         blocks_per_mcu += u32::from(horizontal_sampling) * u32::from(vertical_sampling);
-        
+
         let quantization_table = usize::from(segment.read_u8()?);
         if quantization_table >= QUANTIZATION_TABLES_MAX {
             return Err(error(JPEGError::Table(
@@ -143,7 +143,7 @@ pub(super) fn parse_scan_header(segment: &mut Reader<'_>, frame: &Frame) -> Resu
         successive_high: approximation >> 4,
         successive_low: approximation & 0x0f,
     };
-    
+
     validate_scan_header(&header, frame.process)?;
 
     Ok(header)
@@ -158,45 +158,45 @@ fn validate_scan_header(scan: &ScanHeader, process: CodingProcess) -> Result<()>
             && scan.spectral_end == 63
             && scan.successive_high == 0
             && scan.successive_low == 0;
-        
+
         if !is_sequential {
             return Err(error(JPEGError::Scan(
                 "sequential JPEG scan parameters are invalid",
             )));
         }
-        
+
         return Ok(());
     }
-    
+
     if scan.spectral_start > scan.spectral_end || scan.spectral_end >= 64 {
         return Err(error(JPEGError::Scan(
             "progressive spectral selection is out of range",
         )));
     }
-    
+
     if scan.spectral_start == 0 && scan.spectral_end != 0 {
         return Err(error(JPEGError::Scan(
             "a progressive DC scan must end at coefficient zero",
         )));
     }
-    
+
     if scan.spectral_start > 0 && scan.components.len() != 1 {
         return Err(error(JPEGError::Scan(
             "a progressive AC scan must contain one component",
         )));
     }
-    
+
     if scan.successive_high > 0 && scan.successive_low + 1 != scan.successive_high {
         return Err(error(JPEGError::Scan(
             "progressive refinement must advance exactly one bit",
         )));
     }
-    
+
     if scan.successive_low > 13 {
         return Err(error(JPEGError::Scan(
             "progressive approximation bit exceeds 13",
         )));
     }
-    
+
     Ok(())
 }

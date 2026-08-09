@@ -4,6 +4,7 @@
 //! and grayscale samples are normalized as sRGB. Fixed-point, half-float, floating-point, and RGBE
 //! samples are interpreted as linear scRGB, tone-mapped with a MaxCLL-aware shoulder curve,
 //! gamut-compressed without changing chromaticity, and encoded with the sRGB transfer function.
+//!
 //! `MaxCLL` is estimated from the 99.99th-percentile `max(R, G, B)` light level, rejecting isolated
 //! outliers at the cost of clipping the brightest 0.01% of a sufficiently large image.
 //! A wholly empty, non-premultiplied HDR alpha plane is treated as unspecified and made opaque,
@@ -32,6 +33,37 @@ const MAX_CLL_PERCENTILE_DENOMINATOR: u64 = 10_000;
 const SC_RGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 const SOURCE_BUFFER_MAX: usize = 512 * 1024 * 1024;
 const TONE_MAP_KNEE: f32 = 0.75;
+
+/// Identifies a color channel in decoded JPEG XR RGB data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JPEGXRColorChannel {
+    /// The red color channel.
+    Red,
+    /// The green color channel.
+    Green,
+    /// The blue color channel.
+    Blue,
+}
+
+impl JPEGXRColorChannel {
+    /// Returns the conventional one-letter channel symbol.
+    #[must_use]
+    pub const fn symbol(self) -> char {
+        match self {
+            Self::Red => 'R',
+            Self::Green => 'G',
+            Self::Blue => 'B',
+        }
+    }
+
+    const fn index(self) -> usize {
+        match self {
+            Self::Red => 0,
+            Self::Green => 1,
+            Self::Blue => 2,
+        }
+    }
+}
 
 /// A decoded JPEG XR image and its source metadata.
 #[derive(Debug)]
@@ -67,7 +99,7 @@ pub struct JPEGXRMetadata {
     color_channels: u8,
     has_alpha: bool,
     is_hdr: bool,
-    max_cll_nits: Option<f32>,
+    hdr_metrics: Option<HDRMetrics>,
 }
 
 impl JPEGXRMetadata {
@@ -101,14 +133,74 @@ impl JPEGXRMetadata {
     /// `None` because they do not pass through the HDR tone-mapping pipeline.
     #[must_use]
     pub const fn max_cll_nits(self) -> Option<f32> {
-        self.max_cll_nits
+        match self.hdr_metrics {
+            Some(metrics) => Some(metrics.max_cll.nits),
+            None => None,
+        }
     }
 
     /// Returns the estimated maximum content light level in scRGB units for HDR sources.
     #[must_use]
     pub fn max_cll_scrgb(self) -> Option<f32> {
-        self.max_cll_nits
+        self.max_cll_nits()
             .map(|nits| nits / SC_RGB_REFERENCE_WHITE_NITS)
+    }
+
+    /// Returns the color channel that determines the percentile `MaxCLL` value.
+    #[must_use]
+    pub const fn max_cll_channel(self) -> Option<JPEGXRColorChannel> {
+        match self.hdr_metrics {
+            Some(metrics) => Some(metrics.max_cll.channel),
+            None => None,
+        }
+    }
+
+    /// Returns the maximum decoded luminance in nits for HDR sources.
+    #[must_use]
+    pub const fn max_luminance_nits(self) -> Option<f32> {
+        match self.hdr_metrics {
+            Some(metrics) => Some(metrics.max_luminance_nits),
+            None => None,
+        }
+    }
+
+    /// Returns the mean decoded luminance in nits for HDR sources.
+    #[must_use]
+    pub const fn average_luminance_nits(self) -> Option<f32> {
+        match self.hdr_metrics {
+            Some(metrics) => Some(metrics.average_luminance_nits),
+            None => None,
+        }
+    }
+
+    /// Returns the minimum decoded luminance in nits for HDR sources.
+    #[must_use]
+    pub const fn min_luminance_nits(self) -> Option<f32> {
+        match self.hdr_metrics {
+            Some(metrics) => Some(metrics.min_luminance_nits),
+            None => None,
+        }
+    }
+
+    /// Returns the percentage of HDR pixels inside the linear Rec. 709 gamut cone.
+    #[must_use]
+    pub const fn rec709_percentage(self) -> Option<f32> {
+        match self.hdr_metrics {
+            Some(metrics) => Some(metrics.rec709_percentage),
+            None => None,
+        }
+    }
+
+    /// Returns the percentage of HDR pixels inside Display-P3 but outside Rec. 709.
+    ///
+    /// Pixels outside Display-P3 count toward neither gamut percentage, so the two reported
+    /// percentages may sum to less than 100 percent.
+    #[must_use]
+    pub const fn dci_p3_percentage(self) -> Option<f32> {
+        match self.hdr_metrics {
+            Some(metrics) => Some(metrics.dci_p3_percentage),
+            None => None,
+        }
     }
 }
 
@@ -150,20 +242,27 @@ pub fn decode_with_metadata(bytes: impl AsRef<[u8]>) -> Result<DecodedJPEGXR> {
 
     let mut decoder =
         ImageDecode::with_reader(Cursor::new(bytes)).map_err(|source| codec_error(&source))?;
+
     let (width, height) = decoder.get_size().map_err(|source| codec_error(&source))?;
     let (width, height) = validate_dimensions(width, height)?;
+
     let format = decoder
         .get_pixel_format()
         .map_err(|source| codec_error(&source))?;
+
     let layout = PixelLayout::new(format)?;
+
     let row_stride = layout.row_stride(width)?;
+
     let height_usize = usize::try_from(height)
         .map_err(|_conversion_error| error(JPEGXRError::Output("JPEG XR height exceeds usize")))?;
+
     let source_len = row_stride.checked_mul(height_usize).ok_or_else(|| {
         error(JPEGXRError::Output(
             "JPEG XR source-buffer size exceeds usize",
         ))
     })?;
+
     if source_len > SOURCE_BUFFER_MAX {
         return Err(error(JPEGXRError::LimitExceeded(
             JPEGXRLimit::SourceBufferBytes(SOURCE_BUFFER_MAX),
@@ -175,7 +274,7 @@ pub fn decode_with_metadata(bytes: impl AsRef<[u8]>) -> Result<DecodedJPEGXR> {
         .copy_all(&mut source, row_stride)
         .map_err(|source| codec_error(&source))?;
     let normalized = normalize(&source, width, height, row_stride, layout)?;
-    let metadata = JPEGXRMetadata::new(layout, normalized.max_cll);
+    let metadata = JPEGXRMetadata::new(layout, normalized.hdr_metrics);
     Ok(DecodedJPEGXR {
         image: DecodedImage::new(width, height, normalized.rgba),
         metadata,
@@ -230,8 +329,8 @@ struct PixelLayout {
 }
 
 impl JPEGXRMetadata {
-    fn new(layout: PixelLayout, max_cll: Option<MaxCll>) -> Self {
-        invariant_eq!(layout.encoding.is_hdr(), max_cll.is_some());
+    fn new(layout: PixelLayout, hdr_metrics: Option<HDRMetrics>) -> Self {
+        invariant_eq!(layout.encoding.is_hdr(), hdr_metrics.is_some());
 
         Self {
             bits_per_channel: layout.encoding.bits_per_channel(),
@@ -239,7 +338,7 @@ impl JPEGXRMetadata {
                 .expect("a JPEG XR color-channel count fits u8"),
             has_alpha: layout.has_alpha,
             is_hdr: layout.encoding.is_hdr(),
-            max_cll_nits: max_cll.map(|level| level.nits),
+            hdr_metrics,
         }
     }
 }
@@ -248,6 +347,7 @@ impl PixelLayout {
     fn new(format: CodecPixelFormat) -> Result<Self> {
         let info = PixelInfo::from_format(format);
         let encoding = sample_encoding(format, &info)?;
+
         let color_channels = match info.color_format() {
             ColorFormat::YOnly => 1,
             ColorFormat::RGB => 3,
@@ -401,8 +501,8 @@ fn normalize(
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| error(JPEGXRError::Output("JPEG XR RGBA size exceeds usize")))?;
-    let max_cll = if layout.encoding.is_hdr() {
-        Some(MaxCll::estimate(source, row_stride, layout)?)
+    let hdr_metrics = if layout.encoding.is_hdr() {
+        Some(HDRMetrics::estimate(source, row_stride, layout)?)
     } else {
         None
     };
@@ -420,8 +520,8 @@ fn normalize(
             })?;
             let (color, alpha) = layout.read_pixel(pixel)?;
             has_nonzero_alpha |= alpha > 0.0;
-            let color = if let Some(max_cll) = max_cll {
-                tone_map(color, max_cll)
+            let color = if let Some(metrics) = hdr_metrics {
+                tone_map(color, metrics.max_cll)
             } else {
                 color.map(normalized_to_u8)
             };
@@ -438,63 +538,110 @@ fn normalize(
         }
     }
     invariant_eq!(rgba.len(), output_len);
-    Ok(NormalizedImage { rgba, max_cll })
+    Ok(NormalizedImage { rgba, hdr_metrics })
 }
 
 #[derive(Debug)]
 struct NormalizedImage {
     rgba: Vec<u8>,
-    max_cll: Option<MaxCll>,
+    hdr_metrics: Option<HDRMetrics>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct MaxCll {
     nits: f32,
+    channel: JPEGXRColorChannel,
 }
 
-impl MaxCll {
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HDRMetrics {
+    max_cll: MaxCll,
+    max_luminance_nits: f32,
+    average_luminance_nits: f32,
+    min_luminance_nits: f32,
+    rec709_percentage: f32,
+    dci_p3_percentage: f32,
+}
+
+impl HDRMetrics {
     fn estimate(source: &[u8], row_stride: usize, layout: PixelLayout) -> Result<Self> {
         invariant!(layout.encoding.is_hdr());
         invariant!(row_stride >= layout.bytes_per_pixel);
 
         let pixels_per_row = row_stride / layout.bytes_per_pixel;
         let row_count = source.len() / row_stride;
-        let pixel_count = u64::try_from(
+
+        let source_pixel_count = u64::try_from(
             pixels_per_row
                 .checked_mul(row_count)
                 .expect("validated JPEG XR pixel count fits usize"),
         )
         .expect("validated JPEG XR pixel count fits u64");
-        invariant!(pixel_count > 0);
-        let target_rank = pixel_count - pixel_count / MAX_CLL_PERCENTILE_DENOMINATOR;
+
+        invariant!(source_pixel_count > 0);
+
+        let exclude_fully_transparent =
+            layout.has_alpha && has_visible_alpha(source, row_stride, layout)?;
 
         let mut high_histogram = vec![0_u32; MAX_CLL_HIGH_BINS];
-        visit_pixels(source, row_stride, layout, |color| {
-            let (high, _low) = histogram_parts(max_rgb(color));
+        let mut accumulator = HDRMetricAccumulator::new();
+
+        visit_pixels(source, row_stride, layout, |color, alpha| {
+            if exclude_fully_transparent && alpha == 0.0 {
+                return;
+            }
+            let (level, _channel) = max_rgb(color);
+            let (high, _low) = histogram_parts(level);
             high_histogram[high] += 1;
+            accumulator.observe(color);
         })?;
+
+        let pixel_count = accumulator.pixel_count;
+
+        invariant!(pixel_count > 0);
+        invariant!(pixel_count <= source_pixel_count);
+
+        let target_rank = pixel_count - pixel_count / MAX_CLL_PERCENTILE_DENOMINATOR;
         let (high, count_before_high) = percentile_bin(&high_histogram, target_rank);
 
         let mut low_histogram = vec![0_u32; MAX_CLL_LOW_BINS];
-        visit_pixels(source, row_stride, layout, |color| {
-            let (pixel_high, pixel_low) = histogram_parts(max_rgb(color));
+        let mut low_channel_counts = vec![[0_u32; 3]; MAX_CLL_LOW_BINS];
+
+        visit_pixels(source, row_stride, layout, |color, alpha| {
+            if exclude_fully_transparent && alpha == 0.0 {
+                return;
+            }
+
+            let (level, channel) = max_rgb(color);
+            let (pixel_high, pixel_low) = histogram_parts(level);
+
             if pixel_high == high {
                 low_histogram[pixel_low] += 1;
+                low_channel_counts[pixel_low][channel.index()] += 1;
             }
         })?;
+
         let rank_within_high = target_rank - count_before_high;
         let (low, _count_before_low) = percentile_bin(&low_histogram, rank_within_high);
+        let channel = predominant_channel(low_channel_counts[low]);
 
         let high = u32::try_from(high).expect("a MaxCLL high histogram index fits u32");
         let low = u32::try_from(low).expect("a MaxCLL low histogram index fits u32");
         let relative_light_level = f32::from_bits((high << MAX_CLL_LOW_BITS) | low);
+
         invariant!(relative_light_level.is_finite());
         invariant!(relative_light_level >= 0.0);
-        Ok(Self {
-            nits: relative_light_level * SC_RGB_REFERENCE_WHITE_NITS,
-        })
-    }
 
+        let max_cll = MaxCll {
+            nits: relative_light_level * SC_RGB_REFERENCE_WHITE_NITS,
+            channel,
+        };
+
+        Ok(accumulator.finish(max_cll))
+    }
+}
+
+impl MaxCll {
     fn relative_light_level(self) -> f32 {
         invariant!(self.nits.is_finite());
         invariant!(self.nits >= 0.0);
@@ -502,38 +649,204 @@ impl MaxCll {
     }
 }
 
+struct HDRMetricAccumulator {
+    pixel_count: u64,
+    luminance_sum_nits: f64,
+    max_luminance_nits: f64,
+    min_luminance_nits: f64,
+    rec709_pixels: u64,
+    dci_p3_pixels: u64,
+}
+
+impl HDRMetricAccumulator {
+    const fn new() -> Self {
+        Self {
+            pixel_count: 0,
+            luminance_sum_nits: 0.0,
+            max_luminance_nits: f64::NEG_INFINITY,
+            min_luminance_nits: f64::INFINITY,
+            rec709_pixels: 0,
+            dci_p3_pixels: 0,
+        }
+    }
+
+    fn observe(&mut self, color: [f32; 3]) {
+        let color = color.map(sanitize_metric_sample);
+        let luminance = (0.212_6 * color[0] + 0.715_2 * color[1] + 0.072_2 * color[2]).max(0.0)
+            * f64::from(SC_RGB_REFERENCE_WHITE_NITS);
+
+        self.pixel_count += 1;
+        self.luminance_sum_nits += luminance;
+        self.max_luminance_nits = self.max_luminance_nits.max(luminance);
+        self.min_luminance_nits = self.min_luminance_nits.min(luminance);
+
+        match gamut_membership(color) {
+            GamutMembership::Rec709 => self.rec709_pixels += 1,
+            GamutMembership::DisplayP3Only => self.dci_p3_pixels += 1,
+            GamutMembership::OutsideDisplayP3 => {}
+        }
+    }
+
+    fn finish(self, max_cll: MaxCll) -> HDRMetrics {
+        invariant!(self.pixel_count > 0);
+        invariant!(self.max_luminance_nits.is_finite());
+        invariant!(self.min_luminance_nits.is_finite());
+
+        let pixel_count = f64::from(
+            u32::try_from(self.pixel_count)
+                .expect("the bounded JPEG XR pixel count fits u32 metadata arithmetic"),
+        );
+
+        HDRMetrics {
+            max_cll,
+            max_luminance_nits: nonnegative_f64_to_f32(self.max_luminance_nits),
+            average_luminance_nits: nonnegative_f64_to_f32(self.luminance_sum_nits / pixel_count),
+            min_luminance_nits: nonnegative_f64_to_f32(self.min_luminance_nits),
+            rec709_percentage: percentage(self.rec709_pixels, self.pixel_count),
+            dci_p3_percentage: percentage(self.dci_p3_pixels, self.pixel_count),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GamutMembership {
+    Rec709,
+    DisplayP3Only,
+    OutsideDisplayP3,
+}
+
+fn gamut_membership(color: [f64; 3]) -> GamutMembership {
+    let scale = color.iter().copied().map(f64::abs).fold(1.0_f64, f64::max);
+    let epsilon = 1.0e-6 * scale;
+
+    if color.iter().all(|channel| *channel >= -epsilon) {
+        return GamutMembership::Rec709;
+    }
+
+    let display_p3 = [
+        0.822_592_87 * color[0] + 0.177_533_95 * color[1],
+        0.033_199_51 * color[0] + 0.966_783_50 * color[1],
+        0.017_085_35 * color[0] + 0.072_395_72 * color[1] + 0.910_301_48 * color[2],
+    ];
+    if display_p3.iter().all(|channel| *channel >= -epsilon) {
+        GamutMembership::DisplayP3Only
+    } else {
+        GamutMembership::OutsideDisplayP3
+    }
+}
+
+fn sanitize_metric_sample(value: f32) -> f64 {
+    if value.is_nan() {
+        0.0
+    } else if value == f32::INFINITY {
+        65_504.0
+    } else if value == f32::NEG_INFINITY {
+        -65_504.0
+    } else {
+        f64::from(value)
+    }
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "bounded metadata values are intentionally returned as the decoder's f32 scalar type"
+)]
+fn nonnegative_f64_to_f32(value: f64) -> f32 {
+    invariant!(value.is_finite());
+    invariant!(value >= 0.0);
+    value.min(f64::from(f32::MAX)) as f32
+}
+
+fn percentage(part: u64, total: u64) -> f32 {
+    invariant!(part <= total);
+    invariant!(total > 0);
+    let part = u32::try_from(part).expect("the bounded JPEG XR pixel count fits u32");
+    let total = u32::try_from(total).expect("the bounded JPEG XR pixel count fits u32");
+    percentage_from_u32(part, total)
+}
+
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "a bounded 0..=100 metadata percentage is intentionally stored as f32"
+)]
+fn percentage_from_u32(part: u32, total: u32) -> f32 {
+    (f64::from(part) * 100.0 / f64::from(total)) as f32
+}
+
+fn predominant_channel(counts: [u32; 3]) -> JPEGXRColorChannel {
+    let mut index = 0;
+    for candidate in 1..counts.len() {
+        if counts[candidate] > counts[index] {
+            index = candidate;
+        }
+    }
+
+    invariant!(counts[index] > 0);
+
+    match index {
+        0 => JPEGXRColorChannel::Red,
+        1 => JPEGXRColorChannel::Green,
+        2 => JPEGXRColorChannel::Blue,
+        _ => unreachable!("a three-channel MaxCLL tally has no other channel index"),
+    }
+}
+
 fn visit_pixels(
     source: &[u8],
     row_stride: usize,
     layout: PixelLayout,
-    mut visitor: impl FnMut([f32; 3]),
+    mut visitor: impl FnMut([f32; 3], f32),
 ) -> Result<()> {
     invariant!(row_stride >= layout.bytes_per_pixel);
 
     let mut rows = source.chunks_exact(row_stride);
     for row in &mut rows {
         let mut pixels = row.chunks_exact(layout.bytes_per_pixel);
+
         for pixel in &mut pixels {
-            let (color, _alpha) = layout.read_pixel(pixel)?;
-            visitor(color);
+            let (color, alpha) = layout.read_pixel(pixel)?;
+            visitor(color, alpha);
         }
+
         if !pixels.remainder().is_empty() {
             return Err(error(JPEGXRError::Output(
                 "JPEG XR row contains a partial pixel",
             )));
         }
     }
+
     if !rows.remainder().is_empty() {
         return Err(error(JPEGXRError::Output(
             "JPEG XR source buffer contains a partial row",
         )));
     }
+
     Ok(())
 }
 
-fn max_rgb(color: [f32; 3]) -> f32 {
+fn has_visible_alpha(source: &[u8], row_stride: usize, layout: PixelLayout) -> Result<bool> {
+    invariant!(layout.has_alpha);
+
+    let mut has_visible_alpha = false;
+    visit_pixels(source, row_stride, layout, |_color, alpha| {
+        has_visible_alpha |= alpha > 0.0;
+    })?;
+    Ok(has_visible_alpha)
+}
+
+fn max_rgb(color: [f32; 3]) -> (f32, JPEGXRColorChannel) {
     let color = color.map(sanitize_hdr_sample);
-    color[0].max(color[1]).max(color[2])
+    let mut channel = JPEGXRColorChannel::Red;
+
+    if color[1] > color[channel.index()] {
+        channel = JPEGXRColorChannel::Green;
+    }
+
+    if color[2] > color[channel.index()] {
+        channel = JPEGXRColorChannel::Blue;
+    }
+
+    (color[channel.index()], channel)
 }
 
 fn histogram_parts(value: f32) -> (usize, usize) {
@@ -562,6 +875,7 @@ fn percentile_bin(histogram: &[u32], target_rank: u64) -> (usize, u64) {
         }
         count_before = count_after;
     }
+
     panic!(
         "MaxCLL histogram contains {count_before} samples, fewer than target rank {target_rank}"
     );
@@ -571,6 +885,7 @@ fn validate_dimensions(width: i32, height: i32) -> Result<(u32, u32)> {
     let width = u32::try_from(width).map_err(|_conversion_error| {
         error(JPEGXRError::Output("JPEG XR width must be positive"))
     })?;
+
     let height = u32::try_from(height).map_err(|_conversion_error| {
         error(JPEGXRError::Output("JPEG XR height must be positive"))
     })?;
@@ -664,6 +979,7 @@ fn decode_rgbe(pixel: &[u8]) -> Result<[f32; 3]> {
 fn tone_map(color: [f32; 3], max_cll: MaxCll) -> [u8; 3] {
     let linear = color.map(sanitize_hdr_sample);
     let luminance = 0.212_6 * linear[0] + 0.715_2 * linear[1] + 0.072_2 * linear[2];
+
     if luminance == 0.0 {
         return [0; 3];
     }
@@ -677,7 +993,7 @@ fn tone_map(color: [f32; 3], max_cll: MaxCll) -> [u8; 3] {
         mapped = mapped.map(|channel| channel / peak);
     }
 
-    mapped.map(|channel| normalized_to_u8(linear_to_srgb(channel)))
+    mapped.map(linear_to_srgb).map(normalized_to_u8)
 }
 
 fn sanitize_hdr_sample(value: f32) -> f32 {
@@ -750,6 +1066,57 @@ fn codec_error(source: &JXRError) -> Error {
 mod tests {
     use super::*;
 
+    fn float_rgb_layout() -> PixelLayout {
+        PixelLayout {
+            encoding: SampleEncoding::Float32,
+            color_channels: 3,
+            source_channels: 3,
+            bytes_per_pixel: 12,
+            has_alpha: false,
+            premultiplied_alpha: false,
+            blue_first: false,
+        }
+    }
+
+    fn float_rgb_source(colors: &[[f32; 3]]) -> Vec<u8> {
+        colors
+            .iter()
+            .flatten()
+            .flat_map(|channel| channel.to_ne_bytes())
+            .collect()
+    }
+
+    fn float_rgba_layout() -> PixelLayout {
+        PixelLayout {
+            encoding: SampleEncoding::Float32,
+            color_channels: 3,
+            source_channels: 4,
+            bytes_per_pixel: 16,
+            has_alpha: true,
+            premultiplied_alpha: false,
+            blue_first: false,
+        }
+    }
+
+    fn float_rgba_source(colors: &[[f32; 4]]) -> Vec<u8> {
+        colors
+            .iter()
+            .flatten()
+            .flat_map(|channel| channel.to_ne_bytes())
+            .collect()
+    }
+
+    fn test_max_cll(nits: f32) -> MaxCll {
+        MaxCll {
+            nits,
+            channel: JPEGXRColorChannel::Red,
+        }
+    }
+
+    fn assert_approximately_equal(actual: f32, expected: f32, tolerance: f32) {
+        assert!((actual - expected).abs() <= tolerance);
+    }
+
     #[test]
     fn decodes_half_precision_boundaries() {
         assert_eq!(half_to_f32(0x0000), 0.0);
@@ -761,7 +1128,7 @@ mod tests {
 
     #[test]
     fn tone_mapping_compresses_hdr_white_into_sdr() {
-        let max_cll = MaxCll { nits: 320.0 };
+        let max_cll = test_max_cll(320.0);
         assert_eq!(tone_map([0.0; 3], max_cll), [0; 3]);
         let reference_white = tone_map([1.0; 3], max_cll);
         let hdr_white = tone_map([4.0; 3], max_cll);
@@ -775,7 +1142,7 @@ mod tests {
 
     #[test]
     fn tone_mapping_preserves_chromaticity_during_gamut_compression() {
-        let mapped = tone_map([4.0, 2.0, 1.0], MaxCll { nits: 320.0 });
+        let mapped = tone_map([4.0, 2.0, 1.0], test_max_cll(320.0));
 
         assert_eq!(mapped[0], u8::MAX);
         assert!(mapped[0] > mapped[1]);
@@ -784,15 +1151,7 @@ mod tests {
 
     #[test]
     fn max_cll_rejects_the_brightest_point_zero_one_percent() {
-        let layout = PixelLayout {
-            encoding: SampleEncoding::Float32,
-            color_channels: 3,
-            source_channels: 3,
-            bytes_per_pixel: 12,
-            has_alpha: false,
-            premultiplied_alpha: false,
-            blue_first: false,
-        };
+        let layout = float_rgb_layout();
         let mut source = Vec::with_capacity(10_000 * layout.bytes_per_pixel);
         source.extend(
             std::iter::repeat_n(1.0_f32, 9_998)
@@ -801,39 +1160,94 @@ mod tests {
                 .flat_map(f32::to_ne_bytes),
         );
 
-        let max_cll = MaxCll::estimate(&source, source.len(), layout).unwrap();
-        let metadata = JPEGXRMetadata::new(layout, Some(max_cll));
+        let metrics = HDRMetrics::estimate(&source, source.len(), layout).unwrap();
+        let metadata = JPEGXRMetadata::new(layout, Some(metrics));
 
-        assert_eq!(max_cll.nits, 320.0);
+        assert_eq!(metrics.max_cll.nits, 320.0);
         assert!(metadata.is_hdr());
         assert_eq!(metadata.bits_per_channel(), 32);
         assert_eq!(metadata.color_channels(), 3);
         assert!(!metadata.has_alpha());
         assert_eq!(metadata.max_cll_scrgb(), Some(4.0));
         assert_eq!(metadata.max_cll_nits(), Some(320.0));
+        assert_eq!(metadata.max_cll_channel(), Some(JPEGXRColorChannel::Red));
     }
 
     #[test]
-    fn empty_hdr_alpha_plane_is_treated_as_unspecified() {
-        let layout = PixelLayout {
-            encoding: SampleEncoding::Float32,
-            color_channels: 3,
-            source_channels: 4,
-            bytes_per_pixel: 16,
-            has_alpha: true,
-            premultiplied_alpha: false,
-            blue_first: false,
-        };
-        let source = [
-            0.18_f32.to_ne_bytes(),
-            0.18_f32.to_ne_bytes(),
-            0.18_f32.to_ne_bytes(),
-            0.0_f32.to_ne_bytes(),
-        ]
-        .concat();
+    fn hdr_metrics_use_signed_linear_scrgb_and_disjoint_gamuts() {
+        let colors = [
+            [1.0, 1.0, 1.0],
+            [-0.1, 1.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [-0.000_000_5, 0.0, 0.0],
+        ];
+        let source = float_rgb_source(&colors);
+        let metrics = HDRMetrics::estimate(&source, source.len(), float_rgb_layout()).unwrap();
 
-        let rgba = normalize(&source, 1, 1, 16, layout).unwrap().rgba;
+        assert_approximately_equal(metrics.max_luminance_nits, 80.0, 0.000_1);
+        assert_approximately_equal(metrics.average_luminance_nits, 33.878_8, 0.000_1);
+        assert_eq!(metrics.min_luminance_nits, 0.0);
+        assert_eq!(metrics.rec709_percentage, 50.0);
+        assert_eq!(metrics.dci_p3_percentage, 25.0);
+    }
 
-        assert_eq!(rgba[3], u8::MAX);
+    #[test]
+    fn max_cll_reports_the_winning_color_channel() {
+        let source = float_rgb_source(&[[1.0, 2.0, 5.0]]);
+        let metrics = HDRMetrics::estimate(&source, source.len(), float_rgb_layout()).unwrap();
+        let metadata = JPEGXRMetadata::new(float_rgb_layout(), Some(metrics));
+
+        assert_eq!(metadata.max_cll_scrgb(), Some(5.0));
+        assert_eq!(metadata.max_cll_channel(), Some(JPEGXRColorChannel::Blue));
+        assert_eq!(
+            metadata.max_cll_channel().map(JPEGXRColorChannel::symbol),
+            Some('B')
+        );
+    }
+
+    #[test]
+    fn normalization_quantizes_alpha_to_eight_bits() {
+        let layout = float_rgba_layout();
+        let source: Vec<u8> = std::iter::repeat_n([0.01_f32, 0.01, 0.01, 0.5], 16)
+            .flatten()
+            .flat_map(f32::to_ne_bytes)
+            .collect();
+
+        let rgba = normalize(&source, 4, 4, 64, layout).unwrap().rgba;
+
+        assert!(rgba.iter().skip(3).step_by(4).all(|alpha| *alpha == 128));
+    }
+
+    #[test]
+    fn hidden_transparent_rgb_does_not_affect_hdr_metrics() {
+        let layout = float_rgba_layout();
+        let source = float_rgba_source(&[[1.0, 1.0, 1.0, 1.0], [100.0, -100.0, 0.0, 0.0]]);
+
+        let metrics = HDRMetrics::estimate(&source, source.len(), layout).unwrap();
+
+        assert_eq!(metrics.max_cll.nits, SC_RGB_REFERENCE_WHITE_NITS);
+        assert_eq!(metrics.max_luminance_nits, SC_RGB_REFERENCE_WHITE_NITS);
+        assert_eq!(metrics.average_luminance_nits, SC_RGB_REFERENCE_WHITE_NITS);
+        assert_eq!(metrics.min_luminance_nits, SC_RGB_REFERENCE_WHITE_NITS);
+        assert_eq!(metrics.rec709_percentage, 100.0);
+        assert_eq!(metrics.dci_p3_percentage, 0.0);
+    }
+
+    #[test]
+    fn all_zero_hdr_alpha_plane_is_visible_to_metrics_and_made_opaque() {
+        let layout = float_rgba_layout();
+        let source = float_rgba_source(&[[1.0, 1.0, 1.0, 0.0], [0.0, 0.0, 4.0, 0.0]]);
+
+        let metrics = HDRMetrics::estimate(&source, source.len(), layout).unwrap();
+        let rgba = normalize(&source, 2, 1, 32, layout).unwrap().rgba;
+
+        assert_eq!(metrics.max_cll.nits, 4.0 * SC_RGB_REFERENCE_WHITE_NITS);
+        assert_eq!(metrics.max_cll.channel, JPEGXRColorChannel::Blue);
+        assert!(
+            rgba.iter()
+                .skip(3)
+                .step_by(4)
+                .all(|alpha| *alpha == u8::MAX)
+        );
     }
 }

@@ -276,7 +276,7 @@ impl<'a, State> Parser<'a, State> {
             self.arithmetic_conditioning.dc.len(),
             arithmetic::TABLES_MAX
         );
-        
+
         invariant_eq!(
             self.arithmetic_conditioning.ac.len(),
             arithmetic::TABLES_MAX
@@ -313,14 +313,14 @@ impl<'a, State> Parser<'a, State> {
             if class == 0 {
                 let lower = value & 0x0f;
                 let upper = value >> 4;
-                
+
                 if lower > upper {
                     return Err(error(JPEGError::Table(
                         JPEGTableKind::ArithmeticConditioning,
                         "DC arithmetic conditioning requires L <= U",
                     )));
                 }
-                
+
                 self.arithmetic_conditioning.dc[table] =
                     arithmetic::DCConditioning { lower, upper };
             } else {
@@ -330,7 +330,7 @@ impl<'a, State> Parser<'a, State> {
                         "AC arithmetic conditioning must be in 1..=63",
                     )));
                 }
-                
+
                 self.arithmetic_conditioning.ac[table] = value;
             }
         }
@@ -636,15 +636,15 @@ impl<State: FramePhase> Parser<'_, State> {
                 )));
             }
             for coefficient in scan.spectral_start..=scan.spectral_end {
-                let previous = self.state
-                    .data().coefficient_bits[component.frame_index][usize::from(coefficient)];
-                
+                let previous = self.state.data().coefficient_bits[component.frame_index]
+                    [usize::from(coefficient)];
+
                 if scan.successive_high == 0 && previous.is_some() {
                     return Err(error(JPEGError::Scan(
                         "progressive coefficient band was initialized twice",
                     )));
                 }
-                
+
                 if scan.successive_high > 0 && previous != Some(scan.successive_high) {
                     return Err(error(JPEGError::Scan(
                         "progressive refinement has an inconsistent bit order",

@@ -128,13 +128,13 @@ impl PixelFormat {
                 ))));
             }
         };
-        
+
         if !(1..=64).contains(&bit_depth) {
             return Err(error(TIFFError::Unsupported(format!(
                 "{bit_depth}-bit integer samples are not supported"
             ))));
         }
-        
+
         Ok(Self {
             kind,
             channels,

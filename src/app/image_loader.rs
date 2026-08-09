@@ -112,28 +112,10 @@ impl ImageMetadata {
         ];
 
         if let Some(metadata) = decoded.jpeg_xr_metadata {
-            fields.push(MetadataField::new(
-                "Source samples",
-                format_jpeg_xr_samples(metadata),
-            ));
-            fields.push(MetadataField::new(
-                "Dynamic range",
-                if metadata.is_hdr() {
-                    "HDR → SDR"
-                } else {
-                    "SDR"
-                },
-            ));
-
-            if let (Some(scrgb), Some(nits)) = (metadata.max_cll_scrgb(), metadata.max_cll_nits()) {
-                fields.push(MetadataField::new(
-                    "MaxCLL",
-                    format!("{scrgb:.3} scRGB · {nits:.1} cd/m²"),
-                ));
-            }
+            fields.extend(jpeg_xr_metadata_fields(metadata));
         }
 
-        fields.push(MetadataField::new("Output", "RGBA · 8 bpc"));
+        fields.push(MetadataField::section("Output", "RGBA · 8 bpc"));
         fields.push(MetadataField::new(
             "Transparency",
             if transparency { "Present" } else { "None" },
@@ -148,6 +130,7 @@ impl ImageMetadata {
 pub(super) struct MetadataField {
     pub(super) label: &'static str,
     pub(super) value: SharedString,
+    pub(super) starts_section: bool,
 }
 
 impl MetadataField {
@@ -155,7 +138,17 @@ impl MetadataField {
         let value = value.into();
         invariant!(!label.is_empty());
         invariant!(!value.is_empty());
-        Self { label, value }
+        Self {
+            label,
+            value,
+            starts_section: false,
+        }
+    }
+
+    fn section(label: &'static str, value: impl Into<SharedString>) -> Self {
+        let mut field = Self::new(label, value);
+        field.starts_section = true;
+        field
     }
 }
 
@@ -217,15 +210,15 @@ impl SourceFormat {
             Self::Gif => gif::decode(bytes)
                 .or_raise(|| image_decode_error(path))
                 .map(DecodedSource::standard),
-            
+
             Self::Jpeg => jpeg::decode(bytes)
                 .or_raise(|| image_decode_error(path))
                 .map(DecodedSource::standard),
-            
+
             Self::JpegXl => jpeg_xl::decode(bytes)
                 .or_raise(|| image_decode_error(path))
                 .map(DecodedSource::standard),
-            
+
             Self::JpegXr => jpeg_xr::decode_with_metadata(bytes)
                 .or_raise(|| image_decode_error(path))
                 .map(|decoded| {
@@ -235,11 +228,11 @@ impl SourceFormat {
                         jpeg_xr_metadata: Some(metadata),
                     }
                 }),
-            
+
             Self::Png => png::decode(bytes)
                 .or_raise(|| image_decode_error(path))
                 .map(DecodedSource::standard),
-            
+
             Self::Tiff => tiff::decode(bytes)
                 .or_raise(|| image_decode_error(path))
                 .map(DecodedSource::standard),
@@ -384,15 +377,74 @@ fn display_parent(path: &Path) -> SharedString {
     }
 }
 
-fn format_jpeg_xr_samples(metadata: jpeg_xr::JPEGXRMetadata) -> String {
-    let channels = match (metadata.color_channels(), metadata.has_alpha()) {
+fn format_jpeg_xr_channels(metadata: jpeg_xr::JPEGXRMetadata) -> &'static str {
+    match (metadata.color_channels(), metadata.has_alpha()) {
         (1, false) => "Gray",
         (1, true) => "GrayA",
         (3, false) => "RGB",
         (3, true) => "RGBA",
         _ => "Color",
-    };
-    format!("{channels} · {} bpc", metadata.bits_per_channel())
+    }
+}
+
+fn format_jpeg_xr_dynamic_range(metadata: jpeg_xr::JPEGXRMetadata) -> String {
+    let dynamic_range = if metadata.is_hdr() { "HDR" } else { "SDR" };
+    let channels = format_jpeg_xr_channels(metadata);
+    let bits_per_channel = metadata.bits_per_channel();
+    format!("{dynamic_range} ({channels} @ {bits_per_channel}-bpc)")
+}
+
+fn jpeg_xr_metadata_fields(metadata: jpeg_xr::JPEGXRMetadata) -> Vec<MetadataField> {
+    let mut fields = vec![MetadataField::new(
+        "Dynamic Range",
+        format_jpeg_xr_dynamic_range(metadata),
+    )];
+    if metadata.is_hdr() {
+        fields.extend(jpeg_xr_hdr_fields(metadata));
+    }
+    fields
+}
+
+fn jpeg_xr_hdr_fields(metadata: jpeg_xr::JPEGXRMetadata) -> [MetadataField; 6] {
+    let max_cll = metadata
+        .max_cll_scrgb()
+        .expect("HDR JPEG XR metadata includes MaxCLL");
+
+    let max_cll_channel = metadata
+        .max_cll_channel()
+        .expect("HDR JPEG XR metadata includes a MaxCLL channel");
+
+    let max_luminance = metadata
+        .max_luminance_nits()
+        .expect("HDR JPEG XR metadata includes maximum luminance");
+
+    let average_luminance = metadata
+        .average_luminance_nits()
+        .expect("HDR JPEG XR metadata includes average luminance");
+
+    let min_luminance = metadata
+        .min_luminance_nits()
+        .expect("HDR JPEG XR metadata includes minimum luminance");
+
+    let rec709 = metadata
+        .rec709_percentage()
+        .expect("HDR JPEG XR metadata includes Rec. 709 coverage");
+
+    let dci_p3 = metadata
+        .dci_p3_percentage()
+        .expect("HDR JPEG XR metadata includes DCI-P3 coverage");
+
+    [
+        MetadataField::section(
+            "MaxCLL (scRGB)",
+            format!("{max_cll:.3} ({})", max_cll_channel.symbol()),
+        ),
+        MetadataField::new("Max Luminance", format!("{max_luminance:.3} cd / m²")),
+        MetadataField::new("Avg Luminance", format!("{average_luminance:.3} cd / m²")),
+        MetadataField::new("Min Luminance", format!("{min_luminance:.3} cd / m²")),
+        MetadataField::section("Rec. 709", format!("{rec709:.4} %")),
+        MetadataField::new("DCI-P3", format!("{dci_p3:.4} %")),
+    ]
 }
 
 fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {

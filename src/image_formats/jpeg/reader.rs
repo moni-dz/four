@@ -38,13 +38,13 @@ impl<'a> Reader<'a> {
             .offset
             .checked_add(length)
             .ok_or_raise(|| JPEGError::ArithmeticOverflow("JPEG input offset overflowed"))?;
-        
+
         if end > self.bytes.len() {
             return Err(error(JPEGError::UnexpectedEnd(
                 "JPEG input offset extends past the input",
             )));
         }
-        
+
         self.offset = end;
         Ok(())
     }
@@ -58,7 +58,7 @@ impl<'a> Reader<'a> {
             .get(self.offset)
             .copied()
             .ok_or_raise(|| JPEGError::UnexpectedEnd("unexpected end of JPEG data"))?;
-        
+
         self.offset += 1;
         Ok(value)
     }
@@ -80,12 +80,12 @@ impl<'a> Reader<'a> {
             .offset
             .checked_add(length)
             .ok_or_raise(|| JPEGError::ArithmeticOverflow("JPEG segment length overflowed"))?;
-        
+
         let slice = self
             .bytes
             .get(self.offset..end)
             .ok_or_raise(|| JPEGError::UnexpectedEnd("JPEG segment extends past the input"))?;
-        
+
         self.offset = end;
         Ok(slice)
     }
@@ -114,18 +114,18 @@ impl<'a> Reader<'a> {
                 found: prefix,
             }));
         }
-        
+
         let mut marker = self.read_u8()?;
         while marker == 0xff {
             marker = self.read_u8()?;
         }
-        
+
         if marker == 0x00 {
             return Err(error(JPEGError::Marker(
                 "stuffed byte appeared outside entropy data",
             )));
         }
-        
+
         Ok(marker)
     }
 }

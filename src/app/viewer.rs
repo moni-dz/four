@@ -18,12 +18,13 @@ const CONTEXT_MENU_PADDING: f32 = 8.0;
 const CONTEXT_MENU_WIDTH: f32 = 180.0;
 const DRAG_REGION_HEIGHT: f32 = 40.0;
 const METADATA_FIELD_GAP: f32 = 12.0;
-const METADATA_LABEL_WIDTH: f32 = 112.0;
+const METADATA_LABEL_WIDTH: f32 = 140.0;
 const METADATA_OVERLAY_MARGIN: f32 = 12.0;
-const METADATA_OVERLAY_WIDTH: f32 = 430.0;
+const METADATA_OVERLAY_WIDTH: f32 = 480.0;
+const METADATA_WINDOW_MIN_HEIGHT: f32 = 500.0;
 
 pub(super) const WINDOW_MIN_WIDTH: f32 = METADATA_OVERLAY_WIDTH + 2.0 * METADATA_OVERLAY_MARGIN;
-pub(super) const WINDOW_MIN_HEIGHT: f32 = DRAG_REGION_HEIGHT + context_menu_height(true);
+pub(super) const WINDOW_MIN_HEIGHT: f32 = METADATA_WINDOW_MIN_HEIGHT;
 
 pub(super) enum ViewerState {
     Empty {
@@ -140,7 +141,7 @@ impl Root {
             .load_generation
             .checked_add(1)
             .expect("image load request generation overflowed");
-        
+
         LoadRequest(self.load_generation)
     }
 
@@ -392,6 +393,7 @@ fn metadata_field(field: &MetadataField) -> gpui::Div {
         .items_start()
         .gap(px(METADATA_FIELD_GAP))
         .py_0p5()
+        .when(field.starts_section, gpui::Styled::mt_2)
         .child(
             div()
                 .w(px(METADATA_LABEL_WIDTH))

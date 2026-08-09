@@ -92,7 +92,6 @@ fn decode_huffman(bytes: &[u8]) -> Result<DecodedImage> {
         error(JPEGError::LimitExceeded(JPEGLimit::Dimensions(
             DIMENSION_MAX,
         )))
-
     })?;
     validate_dimensions(width, height)?;
 
@@ -103,7 +102,6 @@ fn decode_huffman(bytes: &[u8]) -> Result<DecodedImage> {
         error(JPEGError::ArithmeticOverflow(
             "JPEG codec output size overflowed",
         ))
-
     })?;
 
     if output_size != expected {

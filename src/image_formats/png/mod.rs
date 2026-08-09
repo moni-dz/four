@@ -61,7 +61,7 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
             "PNG codec could not determine the decoded buffer size",
         ))
     })?;
-    
+
     let rgba_size = rgba_size(width, height)?;
     if output_size > rgba_size {
         return Err(error(PNGError::LimitExceeded(PNGLimit::DecodedBytes(
@@ -73,26 +73,26 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
     let output = reader
         .next_frame(&mut pixel_buffer)
         .map_err(|source| codec_error(&source))?;
-    
+
     if output.width != width || output.height != height {
         return Err(error(PNGError::Output(
             "animated PNG subframes are not supported",
         )));
     }
-    
+
     if output.bit_depth != BitDepth::Eight {
         return Err(error(PNGError::Output(
             "PNG codec did not produce eight-bit samples",
         )));
     }
-    
+
     let used = output.buffer_size();
     let samples = pixel_buffer.get(..used).ok_or_else(|| {
         error(PNGError::Output(
             "PNG codec reported an invalid output length",
         ))
     })?;
-    
+
     let rgba = normalize_rgba(samples, output.color_type, width, height)?;
     Ok(DecodedImage::new(width, height, rgba))
 }
