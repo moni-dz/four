@@ -9,7 +9,7 @@ use exn::{ErrorExt, ResultExt};
 use gpui::{
     App, Bounds, Image as GPUIImage, ImageFormat, MouseButton, MouseDownEvent, PathPromptOptions,
     Pixels, Point, SharedString, Window, WindowBounds, WindowControlArea, WindowOptions, deferred,
-    div, img, prelude::*, px, rgb, size,
+    div, img, prelude::*, px, rgb, rgba, size,
 };
 use gpui_platform::application;
 use mimalloc::MiMalloc;
@@ -51,11 +51,15 @@ macro_rules! invariant_eq {
 #[global_allocator]
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
-const CONTEXT_MENU_HEIGHT: f32 = 80.0;
+const CONTEXT_MENU_ITEM_HEIGHT: f32 = 36.0;
+const CONTEXT_MENU_PADDING: f32 = 8.0;
 const CONTEXT_MENU_WIDTH: f32 = 180.0;
 const DRAG_REGION_HEIGHT: f32 = 40.0;
 const ERROR_FRAMES_MAX: u32 = 8;
 const IMAGE_FILE_BYTES_MAX: u64 = 128 * 1024 * 1024;
+const METADATA_FIELD_GAP: f32 = 12.0;
+const METADATA_LABEL_WIDTH: f32 = 112.0;
+const METADATA_OVERLAY_WIDTH: f32 = 430.0;
 
 type LoadException = exn::Exn<LoadError>;
 type LoadResult<T> = exn::Result<T, LoadError>;
@@ -109,8 +113,14 @@ fn format_load_error(error: &LoadException) -> String {
     message
 }
 
-struct LoadedImage {
+#[derive(Clone)]
+struct DisplayedImage {
     image: Arc<GPUIImage>,
+    metadata: Arc<ImageMetadata>,
+}
+
+struct LoadedImage {
+    displayed: DisplayedImage,
     status: SharedString,
 }
 
@@ -123,7 +133,7 @@ struct FailedView {
 }
 
 struct LoadedFailedView {
-    image: Arc<GPUIImage>,
+    displayed: DisplayedImage,
     status: SharedString,
 }
 
@@ -164,12 +174,12 @@ impl ViewerState {
         invariant!(!self.status().is_empty());
         invariant_eq!(self.image().is_some(), self.has_image());
 
-        let previous_image = self.image();
+        let previous_image = self.displayed().cloned();
         *self = match result {
             Ok(loaded) => Self::Loaded(loaded),
             Err(error) => match previous_image {
-                Some(image) => Self::LoadedFailed(LoadedFailedView {
-                    image,
+                Some(displayed) => Self::LoadedFailed(LoadedFailedView {
+                    displayed,
                     status: format_load_error(&error).into(),
                 }),
                 None => Self::Failed(FailedView {
@@ -194,9 +204,21 @@ impl ViewerState {
     fn image(&self) -> Option<Arc<GPUIImage>> {
         invariant!(!self.status().is_empty());
 
+        self.displayed()
+            .map(|displayed| Arc::clone(&displayed.image))
+    }
+
+    fn metadata(&self) -> Option<Arc<ImageMetadata>> {
+        invariant!(!self.status().is_empty());
+
+        self.displayed()
+            .map(|displayed| Arc::clone(&displayed.metadata))
+    }
+
+    fn displayed(&self) -> Option<&DisplayedImage> {
         match self {
-            Self::Loaded(state) => Some(Arc::clone(&state.image)),
-            Self::LoadedFailed(state) => Some(Arc::clone(&state.image)),
+            Self::Loaded(state) => Some(&state.displayed),
+            Self::LoadedFailed(state) => Some(&state.displayed),
             Self::Empty(_) | Self::Failed(_) => None,
         }
     }
@@ -209,6 +231,7 @@ impl ViewerState {
 
 struct Root {
     context_menu_position: Option<Point<Pixels>>,
+    metadata_visible: bool,
     viewer: ViewerState,
 }
 
@@ -216,9 +239,11 @@ impl Root {
     fn new(viewer: ViewerState) -> Self {
         let root = Self {
             context_menu_position: None,
+            metadata_visible: false,
             viewer,
         };
         invariant!(root.context_menu_position.is_none());
+        invariant!(!root.metadata_visible);
         invariant!(!root.viewer.status().is_empty());
         root
     }
@@ -226,10 +251,9 @@ impl Root {
     fn show_context_menu(&mut self, event: &MouseDownEvent, window: &Window) {
         let mut position = event.position;
         let viewport_size = window.viewport_size();
+        let menu_height = context_menu_height(self.viewer.has_image());
         position.x = position.x.min(viewport_size.width - px(CONTEXT_MENU_WIDTH));
-        position.y = position
-            .y
-            .min(viewport_size.height - px(CONTEXT_MENU_HEIGHT));
+        position.y = position.y.min(viewport_size.height - px(menu_height));
         position.x = position.x.max(px(0.0));
         position.y = position.y.max(px(DRAG_REGION_HEIGHT));
         invariant!(position.x >= px(0.0));
@@ -269,11 +293,20 @@ impl Root {
         invariant!(!self.viewer.status().is_empty());
         invariant!(self.context_menu_position.is_none());
 
+        let load_succeeded = result.is_ok();
         self.viewer.apply_result(result);
+        if load_succeeded {
+            self.metadata_visible = false;
+        }
         invariant!(!self.viewer.status().is_empty());
     }
 
-    fn render_context_menu(position: Point<Pixels>, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_context_menu(
+        position: Point<Pixels>,
+        has_image: bool,
+        metadata_visible: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         invariant!(position.x >= px(0.0));
         invariant!(position.y >= px(DRAG_REGION_HEIGHT));
 
@@ -283,7 +316,7 @@ impl Root {
                 .left(position.x)
                 .top(position.y)
                 .w(px(CONTEXT_MENU_WIDTH))
-                .h(px(CONTEXT_MENU_HEIGHT))
+                .h(px(context_menu_height(has_image)))
                 .p_1()
                 .rounded_md()
                 .shadow_lg()
@@ -300,9 +333,73 @@ impl Root {
                     menu_item("open-image", "Open image…")
                         .on_click(cx.listener(|root, _, window, cx| root.open_image(window, cx))),
                 )
+                .when(has_image, |menu| {
+                    let label = if metadata_visible {
+                        "Hide image info"
+                    } else {
+                        "Show image info"
+                    };
+                    menu.child(menu_item("toggle-image-info", label).on_click(cx.listener(
+                        |root, _, _, cx| {
+                            root.context_menu_position = None;
+                            root.metadata_visible = !root.metadata_visible;
+                            cx.notify();
+                        },
+                    )))
+                })
                 .child(menu_item("quit", "Quit").on_click(|_, _, cx| cx.quit())),
         )
         .priority(1)
+    }
+
+    fn render_metadata_overlay(metadata: &ImageMetadata) -> gpui::Div {
+        invariant!(!metadata.fields.is_empty());
+
+        let mut overlay = div()
+            .absolute()
+            .left(px(12.0))
+            .top(px(DRAG_REGION_HEIGHT + 12.0))
+            .w(px(METADATA_OVERLAY_WIDTH))
+            .p_3()
+            .rounded_md()
+            .border_1()
+            .border_color(rgba(0xff_ff_ff_22))
+            .shadow_lg()
+            .bg(rgba(0x0d_0d_0d_e8))
+            .font_family("Consolas")
+            .text_sm()
+            .flex()
+            .flex_col();
+
+        for field in &metadata.fields {
+            overlay = overlay.child(metadata_field(field));
+        }
+
+        overlay
+    }
+
+    fn render_image_content(image: Option<Arc<GPUIImage>>, has_image: bool) -> gpui::Div {
+        invariant_eq!(image.is_some(), has_image);
+
+        div()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .overflow_hidden()
+            .when_some(image, |content, image| {
+                content.child(img(image).size_full())
+            })
+            .when(!has_image, |content| {
+                content.child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(0x0088_8888))
+                        .child("Right-click anywhere, then choose Open image…"),
+                )
+            })
     }
 }
 
@@ -317,8 +414,11 @@ impl Render for Root {
         let context_menu_position = self.context_menu_position;
         let image = self.viewer.image();
         let has_image = self.viewer.has_image();
+        let metadata = self.viewer.metadata();
+        let metadata_visible = self.metadata_visible;
         let status = self.viewer.status().clone();
         invariant_eq!(image.is_some(), has_image);
+        invariant_eq!(metadata.is_some(), has_image);
         div()
             .relative()
             .size_full()
@@ -346,31 +446,24 @@ impl Render for Root {
                     .window_control_area(WindowControlArea::Drag)
                     .child(status),
             )
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .min_w_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .overflow_hidden()
-                    .when_some(image, |content, image| {
-                        content.child(img(image).size_full())
-                    })
-                    .when(!has_image, |content| {
-                        content.child(
-                            div()
-                                .text_sm()
-                                .text_color(rgb(0x0088_8888))
-                                .child("Right-click anywhere, then choose Open image…"),
-                        )
-                    }),
-            )
+            .child(Self::render_image_content(image, has_image))
+            .when_some(metadata.filter(|_| metadata_visible), |root, metadata| {
+                root.child(Self::render_metadata_overlay(&metadata))
+            })
             .when_some(context_menu_position, |root, position| {
-                root.child(Self::render_context_menu(position, cx))
+                root.child(Self::render_context_menu(
+                    position,
+                    has_image,
+                    metadata_visible,
+                    cx,
+                ))
             })
     }
+}
+
+const fn context_menu_height(has_image: bool) -> f32 {
+    let item_count = if has_image { 3.0 } else { 2.0 };
+    CONTEXT_MENU_PADDING + CONTEXT_MENU_ITEM_HEIGHT * item_count
 }
 
 fn menu_item(identifier: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
@@ -392,6 +485,282 @@ fn menu_item(identifier: &'static str, label: &'static str) -> gpui::Stateful<gp
         .child(label)
 }
 
+fn metadata_field(field: &MetadataField) -> gpui::Div {
+    invariant!(!field.label.is_empty());
+    invariant!(!field.value.is_empty());
+
+    div()
+        .w_full()
+        .flex()
+        .items_start()
+        .gap(px(METADATA_FIELD_GAP))
+        .py_0p5()
+        .child(
+            div()
+                .w(px(METADATA_LABEL_WIDTH))
+                .flex_none()
+                .text_color(rgb(0x009d_9d9d))
+                .child(field.label),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex_1()
+                .text_color(rgb(0x00e8_e8e8))
+                .child(field.value.clone()),
+        )
+}
+
+#[derive(Debug)]
+struct ImageMetadata {
+    fields: Vec<MetadataField>,
+}
+
+impl ImageMetadata {
+    fn new(path: &Path, decoded: &DecodedImageState) -> Self {
+        let (width, height) = decoded.image.dimensions();
+        invariant!(width > 0);
+        invariant!(height > 0);
+        invariant!(decoded.byte_count <= IMAGE_FILE_BYTES_MAX);
+
+        let file_name = path.file_name().map_or_else(
+            || path.as_os_str().to_string_lossy(),
+            |name| name.to_string_lossy(),
+        );
+        let folder = path.parent().map_or_else(
+            || SharedString::from("."),
+            |parent| {
+                let parent = parent.as_os_str().to_string_lossy();
+                if parent.is_empty() {
+                    SharedString::from(".")
+                } else {
+                    SharedString::from(parent.into_owned())
+                }
+            },
+        );
+        let divisor = greatest_common_divisor(width, height);
+        let pixel_count = u64::from(width) * u64::from(height);
+        let (pixels, remainder) = decoded.image.rgba8().as_chunks::<4>();
+        invariant!(remainder.is_empty());
+        let transparency = pixels.iter().any(|pixel| pixel[3] != u8::MAX);
+        let mut fields = vec![
+            MetadataField::new("Image", file_name.into_owned()),
+            MetadataField::new("Folder", folder),
+            MetadataField::new("File size", format_file_size(decoded.byte_count)),
+            MetadataField::new("Format", decoded.source_format.label()),
+            MetadataField::new("Dimensions", format!("{width} × {height} px")),
+            MetadataField::new(
+                "Aspect ratio",
+                format!("{}:{}", width / divisor, height / divisor),
+            ),
+            MetadataField::new("Pixels", format_pixel_count(pixel_count)),
+        ];
+        if let Some(metadata) = decoded.jpeg_xr_metadata {
+            fields.push(MetadataField::new(
+                "Source samples",
+                format_jpeg_xr_samples(metadata),
+            ));
+            fields.push(MetadataField::new(
+                "Dynamic range",
+                if metadata.is_hdr() {
+                    "HDR → SDR"
+                } else {
+                    "SDR"
+                },
+            ));
+            if let (Some(scrgb), Some(nits)) = (metadata.max_cll_scrgb(), metadata.max_cll_nits()) {
+                fields.push(MetadataField::new(
+                    "MaxCLL",
+                    format!("{scrgb:.3} scRGB · {nits:.1} cd/m²"),
+                ));
+            }
+        }
+        fields.push(MetadataField::new("Output", "RGBA · 8 bpc"));
+        fields.push(MetadataField::new(
+            "Transparency",
+            if transparency { "Present" } else { "None" },
+        ));
+        invariant!(fields.iter().all(|field| !field.value.is_empty()));
+        Self { fields }
+    }
+}
+
+#[derive(Debug)]
+struct MetadataField {
+    label: &'static str,
+    value: SharedString,
+}
+
+impl MetadataField {
+    fn new(label: &'static str, value: impl Into<SharedString>) -> Self {
+        let value = value.into();
+        invariant!(!label.is_empty());
+        invariant!(!value.is_empty());
+        Self { label, value }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SourceFormat {
+    Gif,
+    Jpeg,
+    JpegXl,
+    JpegXr,
+    Png,
+    Tiff,
+}
+
+impl SourceFormat {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Gif => "GIF",
+            Self::Jpeg => "JPEG",
+            Self::JpegXl => "JPEG XL",
+            Self::JpegXr => "JPEG XR",
+            Self::Png => "PNG",
+            Self::Tiff => "TIFF",
+        }
+    }
+
+    fn detect(bytes: &[u8], extension: Option<&str>) -> Self {
+        if jpeg_xl::has_signature(bytes) {
+            Self::JpegXl
+        } else if jpeg_xr::has_signature(bytes) {
+            Self::JpegXr
+        } else if png::has_signature(bytes) {
+            Self::Png
+        } else if gif::has_signature(bytes) {
+            Self::Gif
+        } else if tiff::has_signature(bytes) {
+            Self::Tiff
+        } else if bytes.starts_with(&jpeg::SIGNATURE) {
+            Self::Jpeg
+        } else if extension.is_some_and(|value| value.eq_ignore_ascii_case("jxl")) {
+            Self::JpegXl
+        } else if extension.is_some_and(|value| {
+            value.eq_ignore_ascii_case("jxr")
+                || value.eq_ignore_ascii_case("wdp")
+                || value.eq_ignore_ascii_case("hdp")
+        }) {
+            Self::JpegXr
+        } else if extension.is_some_and(|value| value.eq_ignore_ascii_case("png")) {
+            Self::Png
+        } else if extension.is_some_and(|value| value.eq_ignore_ascii_case("gif")) {
+            Self::Gif
+        } else if extension.is_some_and(|value| {
+            value.eq_ignore_ascii_case("tif") || value.eq_ignore_ascii_case("tiff")
+        }) {
+            Self::Tiff
+        } else {
+            Self::Jpeg
+        }
+    }
+
+    fn decode(self, bytes: &[u8], path: &Path) -> LoadResult<DecodedSource> {
+        match self {
+            Self::Gif => gif::decode(bytes)
+                .or_raise(|| image_decode_error(path))
+                .map(DecodedSource::standard),
+            Self::Jpeg => jpeg::decode(bytes)
+                .or_raise(|| image_decode_error(path))
+                .map(DecodedSource::standard),
+            Self::JpegXl => jpeg_xl::decode(bytes)
+                .or_raise(|| image_decode_error(path))
+                .map(DecodedSource::standard),
+            Self::JpegXr => jpeg_xr::decode_with_metadata(bytes)
+                .or_raise(|| image_decode_error(path))
+                .map(|decoded| {
+                    let metadata = decoded.metadata();
+                    DecodedSource {
+                        image: decoded.into_image(),
+                        jpeg_xr_metadata: Some(metadata),
+                    }
+                }),
+            Self::Png => png::decode(bytes)
+                .or_raise(|| image_decode_error(path))
+                .map(DecodedSource::standard),
+            Self::Tiff => tiff::decode(bytes)
+                .or_raise(|| image_decode_error(path))
+                .map(DecodedSource::standard),
+        }
+    }
+}
+
+struct DecodedSource {
+    image: DecodedImage,
+    jpeg_xr_metadata: Option<jpeg_xr::JPEGXRMetadata>,
+}
+
+impl DecodedSource {
+    fn standard(image: DecodedImage) -> Self {
+        Self {
+            image,
+            jpeg_xr_metadata: None,
+        }
+    }
+}
+
+fn image_decode_error(path: &Path) -> LoadError {
+    LoadError::new(format!("Could not decode {}", path.display()))
+}
+
+fn format_jpeg_xr_samples(metadata: jpeg_xr::JPEGXRMetadata) -> String {
+    let channels = match (metadata.color_channels(), metadata.has_alpha()) {
+        (1, false) => "Gray",
+        (1, true) => "GrayA",
+        (3, false) => "RGB",
+        (3, true) => "RGBA",
+        _ => "Color",
+    };
+    format!("{channels} · {} bpc", metadata.bits_per_channel())
+}
+
+fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
+    invariant!(left > 0);
+    invariant!(right > 0);
+
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    invariant!(left > 0);
+    left
+}
+
+fn format_file_size(bytes: u64) -> String {
+    const KIBIBYTE: u64 = 1024;
+    const MEBIBYTE: u64 = 1024 * KIBIBYTE;
+
+    if bytes >= MEBIBYTE {
+        format_hundredths(bytes, MEBIBYTE, "MiB")
+    } else if bytes >= KIBIBYTE {
+        format_hundredths(bytes, KIBIBYTE, "KiB")
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn format_pixel_count(pixels: u64) -> String {
+    const MEGAPIXEL: u64 = 1_000_000;
+
+    if pixels >= MEGAPIXEL {
+        format_hundredths(pixels, MEGAPIXEL, "MP")
+    } else {
+        format!("{pixels} px")
+    }
+}
+
+fn format_hundredths(value: u64, unit: u64, suffix: &str) -> String {
+    invariant!(unit > 0);
+    invariant!(!suffix.is_empty());
+
+    let scaled = value
+        .checked_mul(100)
+        .and_then(|value| value.checked_add(unit / 2))
+        .expect("bounded image metadata fits fixed-point display arithmetic")
+        / unit;
+    format!("{}.{:02} {suffix}", scaled / 100, scaled % 100)
+}
+
 // Loading is a linear pipeline: only read bytes can be decoded, and only decoded pixels can be
 // presented. Consuming transitions prevent callers from skipping or repeating a phase.
 struct ImageLoad<State> {
@@ -409,6 +778,9 @@ struct EncodedImage {
 
 struct DecodedImageState {
     image: DecodedImage,
+    byte_count: u64,
+    source_format: SourceFormat,
+    jpeg_xr_metadata: Option<jpeg_xr::JPEGXRMetadata>,
 }
 
 impl ImageLoad<SelectedImage> {
@@ -451,67 +823,23 @@ impl ImageLoad<EncodedImage> {
     fn decode(self) -> LoadResult<ImageLoad<DecodedImageState>> {
         invariant!(self.state.bytes.len() as u64 <= IMAGE_FILE_BYTES_MAX);
         invariant!(isize::try_from(self.state.bytes.len()).is_ok());
+        let byte_count = u64::try_from(self.state.bytes.len())
+            .expect("the validated image input length fits u64");
 
         let extension = self.path.extension().map(|value| value.to_string_lossy());
-        let extension_is_jpeg_xl = extension
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case("jxl"));
-        let extension_is_hd_photo = extension.as_deref().is_some_and(|value| {
-            value.eq_ignore_ascii_case("jxr")
-                || value.eq_ignore_ascii_case("wdp")
-                || value.eq_ignore_ascii_case("hdp")
-        });
-        let extension_is_png = extension
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case("png"));
-        let extension_is_gif = extension
-            .as_deref()
-            .is_some_and(|value| value.eq_ignore_ascii_case("gif"));
-        let extension_is_tiff = extension.as_deref().is_some_and(|value| {
-            value.eq_ignore_ascii_case("tif") || value.eq_ignore_ascii_case("tiff")
-        });
-        let image = if jpeg_xl::has_signature(&self.state.bytes) {
-            jpeg_xl::decode(&self.state.bytes)
-                .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
-        } else if jpeg_xr::has_signature(&self.state.bytes) {
-            jpeg_xr::decode(&self.state.bytes)
-                .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
-        } else if png::has_signature(&self.state.bytes) {
-            png::decode(&self.state.bytes)
-                .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
-        } else if gif::has_signature(&self.state.bytes) {
-            gif::decode(&self.state.bytes)
-                .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
-        } else if tiff::has_signature(&self.state.bytes) {
-            tiff::decode(&self.state.bytes)
-                .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
-        } else if self.state.bytes.starts_with(&jpeg::SIGNATURE) {
-            jpeg::decode(&self.state.bytes)
-                .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
-        } else if extension_is_jpeg_xl {
-            jpeg_xl::decode(&self.state.bytes)
-                .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
-        } else if extension_is_hd_photo {
-            jpeg_xr::decode(&self.state.bytes)
-                .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
-        } else if extension_is_png {
-            png::decode(&self.state.bytes)
-                .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
-        } else if extension_is_gif {
-            gif::decode(&self.state.bytes)
-                .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
-        } else if extension_is_tiff {
-            tiff::decode(&self.state.bytes)
-                .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
-        } else {
-            jpeg::decode(&self.state.bytes)
-                .or_raise(|| LoadError::new(format!("Could not decode {}", self.path.display())))?
-        };
+        let source_format = SourceFormat::detect(&self.state.bytes, extension.as_deref());
+        let decoded = source_format.decode(&self.state.bytes, &self.path)?;
+        let image = decoded.image;
         invariant!(image.width() > 0);
         invariant!(image.height() > 0);
         Ok(ImageLoad {
             path: self.path,
-            state: DecodedImageState { image },
+            state: DecodedImageState {
+                image,
+                byte_count,
+                source_format,
+                jpeg_xr_metadata: decoded.jpeg_xr_metadata,
+            },
         })
     }
 }
@@ -522,6 +850,7 @@ impl ImageLoad<DecodedImageState> {
         invariant!(width > 0);
         invariant!(height > 0);
 
+        let metadata = Arc::new(ImageMetadata::new(&self.path, &self.state));
         let image = Arc::new(GPUIImage::from_bytes(
             ImageFormat::Bmp,
             encode_bmp(&self.state.image),
@@ -531,7 +860,7 @@ impl ImageLoad<DecodedImageState> {
             |name| name.to_string_lossy(),
         );
         LoadedImage {
-            image,
+            displayed: DisplayedImage { image, metadata },
             status: format!("{file_name} — {width} × {height}").into(),
         }
     }
@@ -550,7 +879,8 @@ fn validate_image_file_size(path: &Path, byte_count: u64) -> LoadResult<()> {
 fn load_image(path: &Path) -> LoadResult<LoadedImage> {
     let loaded = ImageLoad::select(path).read()?.decode()?.present();
     invariant!(!loaded.status.is_empty());
-    invariant!(Arc::strong_count(&loaded.image) > 0);
+    invariant!(Arc::strong_count(&loaded.displayed.image) > 0);
+    invariant!(Arc::strong_count(&loaded.displayed.metadata) > 0);
     Ok(loaded)
 }
 
@@ -575,8 +905,8 @@ fn main() {
                 titlebar: None,
                 is_movable: true,
                 window_min_size: Some(size(
-                    px(CONTEXT_MENU_WIDTH),
-                    px(DRAG_REGION_HEIGHT + CONTEXT_MENU_HEIGHT),
+                    px(METADATA_OVERLAY_WIDTH + 24.0),
+                    px(DRAG_REGION_HEIGHT + context_menu_height(true)),
                 )),
                 ..Default::default()
             },
@@ -600,5 +930,27 @@ mod tests {
         invariant!(message.contains("JPEG codec error"));
         invariant_eq!(load_error.frame().children().len(), 1);
         invariant!(load_error.frame().children()[0].children().is_empty());
+    }
+
+    #[test]
+    fn overlay_formats_bounded_file_and_pixel_sizes() {
+        assert_eq!(format_file_size(999), "999 B");
+        assert_eq!(format_file_size(14_669_660), "13.99 MiB");
+        assert_eq!(format_pixel_count(3_686_400), "3.69 MP");
+    }
+
+    #[test]
+    fn overlay_reduces_image_aspect_ratios() {
+        let divisor = greatest_common_divisor(2560, 1440);
+
+        assert_eq!((2560 / divisor, 1440 / divisor), (16, 9));
+        assert!(context_menu_height(true) > context_menu_height(false));
+    }
+
+    #[test]
+    fn image_information_is_hidden_by_default() {
+        let root = Root::new(ViewerState::empty());
+
+        assert!(!root.metadata_visible);
     }
 }

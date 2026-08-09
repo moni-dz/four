@@ -35,6 +35,85 @@ const SC_RGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 const SOURCE_BUFFER_MAX: usize = 512 * 1024 * 1024;
 const TONE_MAP_KNEE: f32 = 0.75;
 
+/// A decoded JPEG XR image and its source metadata.
+#[derive(Debug)]
+pub struct DecodedJPEGXR {
+    image: DecodedImage,
+    metadata: JPEGXRMetadata,
+}
+
+impl DecodedJPEGXR {
+    /// Returns the normalized SDR image.
+    #[must_use]
+    pub const fn image(&self) -> &DecodedImage {
+        &self.image
+    }
+
+    /// Returns metadata derived from the JPEG XR pixel representation.
+    #[must_use]
+    pub const fn metadata(&self) -> JPEGXRMetadata {
+        self.metadata
+    }
+
+    /// Consumes the result and returns the normalized SDR image.
+    #[must_use]
+    pub fn into_image(self) -> DecodedImage {
+        self.image
+    }
+}
+
+/// Describes the native JPEG XR samples used to produce the SDR image.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct JPEGXRMetadata {
+    bits_per_channel: u8,
+    color_channels: u8,
+    has_alpha: bool,
+    is_hdr: bool,
+    max_cll_nits: Option<f32>,
+}
+
+impl JPEGXRMetadata {
+    /// Returns the number of bits in each native color sample.
+    #[must_use]
+    pub const fn bits_per_channel(self) -> u8 {
+        self.bits_per_channel
+    }
+
+    /// Returns the number of native color channels, excluding alpha.
+    #[must_use]
+    pub const fn color_channels(self) -> u8 {
+        self.color_channels
+    }
+
+    /// Returns whether the source pixel representation contains alpha.
+    #[must_use]
+    pub const fn has_alpha(self) -> bool {
+        self.has_alpha
+    }
+
+    /// Returns whether the source samples were interpreted as linear HDR light levels.
+    #[must_use]
+    pub const fn is_hdr(self) -> bool {
+        self.is_hdr
+    }
+
+    /// Returns the estimated maximum content light level in nits for HDR sources.
+    ///
+    /// The estimate is the 99.99th-percentile `max(R, G, B)` light level. SDR sources return
+    /// `None` because they do not pass through the HDR tone-mapping pipeline.
+    #[must_use]
+    pub const fn max_cll_nits(self) -> Option<f32> {
+        self.max_cll_nits
+    }
+
+    /// Returns the estimated maximum content light level in scRGB units for HDR sources.
+    #[must_use]
+    pub fn max_cll_scrgb(self) -> Option<f32> {
+        self.max_cll_nits
+            .map(|nits| nits / SC_RGB_REFERENCE_WHITE_NITS)
+    }
+}
+
 /// Returns whether `bytes` begins with the JPEG XR file signature.
 #[must_use]
 pub fn has_signature(bytes: impl AsRef<[u8]>) -> bool {
@@ -53,6 +132,19 @@ pub fn has_signature(bytes: impl AsRef<[u8]>) -> bool {
 /// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
 /// representation that cannot be normalized to RGB.
 pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
+    Ok(decode_with_metadata(bytes)?.into_image())
+}
+
+/// Decodes JPEG XR pixels together with their source representation metadata.
+///
+/// This performs the same bounded decode and HDR-to-SDR normalization as [`decode`]. For HDR
+/// sources, the returned metadata includes the percentile `MaxCLL` used by tone mapping.
+///
+/// # Errors
+///
+/// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
+/// representation that cannot be normalized to RGB.
+pub fn decode_with_metadata(bytes: impl AsRef<[u8]>) -> Result<DecodedJPEGXR> {
     let bytes = bytes.as_ref();
     if !has_signature(bytes) {
         return Err(error(JPEGXRError::Signature));
@@ -84,8 +176,12 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
     decoder
         .copy_all(&mut source, row_stride)
         .map_err(|source| codec_error(&source))?;
-    let rgba = normalize(&source, width, height, row_stride, layout)?;
-    Ok(DecodedImage::new(width, height, rgba))
+    let normalized = normalize(&source, width, height, row_stride, layout)?;
+    let metadata = JPEGXRMetadata::new(layout, normalized.max_cll);
+    Ok(DecodedJPEGXR {
+        image: DecodedImage::new(width, height, normalized.rgba),
+        metadata,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -114,6 +210,14 @@ impl SampleEncoding {
             Self::Fixed16 | Self::Fixed32 | Self::Float16 | Self::Float32 | Self::Rgbe
         )
     }
+
+    const fn bits_per_channel(self) -> u8 {
+        match self {
+            Self::Unsigned8 | Self::Rgbe => 8,
+            Self::Unsigned16 | Self::Fixed16 | Self::Float16 => 16,
+            Self::Fixed32 | Self::Float32 => 32,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,6 +229,21 @@ struct PixelLayout {
     has_alpha: bool,
     premultiplied_alpha: bool,
     blue_first: bool,
+}
+
+impl JPEGXRMetadata {
+    fn new(layout: PixelLayout, max_cll: Option<MaxCll>) -> Self {
+        invariant_eq!(layout.encoding.is_hdr(), max_cll.is_some());
+
+        Self {
+            bits_per_channel: layout.encoding.bits_per_channel(),
+            color_channels: u8::try_from(layout.color_channels)
+                .expect("a JPEG XR color-channel count fits u8"),
+            has_alpha: layout.has_alpha,
+            is_hdr: layout.encoding.is_hdr(),
+            max_cll_nits: max_cll.map(|level| level.nits),
+        }
+    }
 }
 
 impl PixelLayout {
@@ -263,7 +382,7 @@ fn normalize(
     height: u32,
     row_stride: usize,
     layout: PixelLayout,
-) -> Result<Vec<u8>> {
+) -> Result<NormalizedImage> {
     let width = usize::try_from(width).expect("validated JPEG XR width fits usize");
     let height = usize::try_from(height).expect("validated JPEG XR height fits usize");
     let expected_source_len = row_stride.checked_mul(height).ok_or_else(|| {
@@ -281,9 +400,9 @@ fn normalize(
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| error(JPEGXRError::Output("JPEG XR RGBA size exceeds usize")))?;
     let max_cll = if layout.encoding.is_hdr() {
-        MaxCll::estimate(source, row_stride, layout)?
+        Some(MaxCll::estimate(source, row_stride, layout)?)
     } else {
-        MaxCll::SDR
+        None
     };
     let mut rgba = Vec::with_capacity(output_len);
     let mut has_nonzero_alpha = false;
@@ -299,7 +418,7 @@ fn normalize(
             })?;
             let (color, alpha) = layout.read_pixel(pixel)?;
             has_nonzero_alpha |= alpha > 0.0;
-            let color = if layout.encoding.is_hdr() {
+            let color = if let Some(max_cll) = max_cll {
                 tone_map(color, max_cll)
             } else {
                 color.map(normalized_to_u8)
@@ -317,7 +436,13 @@ fn normalize(
         }
     }
     invariant_eq!(rgba.len(), output_len);
-    Ok(rgba)
+    Ok(NormalizedImage { rgba, max_cll })
+}
+
+#[derive(Debug)]
+struct NormalizedImage {
+    rgba: Vec<u8>,
+    max_cll: Option<MaxCll>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -326,10 +451,6 @@ struct MaxCll {
 }
 
 impl MaxCll {
-    const SDR: Self = Self {
-        nits: SC_RGB_REFERENCE_WHITE_NITS,
-    };
-
     fn estimate(source: &[u8], row_stride: usize, layout: PixelLayout) -> Result<Self> {
         invariant!(layout.encoding.is_hdr());
         invariant!(row_stride >= layout.bytes_per_pixel);
@@ -670,8 +791,15 @@ mod tests {
         }
 
         let max_cll = MaxCll::estimate(&source, source.len(), layout).unwrap();
+        let metadata = JPEGXRMetadata::new(layout, Some(max_cll));
 
         assert_eq!(max_cll.nits, 320.0);
+        assert!(metadata.is_hdr());
+        assert_eq!(metadata.bits_per_channel(), 32);
+        assert_eq!(metadata.color_channels(), 3);
+        assert!(!metadata.has_alpha());
+        assert_eq!(metadata.max_cll_scrgb(), Some(4.0));
+        assert_eq!(metadata.max_cll_nits(), Some(320.0));
     }
 
     #[test]
@@ -693,7 +821,7 @@ mod tests {
         ]
         .concat();
 
-        let rgba = normalize(&source, 1, 1, 16, layout).unwrap();
+        let rgba = normalize(&source, 1, 1, 16, layout).unwrap().rgba;
 
         assert_eq!(rgba[3], u8::MAX);
     }
