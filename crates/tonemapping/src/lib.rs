@@ -70,6 +70,45 @@ pub trait ToneMapper {
     fn map(&self, color: LinearRgb) -> LinearRgb;
 }
 
+/// Identifies a positive finite scene level that maps to display white.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct WhitePoint(f32);
+
+impl WhitePoint {
+    /// Creates a white point from a positive finite linear-light level.
+    ///
+    /// Returns `None` when `level` is zero, negative, or non-finite.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use tonemapping::WhitePoint;
+    ///
+    /// assert_eq!(WhitePoint::new(4.0).map(WhitePoint::level), Some(4.0));
+    /// assert!(WhitePoint::new(0.0).is_none());
+    /// ```
+    #[must_use]
+    pub fn new(level: f32) -> Option<Self> {
+        (level.is_finite() && level > 0.0).then_some(Self(level))
+    }
+
+    /// Returns the relative linear-light level represented by this white point.
+    #[must_use]
+    pub const fn level(self) -> f32 {
+        self.0
+    }
+}
+
+/// Clamps every component to the displayable range.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Clamp;
+
+impl ToneMapper for Clamp {
+    fn map(&self, color: LinearRgb) -> LinearRgb {
+        LinearRgb::displayable(color.components())
+    }
+}
+
 /// Compresses highlights above a fixed knee using the content peak.
 ///
 /// This operator preserves input luminance below `0.75`, maps `max_content_level` to `1.0`, and
@@ -163,4 +202,12 @@ mod tests {
         assert!(red > green);
         assert!(green > blue);
     }
+
+    #[test]
+    fn clamp_discards_values_outside_the_display_range() {
+        let color = Clamp.map(LinearRgb::new([0.25, 1.0, 4.0]));
+
+        assert_eq!(color.components(), [0.25, 1.0, 1.0]);
+    }
+
 }
