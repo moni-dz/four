@@ -518,6 +518,35 @@ impl ToneMapper for ReinhardJodie {
     }
 }
 
+/// Applies John Hable's Uncharted 2 filmic curve component-wise.
+///
+/// The operator includes the article's exposure bias of two and normalizes the curve at its `11.2`
+/// reference input. Consequently, a scene component of `5.6` maps to display white.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Uncharted2;
+
+impl ToneMapper for Uncharted2 {
+    fn map(&self, color: LinearRgb) -> LinearRgb {
+        let white_scale = 1.0 / uncharted2_partial(11.2);
+        LinearRgb::displayable(
+            color
+                .components()
+                .map(|component| uncharted2_partial(component * 2.0) * white_scale),
+        )
+    }
+}
+
+fn uncharted2_partial(value: f32) -> f32 {
+    const A: f32 = 0.15;
+    const B: f32 = 0.50;
+    const C: f32 = 0.10;
+    const D: f32 = 0.20;
+    const E: f32 = 0.02;
+    const F: f32 = 0.30;
+
+    ((value * (A * value + C * B) + D * E) / (value * (A * value + B) + D * F)) - E / F
+}
+
 /// Compresses highlights above a fixed knee using the content peak.
 ///
 /// This operator preserves input luminance below `0.75`, maps `max_content_level` to `1.0`, and
@@ -711,6 +740,17 @@ mod tests {
             ReinhardJodie.map(LinearRgb::new([1.0; 3])),
             Reinhard.map(LinearRgb::new([1.0; 3]))
         );
+    }
+
+    #[test]
+    fn uncharted_two_uses_the_article_exposure_and_white_scale() {
+        let [middle_gray, reference_white, filmic_white] = Uncharted2
+            .map(LinearRgb::new([0.18, 1.0, 5.6]))
+            .components();
+
+        assert_approximately_equal(middle_gray, 0.128_338_45);
+        assert_approximately_equal(reference_white, 0.492_918_55);
+        assert_eq!(filmic_white, 1.0);
     }
 
     #[test]
