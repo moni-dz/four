@@ -420,6 +420,17 @@ impl ToneMapper for ExtendedReinhard {
     }
 }
 
+/// Applies the simple Reinhard curve to luminance while retaining color ratios.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LuminanceReinhard;
+
+impl ToneMapper for LuminanceReinhard {
+    fn map(&self, color: LinearRgb) -> LinearRgb {
+        let scale = 1.0 / (1.0 + color.luminance());
+        LinearRgb::displayable(color.components().map(|component| component * scale))
+    }
+}
+
 /// Compresses highlights above a fixed knee using the content peak.
 ///
 /// This operator preserves input luminance below `0.75`, maps `max_content_level` to `1.0`, and
@@ -562,6 +573,20 @@ mod tests {
         let black = estimate_max_cll(&[LinearRgb::default()]).unwrap();
 
         assert!(ExtendedReinhard::from_max_cll(black).is_none());
+    }
+
+    #[test]
+    fn luminance_reinhard_preserves_unclipped_color_ratios() {
+        let input = LinearRgb::new([1.0, 0.5, 0.25]);
+        let output = LuminanceReinhard.map(input);
+        let [red, green, blue] = output.components();
+
+        assert_approximately_equal(red / green, 2.0);
+        assert_approximately_equal(green / blue, 2.0);
+        assert_approximately_equal(
+            output.luminance(),
+            input.luminance() / (1.0 + input.luminance()),
+        );
     }
 
     #[test]
