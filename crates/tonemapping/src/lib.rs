@@ -10,6 +10,7 @@
 //! component-wise, luminance-preserving, white-point, and Reinhard-Jodie variants. [`Uncharted2`],
 //! [`AcesFitted`], and [`AcesApproximate`] provide filmic curves, while [`CameraResponse`] applies
 //! a caller-supplied normalized camera-response lookup table.
+//! [`ToneMappingMethod`] enumerates the built-in operator families that need no custom response.
 //!
 //! [`estimate_max_cll`] and [`MaxCllEstimator`] select the nearest-rank 99.99th percentile of
 //! per-pixel `max(R, G, B)`. Inputs determine the unit: absolute-nit inputs produce `MaxCLL` in nits,
@@ -174,6 +175,75 @@ pub trait ToneMapper {
         for color in colors {
             *color = self.map(*color);
         }
+    }
+}
+
+/// Identifies a built-in tone-mapping operator family.
+///
+/// White-point methods still require an image-specific white point when they are constructed.
+/// [`CameraToneMapper`] is not listed because it additionally requires a caller-supplied
+/// [`CameraResponse`], for which there is no universal built-in preset.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ToneMappingMethod {
+    /// Clips each component to the display range.
+    Clamp,
+    /// Scales components by an image white point before clipping.
+    ScaledClamp,
+    /// Applies simple Reinhard independently to each component.
+    Reinhard,
+    /// Applies white-point Reinhard independently to each component.
+    #[default]
+    ExtendedReinhard,
+    /// Applies simple Reinhard to luminance while preserving color ratios.
+    LuminanceReinhard,
+    /// Applies white-point Reinhard to luminance while preserving color ratios.
+    ExtendedLuminanceReinhard,
+    /// Blends component-wise and luminance-based Reinhard results.
+    ReinhardJodie,
+    /// Applies the Uncharted 2 filmic curve.
+    Uncharted2,
+    /// Applies the fitted ACES reference and display transform.
+    AcesFitted,
+    /// Applies the scalar ACES curve approximation.
+    AcesApproximate,
+}
+
+impl ToneMappingMethod {
+    /// Contains every selectable built-in method in display order.
+    pub const ALL: [Self; 10] = [
+        Self::Clamp,
+        Self::ScaledClamp,
+        Self::Reinhard,
+        Self::ExtendedReinhard,
+        Self::LuminanceReinhard,
+        Self::ExtendedLuminanceReinhard,
+        Self::ReinhardJodie,
+        Self::Uncharted2,
+        Self::AcesFitted,
+        Self::AcesApproximate,
+    ];
+
+    /// Returns the concise user-facing method name.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Clamp => "Clamp",
+            Self::ScaledClamp => "Scaled clamp",
+            Self::Reinhard => "Reinhard",
+            Self::ExtendedReinhard => "Extended Reinhard",
+            Self::LuminanceReinhard => "Luminance Reinhard",
+            Self::ExtendedLuminanceReinhard => "Extended luminance Reinhard",
+            Self::ReinhardJodie => "Reinhard-Jodie",
+            Self::Uncharted2 => "Uncharted 2",
+            Self::AcesFitted => "ACES fitted",
+            Self::AcesApproximate => "ACES approximate",
+        }
+    }
+}
+
+impl fmt::Display for ToneMappingMethod {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.label())
     }
 }
 
@@ -1155,6 +1225,8 @@ fn nonnegative_f64_to_f32(value: f64) -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
+
     use super::*;
 
     struct DefaultBatchMapper;
@@ -1241,6 +1313,25 @@ mod tests {
 
         assert_eq!(color.components(), [70_000.0, 100_000.0, f32::MAX]);
         assert!(color.luminance().is_finite());
+    }
+
+    #[test]
+    fn selectable_method_labels_are_unique_and_default_to_extended_reinhard() {
+        let labels: HashSet<_> = ToneMappingMethod::ALL
+            .into_iter()
+            .map(ToneMappingMethod::label)
+            .collect();
+
+        assert_eq!(labels.len(), ToneMappingMethod::ALL.len());
+        assert!(labels.iter().all(|label| !label.is_empty()));
+        assert_eq!(
+            ToneMappingMethod::default(),
+            ToneMappingMethod::ExtendedReinhard
+        );
+        assert_eq!(
+            ToneMappingMethod::default().to_string(),
+            "Extended Reinhard"
+        );
     }
 
     #[test]

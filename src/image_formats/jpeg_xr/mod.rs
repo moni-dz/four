@@ -2,17 +2,21 @@
 //!
 //! The JPEG XR reference codec produces pixels in their native WIC representation. Unsigned RGB
 //! and grayscale samples are normalized as sRGB. Fixed-point, half-float, floating-point, and RGBE
-//! samples are interpreted as linear scRGB, mapped component-wise with extended Reinhard using a
-//! `MaxCLL` white point, and encoded with the sRGB transfer function. Mapping is bypassed when the
-//! content peak already fits the SDR target range.
+//! samples are interpreted as linear scRGB and encoded with the sRGB transfer function. By default,
+//! HDR values are mapped component-wise with extended Reinhard using a `MaxCLL` white point. Its
+//! white point is floored at display white so content already inside the SDR range is unchanged.
 //!
 //! `MaxCLL` is estimated from the 99.99th-percentile `max(R, G, B)` light level, rejecting isolated
 //! outliers at the cost of clipping the brightest 0.01% of a sufficiently large image.
+//! Callers can select any built-in [`ToneMappingMethod`]; white-point methods use matching
+//! percentile statistics estimated from the decoded image.
 //! A wholly empty, non-premultiplied HDR alpha plane is treated as unspecified and made opaque,
 //! matching JPEG XR screenshots that store zero in an otherwise unused alpha channel.
 
 mod error;
 
+use std::cmp::{Ordering, Reverse};
+use std::collections::BinaryHeap;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
 
@@ -20,8 +24,10 @@ use ::jpegxr::{
     BitDepthBits, ColorFormat, ImageDecode, JXRError, PixelFormat as CodecPixelFormat, PixelInfo,
 };
 use tonemapping::{
-    Clamp, ColorChannel as ToneColorChannel, ExtendedReinhard, LinearRgb, MaxCllEstimator,
-    ToneMapper, WhitePoint,
+    AcesApproximate, AcesFitted, Clamp, ColorChannel as ToneColorChannel,
+    ExtendedLuminanceReinhard, ExtendedReinhard, LinearRgb, LuminanceReinhard, LuminanceWhitePoint,
+    MaxCllEstimator, Reinhard, ReinhardJodie, ScaledClamp, ToneMapper, ToneMappingMethod,
+    Uncharted2, WhitePoint,
 };
 
 use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
@@ -208,7 +214,7 @@ pub fn has_signature(bytes: impl AsRef<[u8]>) -> bool {
 /// Unsigned integer RGB and grayscale inputs retain their sRGB encoding. Linear-light HDR inputs
 /// use extended Reinhard with a `MaxCLL` white point before conversion to sRGB. `MaxCLL` is
 /// estimated from the 99.99th-percentile brightest pixel to prevent isolated outliers from dimming
-/// the image. Mapping is bypassed when the content peak already fits the target range.
+/// the image. The white point is floored at display white so in-range content is unchanged.
 /// Premultiplied inputs are returned with straight alpha.
 ///
 /// # Errors
@@ -216,7 +222,23 @@ pub fn has_signature(bytes: impl AsRef<[u8]>) -> bool {
 /// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
 /// representation that cannot be normalized to RGB.
 pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
-    Ok(decode_with_metadata(bytes)?.into_image())
+    decode_with_tone_mapping(bytes, ToneMappingMethod::default())
+}
+
+/// Decodes JPEG XR pixels using the selected HDR tone-mapping `method`.
+///
+/// SDR sources do not pass through tone mapping. Image-derived white points are floored at display
+/// white; methods without a white point apply their curves to every HDR source.
+///
+/// # Errors
+///
+/// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
+/// representation that cannot be normalized to RGB.
+pub fn decode_with_tone_mapping(
+    bytes: impl AsRef<[u8]>,
+    method: ToneMappingMethod,
+) -> Result<DecodedImage> {
+    Ok(decode_with_metadata_and_tone_mapping(bytes, method)?.into_image())
 }
 
 /// Decodes JPEG XR pixels together with their source representation metadata.
@@ -229,6 +251,24 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
 /// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
 /// representation that cannot be normalized to RGB.
 pub fn decode_with_metadata(bytes: impl AsRef<[u8]>) -> Result<DecodedJPEGXR> {
+    decode_with_metadata_and_tone_mapping(bytes, ToneMappingMethod::default())
+}
+
+/// Decodes JPEG XR pixels and metadata using the selected HDR tone-mapping `method`.
+///
+/// Image-dependent parameters are derived from the decoded source. Component-wise white-point
+/// methods use p99.99 `MaxCLL`, while extended luminance Reinhard uses p99.99 Rec. 709 luminance.
+/// SDR sources do not pass through tone mapping. Image-derived white points are floored at display
+/// white; methods without a white point apply their curves to every HDR source.
+///
+/// # Errors
+///
+/// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
+/// representation that cannot be normalized to RGB.
+pub fn decode_with_metadata_and_tone_mapping(
+    bytes: impl AsRef<[u8]>,
+    method: ToneMappingMethod,
+) -> Result<DecodedJPEGXR> {
     let bytes = bytes.as_ref();
     if !has_signature(bytes) {
         return Err(error(JPEGXRError::Signature));
@@ -267,7 +307,7 @@ pub fn decode_with_metadata(bytes: impl AsRef<[u8]>) -> Result<DecodedJPEGXR> {
     decoder
         .copy_all(&mut source, row_stride)
         .map_err(|source| codec_error(&source))?;
-    let normalized = normalize(&source, width, height, row_stride, layout)?;
+    let normalized = normalize(&source, width, height, row_stride, layout, method)?;
     let metadata = JPEGXRMetadata::new(layout, normalized.hdr_metrics);
     Ok(DecodedJPEGXR {
         image: DecodedImage::new(width, height, normalized.rgba),
@@ -478,6 +518,7 @@ fn normalize(
     height: u32,
     row_stride: usize,
     layout: PixelLayout,
+    method: ToneMappingMethod,
 ) -> Result<NormalizedImage> {
     let width = usize::try_from(width).expect("validated JPEG XR width fits usize");
     let height = usize::try_from(height).expect("validated JPEG XR height fits usize");
@@ -496,16 +537,22 @@ fn normalize(
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| error(JPEGXRError::Output("JPEG XR RGBA size exceeds usize")))?;
     let hdr_metrics = if layout.encoding.is_hdr() {
-        Some(HDRMetrics::estimate(source, row_stride, layout)?)
+        Some(HDRMetrics::estimate(
+            source,
+            row_stride,
+            layout,
+            method == ToneMappingMethod::ExtendedLuminanceReinhard,
+        )?)
     } else {
         None
     };
     let mut rgba = Vec::with_capacity(output_len);
     let has_nonzero_alpha = if let Some(metrics) = hdr_metrics {
-        if let Some(mapper) = hdr_tone_mapper(metrics.max_cll) {
-            append_hdr_pixels(source, width, row_stride, layout, &mapper, &mut rgba)?
-        } else {
+        let mapper = ResolvedToneMapper::new(method, metrics);
+        if matches!(mapper, ResolvedToneMapper::Clamp) {
             append_hdr_pixels_scalar(source, width, row_stride, layout, &Clamp, &mut rgba)?
+        } else {
+            append_hdr_pixels(source, width, row_stride, layout, &mapper, &mut rgba)?
         }
     } else {
         append_sdr_pixels(source, width, row_stride, layout, &mut rgba)?
@@ -643,6 +690,7 @@ struct MaxCll {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct HDRMetrics {
     max_cll: MaxCll,
+    luminance_white_point: Option<LuminanceWhitePoint>,
     max_luminance_nits: f32,
     average_luminance_nits: f32,
     min_luminance_nits: f32,
@@ -651,7 +699,12 @@ struct HDRMetrics {
 }
 
 impl HDRMetrics {
-    fn estimate(source: &[u8], row_stride: usize, layout: PixelLayout) -> Result<Self> {
+    fn estimate(
+        source: &[u8],
+        row_stride: usize,
+        layout: PixelLayout,
+        estimate_luminance_white_point: bool,
+    ) -> Result<Self> {
         invariant!(layout.encoding.is_hdr());
         invariant!(row_stride >= layout.bytes_per_pixel);
 
@@ -683,6 +736,8 @@ impl HDRMetrics {
         let mut max_cll_estimator = MaxCllEstimator::new(
             NonZeroUsize::new(pixel_count).expect("HDR metrics include at least one pixel"),
         );
+        let mut luminance_white_point_estimator =
+            estimate_luminance_white_point.then(|| LuminanceWhitePointEstimator::new(pixel_count));
         let mut max_cll_batch = Vec::with_capacity(HDR_BATCH_PIXELS.min(pixel_count));
 
         visit_pixels(source, row_stride, layout, |color, alpha| {
@@ -690,7 +745,11 @@ impl HDRMetrics {
                 return;
             }
             accumulator.observe(color);
-            max_cll_batch.push(LinearRgb::new(color));
+            let color = LinearRgb::new(color);
+            if let Some(estimator) = &mut luminance_white_point_estimator {
+                estimator.observe(color);
+            }
+            max_cll_batch.push(color);
             if max_cll_batch.len() == HDR_BATCH_PIXELS {
                 max_cll_estimator.observe_many(&max_cll_batch);
                 max_cll_batch.clear();
@@ -716,8 +775,10 @@ impl HDRMetrics {
             relative_light_level,
             channel: jpeg_xr_color_channel(estimate.channel()),
         };
+        let luminance_white_point =
+            luminance_white_point_estimator.and_then(LuminanceWhitePointEstimator::finish);
 
-        Ok(accumulator.finish(max_cll))
+        Ok(accumulator.finish(max_cll, luminance_white_point))
     }
 }
 
@@ -735,13 +796,142 @@ impl MaxCll {
     }
 }
 
-fn hdr_tone_mapper(max_cll: MaxCll) -> Option<ExtendedReinhard> {
-    let max_cll = max_cll.relative_light_level();
-    (max_cll > 1.0).then(|| {
-        ExtendedReinhard::new(
-            WhitePoint::new(max_cll).expect("a positive finite MaxCLL is a valid white point"),
-        )
-    })
+fn hdr_white_point(max_cll: MaxCll) -> WhitePoint {
+    WhitePoint::new(max_cll.relative_light_level().max(1.0))
+        .expect("MaxCLL floored at display white is a positive finite white point")
+}
+
+enum ResolvedToneMapper {
+    Clamp,
+    ScaledClamp(ScaledClamp),
+    Reinhard,
+    ExtendedReinhard(ExtendedReinhard),
+    LuminanceReinhard,
+    ExtendedLuminanceReinhard(ExtendedLuminanceReinhard),
+    ReinhardJodie,
+    Uncharted2,
+    AcesFitted,
+    AcesApproximate,
+}
+
+impl ResolvedToneMapper {
+    fn new(method: ToneMappingMethod, metrics: HDRMetrics) -> Self {
+        let white_point = hdr_white_point(metrics.max_cll);
+
+        match method {
+            ToneMappingMethod::Clamp => Self::Clamp,
+            ToneMappingMethod::ScaledClamp => Self::ScaledClamp(ScaledClamp::new(white_point)),
+            ToneMappingMethod::Reinhard => Self::Reinhard,
+            ToneMappingMethod::ExtendedReinhard => {
+                Self::ExtendedReinhard(ExtendedReinhard::new(white_point))
+            }
+            ToneMappingMethod::LuminanceReinhard => Self::LuminanceReinhard,
+            ToneMappingMethod::ExtendedLuminanceReinhard => {
+                let luminance = metrics
+                    .luminance_white_point
+                    .map_or(1.0, LuminanceWhitePoint::luminance)
+                    .max(1.0);
+                let luminance_white_point = LuminanceWhitePoint::new(luminance).expect(
+                    "p99.99 luminance floored at display white is a positive finite white point",
+                );
+                Self::ExtendedLuminanceReinhard(ExtendedLuminanceReinhard::new(
+                    luminance_white_point,
+                ))
+            }
+            ToneMappingMethod::ReinhardJodie => Self::ReinhardJodie,
+            ToneMappingMethod::Uncharted2 => Self::Uncharted2,
+            ToneMappingMethod::AcesFitted => Self::AcesFitted,
+            ToneMappingMethod::AcesApproximate => Self::AcesApproximate,
+        }
+    }
+}
+
+impl ToneMapper for ResolvedToneMapper {
+    fn map(&self, color: LinearRgb) -> LinearRgb {
+        match self {
+            Self::Clamp => Clamp.map(color),
+            Self::ScaledClamp(mapper) => mapper.map(color),
+            Self::Reinhard => Reinhard.map(color),
+            Self::ExtendedReinhard(mapper) => mapper.map(color),
+            Self::LuminanceReinhard => LuminanceReinhard.map(color),
+            Self::ExtendedLuminanceReinhard(mapper) => mapper.map(color),
+            Self::ReinhardJodie => ReinhardJodie.map(color),
+            Self::Uncharted2 => Uncharted2.map(color),
+            Self::AcesFitted => AcesFitted.map(color),
+            Self::AcesApproximate => AcesApproximate.map(color),
+        }
+    }
+
+    fn map_in_place(&self, colors: &mut [LinearRgb]) {
+        match self {
+            Self::Clamp => Clamp.map_in_place(colors),
+            Self::ScaledClamp(mapper) => mapper.map_in_place(colors),
+            Self::Reinhard => Reinhard.map_in_place(colors),
+            Self::ExtendedReinhard(mapper) => mapper.map_in_place(colors),
+            Self::LuminanceReinhard => LuminanceReinhard.map_in_place(colors),
+            Self::ExtendedLuminanceReinhard(mapper) => mapper.map_in_place(colors),
+            Self::ReinhardJodie => ReinhardJodie.map_in_place(colors),
+            Self::Uncharted2 => Uncharted2.map_in_place(colors),
+            Self::AcesFitted => AcesFitted.map_in_place(colors),
+            Self::AcesApproximate => AcesApproximate.map_in_place(colors),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct OrderedLuminance(f32);
+
+impl PartialEq for OrderedLuminance {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.to_bits() == other.0.to_bits()
+    }
+}
+
+impl Eq for OrderedLuminance {}
+
+impl PartialOrd for OrderedLuminance {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for OrderedLuminance {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
+struct LuminanceWhitePointEstimator {
+    retained: usize,
+    luminances: BinaryHeap<Reverse<OrderedLuminance>>,
+}
+
+impl LuminanceWhitePointEstimator {
+    fn new(pixel_count: usize) -> Self {
+        invariant!(pixel_count > 0);
+        let retained = pixel_count / 10_000 + 1;
+        Self {
+            retained,
+            luminances: BinaryHeap::with_capacity(retained),
+        }
+    }
+
+    fn observe(&mut self, color: LinearRgb) {
+        let luminance = OrderedLuminance(color.luminance());
+        if self.luminances.len() < self.retained {
+            self.luminances.push(Reverse(luminance));
+        } else if let Some(mut threshold) = self.luminances.peek_mut()
+            && luminance > threshold.0
+        {
+            *threshold = Reverse(luminance);
+        }
+    }
+
+    fn finish(self) -> Option<LuminanceWhitePoint> {
+        self.luminances
+            .peek()
+            .and_then(|luminance| LuminanceWhitePoint::new(luminance.0.0))
+    }
 }
 
 struct HDRMetricAccumulator {
@@ -782,7 +972,11 @@ impl HDRMetricAccumulator {
         }
     }
 
-    fn finish(self, max_cll: MaxCll) -> HDRMetrics {
+    fn finish(
+        self,
+        max_cll: MaxCll,
+        luminance_white_point: Option<LuminanceWhitePoint>,
+    ) -> HDRMetrics {
         invariant!(self.pixel_count > 0);
         invariant!(self.max_luminance_nits.is_finite());
         invariant!(self.min_luminance_nits.is_finite());
@@ -794,6 +988,7 @@ impl HDRMetricAccumulator {
 
         HDRMetrics {
             max_cll,
+            luminance_white_point,
             max_luminance_nits: nonnegative_f64_to_f32(self.max_luminance_nits),
             average_luminance_nits: nonnegative_f64_to_f32(self.luminance_sum_nits / pixel_count),
             min_luminance_nits: nonnegative_f64_to_f32(self.min_luminance_nits),
@@ -1120,11 +1315,11 @@ mod tests {
         assert!((actual - expected).abs() <= tolerance);
     }
 
-    fn assert_hdr_normalization_matches_scalar(
+    fn normalize_float_rgb(
         colors: &[[f32; 3]],
         width: usize,
-        mapper: &impl ToneMapper,
-    ) {
+        method: ToneMappingMethod,
+    ) -> Vec<u8> {
         assert_eq!(
             colors.len() % width,
             0,
@@ -1134,15 +1329,25 @@ mod tests {
         let source = float_rgb_source(colors);
         let height = colors.len() / width;
         let row_stride = width * layout.bytes_per_pixel;
-        let actual = normalize(
+
+        normalize(
             &source,
             u32::try_from(width).expect("test width fits u32"),
             u32::try_from(height).expect("test height fits u32"),
             row_stride,
             layout,
+            method,
         )
         .expect("synthetic HDR pixels normalize")
-        .rgba;
+        .rgba
+    }
+
+    fn assert_hdr_normalization_matches_scalar(
+        colors: &[[f32; 3]],
+        width: usize,
+        mapper: &impl ToneMapper,
+    ) {
+        let actual = normalize_float_rgb(colors, width, ToneMappingMethod::default());
         let expected: Vec<_> = colors
             .iter()
             .copied()
@@ -1179,7 +1384,51 @@ mod tests {
     }
 
     #[test]
-    fn tone_mapping_is_bypassed_when_max_cll_fits_the_target() {
+    fn every_selectable_method_normalizes_hdr_pixels() {
+        let colors = [[4.0, 2.0, 1.0], [0.18, 0.5, 1.5]];
+
+        for method in ToneMappingMethod::ALL {
+            let rgba = normalize_float_rgb(&colors, 2, method);
+
+            assert_eq!(rgba.len(), colors.len() * 4);
+            assert!(
+                rgba.iter()
+                    .skip(3)
+                    .step_by(4)
+                    .all(|alpha| *alpha == u8::MAX)
+            );
+        }
+    }
+
+    #[test]
+    fn selected_method_changes_hdr_normalization() {
+        let colors = [[4.0, 2.0, 1.0]];
+        let clamped = normalize_float_rgb(&colors, 1, ToneMappingMethod::Clamp);
+        let reinhard = normalize_float_rgb(&colors, 1, ToneMappingMethod::Reinhard);
+
+        assert_eq!(clamped, [u8::MAX, u8::MAX, u8::MAX, u8::MAX]);
+        assert_eq!(reinhard, [231, 213, 188, u8::MAX]);
+    }
+
+    #[test]
+    fn extended_luminance_method_uses_the_luminance_white_point() {
+        let color = [4.0, 2.0, 1.0];
+        let source = float_rgb_source(&[color]);
+        let metrics =
+            HDRMetrics::estimate(&source, source.len(), float_rgb_layout(), true).unwrap();
+        let white_point = metrics
+            .luminance_white_point
+            .expect("a nonblack HDR pixel has a luminance white point");
+        let mapper = ExtendedLuminanceReinhard::new(white_point);
+        let expected = hdr_to_srgb8(color, &mapper);
+        let actual = normalize_float_rgb(&[color], 1, ToneMappingMethod::ExtendedLuminanceReinhard);
+
+        assert_approximately_equal(white_point.luminance(), 2.353, 0.000_1);
+        assert_eq!(actual, [expected[0], expected[1], expected[2], u8::MAX]);
+    }
+
+    #[test]
+    fn white_point_methods_preserve_content_that_fits_the_target() {
         let fitting = MaxCll {
             relative_light_level: 1.0,
             channel: JPEGXRColorChannel::Red,
@@ -1189,10 +1438,21 @@ mod tests {
             channel: JPEGXRColorChannel::Red,
         };
 
-        assert!(hdr_tone_mapper(fitting).is_none());
-        assert_eq!(
-            hdr_tone_mapper(hdr).map(|mapper| mapper.white_point().level()),
-            Some(4.0)
+        assert_eq!(hdr_white_point(fitting).level(), 1.0);
+        assert_eq!(hdr_white_point(hdr).level(), 4.0);
+
+        let colors = [[0.25, 0.5, 1.0]];
+        let expected = normalize_float_rgb(&colors, 1, ToneMappingMethod::Clamp);
+        for method in [
+            ToneMappingMethod::ScaledClamp,
+            ToneMappingMethod::ExtendedReinhard,
+            ToneMappingMethod::ExtendedLuminanceReinhard,
+        ] {
+            assert_eq!(normalize_float_rgb(&colors, 1, method), expected);
+        }
+        assert_ne!(
+            normalize_float_rgb(&colors, 1, ToneMappingMethod::Reinhard),
+            expected
         );
     }
 
@@ -1207,7 +1467,7 @@ mod tests {
                 .flat_map(f32::to_ne_bytes),
         );
 
-        let metrics = HDRMetrics::estimate(&source, source.len(), layout).unwrap();
+        let metrics = HDRMetrics::estimate(&source, source.len(), layout, false).unwrap();
         let metadata = JPEGXRMetadata::new(layout, Some(metrics));
 
         assert_eq!(metrics.max_cll.nits(), 320.0);
@@ -1221,6 +1481,23 @@ mod tests {
     }
 
     #[test]
+    fn luminance_white_point_rejects_the_brightest_point_zero_one_percent() {
+        let colors: Vec<_> = std::iter::repeat_n([1.0_f32; 3], 9_998)
+            .chain([[4.0; 3], [126.0; 3]])
+            .collect();
+        let source = float_rgb_source(&colors);
+        let metrics =
+            HDRMetrics::estimate(&source, source.len(), float_rgb_layout(), true).unwrap();
+
+        assert_eq!(
+            metrics
+                .luminance_white_point
+                .map(LuminanceWhitePoint::luminance),
+            Some(4.0)
+        );
+    }
+
+    #[test]
     fn hdr_metrics_use_signed_linear_scrgb_and_disjoint_gamuts() {
         let colors = [
             [1.0, 1.0, 1.0],
@@ -1229,7 +1506,8 @@ mod tests {
             [-0.000_000_5, 0.0, 0.0],
         ];
         let source = float_rgb_source(&colors);
-        let metrics = HDRMetrics::estimate(&source, source.len(), float_rgb_layout()).unwrap();
+        let metrics =
+            HDRMetrics::estimate(&source, source.len(), float_rgb_layout(), false).unwrap();
 
         assert_approximately_equal(metrics.max_luminance_nits, 80.0, 0.000_1);
         assert_approximately_equal(metrics.average_luminance_nits, 33.878_8, 0.000_1);
@@ -1241,7 +1519,8 @@ mod tests {
     #[test]
     fn max_cll_reports_the_winning_color_channel() {
         let source = float_rgb_source(&[[1.0, 2.0, 5.0]]);
-        let metrics = HDRMetrics::estimate(&source, source.len(), float_rgb_layout()).unwrap();
+        let metrics =
+            HDRMetrics::estimate(&source, source.len(), float_rgb_layout(), false).unwrap();
         let metadata = JPEGXRMetadata::new(float_rgb_layout(), Some(metrics));
 
         assert_eq!(metadata.max_cll_scrgb(), Some(5.0));
@@ -1255,7 +1534,8 @@ mod tests {
     #[test]
     fn max_cll_preserves_float32_levels_above_binary16_range() {
         let source = float_rgb_source(&[[70_000.0, 0.0, 100_000.0]]);
-        let metrics = HDRMetrics::estimate(&source, source.len(), float_rgb_layout()).unwrap();
+        let metrics =
+            HDRMetrics::estimate(&source, source.len(), float_rgb_layout(), false).unwrap();
         let metadata = JPEGXRMetadata::new(float_rgb_layout(), Some(metrics));
 
         assert_eq!(metadata.max_cll_scrgb(), Some(100_000.0));
@@ -1271,7 +1551,9 @@ mod tests {
             .flat_map(f32::to_ne_bytes)
             .collect();
 
-        let rgba = normalize(&source, 4, 4, 64, layout).unwrap().rgba;
+        let rgba = normalize(&source, 4, 4, 64, layout, ToneMappingMethod::default())
+            .unwrap()
+            .rgba;
 
         assert!(rgba.iter().skip(3).step_by(4).all(|alpha| *alpha == 128));
     }
@@ -1350,7 +1632,9 @@ mod tests {
         let source =
             float_rgba_source(&[[0.5, 0.5, 0.5, f32::from_bits(1)], [0.25, 0.25, 0.25, 0.0]]);
 
-        let rgba = normalize(&source, 2, 1, 32, layout).unwrap().rgba;
+        let rgba = normalize(&source, 2, 1, 32, layout, ToneMappingMethod::default())
+            .unwrap()
+            .rgba;
 
         assert!(rgba.iter().skip(3).step_by(4).all(|alpha| *alpha == 0));
     }
@@ -1360,7 +1644,7 @@ mod tests {
         let layout = float_rgba_layout();
         let source = float_rgba_source(&[[1.0, 1.0, 1.0, 1.0], [100.0, -100.0, 0.0, 0.0]]);
 
-        let metrics = HDRMetrics::estimate(&source, source.len(), layout).unwrap();
+        let metrics = HDRMetrics::estimate(&source, source.len(), layout, false).unwrap();
 
         assert_eq!(metrics.max_cll.nits(), SC_RGB_REFERENCE_WHITE_NITS);
         assert_eq!(metrics.max_luminance_nits, SC_RGB_REFERENCE_WHITE_NITS);
@@ -1375,8 +1659,10 @@ mod tests {
         let layout = float_rgba_layout();
         let source = float_rgba_source(&[[1.0, 1.0, 1.0, 0.0], [0.0, 0.0, 4.0, 0.0]]);
 
-        let metrics = HDRMetrics::estimate(&source, source.len(), layout).unwrap();
-        let rgba = normalize(&source, 2, 1, 32, layout).unwrap().rgba;
+        let metrics = HDRMetrics::estimate(&source, source.len(), layout, false).unwrap();
+        let rgba = normalize(&source, 2, 1, 32, layout, ToneMappingMethod::default())
+            .unwrap()
+            .rgba;
 
         assert_eq!(metrics.max_cll.nits(), 4.0 * SC_RGB_REFERENCE_WHITE_NITS);
         assert_eq!(metrics.max_cll.channel, JPEGXRColorChannel::Blue);

@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use exn::{ErrorExt, ResultExt};
 use gpui::{Image as GPUIImage, ImageFormat, SharedString};
+use tonemapping::ToneMappingMethod;
 
 use four::{DecodedImage, encode_bmp, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
 
@@ -73,6 +74,8 @@ pub(super) fn format_load_error(error: &LoadException) -> String {
 pub(super) struct DisplayedImage {
     pub(super) image: Arc<GPUIImage>,
     pub(super) metadata: Arc<ImageMetadata>,
+    pub(super) source_path: Arc<Path>,
+    pub(super) tone_mapping: Option<ToneMappingMethod>,
 }
 
 pub(super) struct LoadedImage {
@@ -199,7 +202,6 @@ impl SourceFormat {
             return Self::JPEG;
         }
 
-
         let extension = extension.map(str::to_ascii_lowercase);
 
         match extension.as_deref() {
@@ -212,7 +214,12 @@ impl SourceFormat {
         }
     }
 
-    fn decode(self, bytes: &[u8], path: &Path) -> LoadResult<DecodedSource> {
+    fn decode(
+        self,
+        bytes: &[u8],
+        path: &Path,
+        tone_mapping: ToneMappingMethod,
+    ) -> LoadResult<DecodedSource> {
         match self {
             Self::GIF => gif::decode(bytes)
                 .or_raise(|| image_decode_error(path))
@@ -226,7 +233,7 @@ impl SourceFormat {
                 .or_raise(|| image_decode_error(path))
                 .map(DecodedSource::standard),
 
-            Self::JPEGXR => jpeg_xr::decode_with_metadata(bytes)
+            Self::JPEGXR => jpeg_xr::decode_with_metadata_and_tone_mapping(bytes, tone_mapping)
                 .or_raise(|| image_decode_error(path))
                 .map(|decoded| {
                     let metadata = decoded.metadata();
@@ -320,7 +327,7 @@ impl ImageLoad<SelectedImage> {
 }
 
 impl ImageLoad<EncodedImage> {
-    fn decode(self) -> LoadResult<ImageLoad<DecodedImageState>> {
+    fn decode(self, tone_mapping: ToneMappingMethod) -> LoadResult<ImageLoad<DecodedImageState>> {
         invariant!(self.state.bytes.len() as u64 <= IMAGE_FILE_BYTES_MAX);
         invariant!(isize::try_from(self.state.bytes.len()).is_ok());
 
@@ -329,7 +336,7 @@ impl ImageLoad<EncodedImage> {
 
         let extension = self.path.extension().map(|value| value.to_string_lossy());
         let source_format = SourceFormat::detect(&self.state.bytes, extension.as_deref());
-        let decoded = source_format.decode(&self.state.bytes, &self.path)?;
+        let decoded = source_format.decode(&self.state.bytes, &self.path, tone_mapping)?;
         let image = decoded.image;
 
         invariant!(image.width() > 0);
@@ -348,7 +355,7 @@ impl ImageLoad<EncodedImage> {
 }
 
 impl ImageLoad<DecodedImageState> {
-    fn present(self) -> LoadedImage {
+    fn present(self, tone_mapping: ToneMappingMethod) -> LoadedImage {
         let (width, height) = self.state.image.dimensions();
 
         invariant!(width > 0);
@@ -359,10 +366,21 @@ impl ImageLoad<DecodedImageState> {
             ImageFormat::Bmp,
             encode_bmp(&self.state.image),
         ));
-        let file_name = display_file_name(&self.path);
+        let file_name = display_file_name(&self.path).into_owned();
+        let active_tone_mapping = self
+            .state
+            .jpeg_xr_metadata
+            .filter(|metadata| metadata.is_hdr())
+            .map(|_| tone_mapping);
+        let source_path = Arc::<Path>::from(self.path);
 
         LoadedImage {
-            displayed: DisplayedImage { image, metadata },
+            displayed: DisplayedImage {
+                image,
+                metadata,
+                source_path,
+                tone_mapping: active_tone_mapping,
+            },
             status: format!("{file_name} — {width} × {height}").into(),
         }
     }
@@ -523,7 +541,17 @@ fn validate_image_file_size(path: &Path, byte_count: u64) -> LoadResult<()> {
 }
 
 pub(super) fn load_image(path: &Path) -> LoadResult<LoadedImage> {
-    let loaded = ImageLoad::select(path).read()?.decode()?.present();
+    load_image_with_tone_mapping(path, ToneMappingMethod::default())
+}
+
+pub(super) fn load_image_with_tone_mapping(
+    path: &Path,
+    tone_mapping: ToneMappingMethod,
+) -> LoadResult<LoadedImage> {
+    let loaded = ImageLoad::select(path)
+        .read()?
+        .decode(tone_mapping)?
+        .present(tone_mapping);
     invariant!(!loaded.status.is_empty());
     Ok(loaded)
 }
