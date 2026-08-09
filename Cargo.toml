@@ -5,6 +5,10 @@ edition = "2024"
 description = "A minimal GPUI image viewer with bounded image decoders"
 publish = false
 
+[workspace]
+members = ["crates/tonemapping"]
+resolver = "3"
+
 [dependencies]
 exn = "0.3.1"
 gif = "0.14.2"
@@ -16,6 +20,7 @@ multiversion = "0.8.0"
 mimalloc = "0.1.48"
 png = "0.18.1"
 tiff = "0.11.3"
+tonemapping = { path = "crates/tonemapping" }
 zune-jpeg = "0.5.15"
 
 [dev-dependencies]

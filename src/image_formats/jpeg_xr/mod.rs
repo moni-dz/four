@@ -17,6 +17,7 @@ use std::io::Cursor;
 use ::jpegxr::{
     BitDepthBits, ColorFormat, ImageDecode, JXRError, PixelFormat as CodecPixelFormat, PixelInfo,
 };
+use tonemapping::{LinearRgb, LinearShoulder, ToneMapper};
 
 use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
 use error::error;
@@ -32,7 +33,6 @@ const MAX_CLL_LOW_BITS: u32 = 15;
 const MAX_CLL_PERCENTILE_DENOMINATOR: u64 = 10_000;
 const SC_RGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 const SOURCE_BUFFER_MAX: usize = 512 * 1024 * 1024;
-const TONE_MAP_KNEE: f32 = 0.75;
 
 /// Identifies a color channel in decoded JPEG XR RGB data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -506,6 +506,10 @@ fn normalize(
     } else {
         None
     };
+    let tone_mapper = hdr_metrics.map(|metrics| {
+        LinearShoulder::new(metrics.max_cll.relative_light_level())
+            .expect("estimated MaxCLL is finite and nonnegative")
+    });
     let mut rgba = Vec::with_capacity(output_len);
     let mut has_nonzero_alpha = false;
 
@@ -520,8 +524,8 @@ fn normalize(
             })?;
             let (color, alpha) = layout.read_pixel(pixel)?;
             has_nonzero_alpha |= alpha > 0.0;
-            let color = if let Some(metrics) = hdr_metrics {
-                tone_map(color, metrics.max_cll)
+            let color = if let Some(mapper) = tone_mapper {
+                hdr_to_srgb8(color, &mapper)
             } else {
                 color.map(normalized_to_u8)
             };
@@ -835,7 +839,7 @@ fn has_visible_alpha(source: &[u8], row_stride: usize, layout: PixelLayout) -> R
 }
 
 fn max_rgb(color: [f32; 3]) -> (f32, JPEGXRColorChannel) {
-    let color = color.map(sanitize_hdr_sample);
+    let color = LinearRgb::new(color).components();
     let mut channel = JPEGXRColorChannel::Red;
 
     if color[1] > color[channel.index()] {
@@ -976,34 +980,12 @@ fn decode_rgbe(pixel: &[u8]) -> Result<[f32; 3]> {
     ])
 }
 
-fn tone_map(color: [f32; 3], max_cll: MaxCll) -> [u8; 3] {
-    let linear = color.map(sanitize_hdr_sample);
-    let luminance = 0.212_6 * linear[0] + 0.715_2 * linear[1] + 0.072_2 * linear[2];
-
-    if luminance == 0.0 {
-        return [0; 3];
-    }
-
-    let mapped_luminance = shoulder_curve(luminance, max_cll.relative_light_level());
-    let luminance_scale = mapped_luminance / luminance;
-    let mut mapped = linear.map(|channel| channel * luminance_scale);
-    let peak = mapped[0].max(mapped[1]).max(mapped[2]);
-
-    if peak > 1.0 {
-        mapped = mapped.map(|channel| channel / peak);
-    }
-
-    mapped.map(linear_to_srgb).map(normalized_to_u8)
-}
-
-fn sanitize_hdr_sample(value: f32) -> f32 {
-    if value.is_nan() || value <= 0.0 {
-        0.0
-    } else if value.is_infinite() {
-        65_504.0
-    } else {
-        value.min(65_504.0)
-    }
+fn hdr_to_srgb8(color: [f32; 3], mapper: &impl ToneMapper) -> [u8; 3] {
+    mapper
+        .map(LinearRgb::new(color))
+        .components()
+        .map(linear_to_srgb)
+        .map(normalized_to_u8)
 }
 
 fn normalize_alpha(value: f32) -> f32 {
@@ -1012,21 +994,6 @@ fn normalize_alpha(value: f32) -> f32 {
     } else {
         0.0
     }
-}
-
-fn shoulder_curve(value: f32, max_cll: f32) -> f32 {
-    invariant!(value >= 0.0);
-    invariant!(max_cll >= 0.0);
-
-    if max_cll <= 1.0 || value <= TONE_MAP_KNEE {
-        return value;
-    }
-
-    let input_range = max_cll - TONE_MAP_KNEE;
-    let output_range = 1.0 - TONE_MAP_KNEE;
-    let softness = input_range * output_range / (max_cll - 1.0);
-    let distance = value - TONE_MAP_KNEE;
-    TONE_MAP_KNEE + distance / (1.0 + distance / softness)
 }
 
 fn linear_to_srgb(value: f32) -> f32 {
@@ -1106,13 +1073,6 @@ mod tests {
             .collect()
     }
 
-    fn test_max_cll(nits: f32) -> MaxCll {
-        MaxCll {
-            nits,
-            channel: JPEGXRColorChannel::Red,
-        }
-    }
-
     fn assert_approximately_equal(actual: f32, expected: f32, tolerance: f32) {
         assert!((actual - expected).abs() <= tolerance);
     }
@@ -1127,26 +1087,17 @@ mod tests {
     }
 
     #[test]
-    fn tone_mapping_compresses_hdr_white_into_sdr() {
-        let max_cll = test_max_cll(320.0);
-        assert_eq!(tone_map([0.0; 3], max_cll), [0; 3]);
-        let reference_white = tone_map([1.0; 3], max_cll);
-        let hdr_white = tone_map([4.0; 3], max_cll);
+    fn tone_mapper_output_is_encoded_as_srgb() {
+        let mapper = LinearShoulder::new(4.0).unwrap();
+        assert_eq!(hdr_to_srgb8([0.0; 3], &mapper), [0; 3]);
+        let reference_white = hdr_to_srgb8([1.0; 3], &mapper);
+        let hdr_white = hdr_to_srgb8([4.0; 3], &mapper);
 
         assert!(reference_white[0] >= 235 && reference_white[0] <= 245);
         assert!(hdr_white[0] > reference_white[0]);
         assert_eq!(hdr_white[0], u8::MAX);
         assert_eq!(reference_white[0], reference_white[1]);
         assert_eq!(hdr_white[1], hdr_white[2]);
-    }
-
-    #[test]
-    fn tone_mapping_preserves_chromaticity_during_gamut_compression() {
-        let mapped = tone_map([4.0, 2.0, 1.0], test_max_cll(320.0));
-
-        assert_eq!(mapped[0], u8::MAX);
-        assert!(mapped[0] > mapped[1]);
-        assert!(mapped[1] > mapped[2]);
     }
 
     #[test]

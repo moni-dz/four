@@ -1829,6 +1829,7 @@ dependencies = [
  "multiversion",
  "png 0.18.1",
  "tiff",
+ "tonemapping",
  "zune-jpeg",
 ]
 
@@ -5876,6 +5877,10 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
+
+[[package]]
+name = "tonemapping"
+version = "0.1.0"
 
 [[package]]
 name = "tracing"
