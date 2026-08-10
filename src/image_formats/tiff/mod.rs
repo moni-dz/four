@@ -10,6 +10,7 @@ use std::io::Cursor;
 
 use ::tiff::ColorType;
 use ::tiff::decoder::{BufferLayoutPreference, Decoder, DecodingResult, Limits};
+use rayon::prelude::*;
 
 use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
 use error::error;
@@ -26,6 +27,8 @@ pub const SIGNATURE_BIG_LE: [u8; 4] = *b"II+\0";
 pub const SIGNATURE_BIG_BE: [u8; 4] = *b"MM\0+";
 
 const CODEC_BUFFER_MAX: usize = 512 * 1024 * 1024;
+const PARALLEL_PIXELS_MIN: usize = 256 * 1024;
+const PARALLEL_PIXELS_PER_JOB: usize = 64 * 1024;
 
 /// Returns whether `bytes` begin with a classic TIFF or `BigTIFF` signature.
 #[must_use]
@@ -245,59 +248,97 @@ fn validate_raw_size(width: u32, height: u32, format: PixelFormat) -> Result<()>
     Ok(())
 }
 
-fn normalize_unsigned<T: Copy>(
+fn normalize_unsigned<T: Copy + Sync>(
     samples: &[T],
     width: u32,
     height: u32,
     format: PixelFormat,
     codec_layout: &BufferLayoutPreference,
-    into_u64: impl Fn(T) -> u64,
+    into_u64: impl Fn(T) -> u64 + Sync,
 ) -> Result<Vec<u8>> {
     let layout = SampleLayout::new(codec_layout, samples, format.channels)?;
     let width = usize::try_from(width).expect("validated TIFF width fits usize");
     let height = usize::try_from(height).expect("validated TIFF height fits usize");
-    let mut rgba = Vec::with_capacity(width * height * 4);
+    normalize_unsigned_with_layout(samples, width, height, format, layout, &into_u64)
+}
 
-    for y in 0..height {
-        for x in 0..width {
-            let sample = |channel| -> Result<u8> {
-                let index = layout
-                    .index(x, y, channel)
-                    .ok_or_else(|| error(TIFFError::Output("TIFF sample offset overflowed")))?;
-                let value = samples.get(index).copied().ok_or_else(|| {
-                    error(TIFFError::Output(
-                        "TIFF sample layout exceeds its decoded buffer",
-                    ))
-                })?;
-                Ok(scale_sample(into_u64(value), format.bit_depth))
-            };
-            match format.kind {
-                PixelKind::Grayscale => {
-                    let gray = sample(0)?;
-                    rgba.extend_from_slice(&[gray, gray, gray, u8::MAX]);
-                }
-                PixelKind::GrayscaleAlpha => {
-                    let gray = sample(0)?;
-                    rgba.extend_from_slice(&[gray, gray, gray, sample(1)?]);
-                }
-                PixelKind::RGB => {
-                    rgba.extend_from_slice(&[sample(0)?, sample(1)?, sample(2)?, u8::MAX]);
-                }
-                PixelKind::RGBA => {
-                    rgba.extend_from_slice(&[sample(0)?, sample(1)?, sample(2)?, sample(3)?]);
-                }
-                PixelKind::CMYK => {
-                    let rgb = cmyk_to_rgb(sample(0)?, sample(1)?, sample(2)?, sample(3)?);
-                    rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], u8::MAX]);
-                }
-                PixelKind::CMYKA => {
-                    let rgb = cmyk_to_rgb(sample(0)?, sample(1)?, sample(2)?, sample(3)?);
-                    rgba.extend_from_slice(&[rgb[0], rgb[1], rgb[2], sample(4)?]);
-                }
+fn normalize_unsigned_with_layout<T: Copy + Sync>(
+    samples: &[T],
+    width: usize,
+    height: usize,
+    format: PixelFormat,
+    layout: SampleLayout,
+    into_u64: &(impl Fn(T) -> u64 + Sync),
+) -> Result<Vec<u8>> {
+    if width * height >= PARALLEL_PIXELS_MIN {
+        let mut rgba = vec![0; width * height * 4];
+        rgba.par_chunks_exact_mut(4)
+            .with_min_len(PARALLEL_PIXELS_PER_JOB)
+            .enumerate()
+            .try_for_each(|(index, target)| {
+                let pixel = normalize_pixel(
+                    samples,
+                    index % width,
+                    index / width,
+                    format,
+                    layout,
+                    into_u64,
+                )?;
+                target.copy_from_slice(&pixel);
+                Ok::<(), Error>(())
+            })?;
+        Ok(rgba)
+    } else {
+        let mut rgba = Vec::with_capacity(width * height * 4);
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&normalize_pixel(samples, x, y, format, layout, into_u64)?);
             }
         }
+        Ok(rgba)
     }
-    Ok(rgba)
+}
+
+fn normalize_pixel<T: Copy>(
+    samples: &[T],
+    x: usize,
+    y: usize,
+    format: PixelFormat,
+    layout: SampleLayout,
+    into_u64: &impl Fn(T) -> u64,
+) -> Result<[u8; 4]> {
+    let sample = |channel| -> Result<u8> {
+        let index = layout
+            .index(x, y, channel)
+            .ok_or_else(|| error(TIFFError::Output("TIFF sample offset overflowed")))?;
+        let value = samples.get(index).copied().ok_or_else(|| {
+            error(TIFFError::Output(
+                "TIFF sample layout exceeds its decoded buffer",
+            ))
+        })?;
+        Ok(scale_sample(into_u64(value), format.bit_depth))
+    };
+
+    match format.kind {
+        PixelKind::Grayscale => {
+            let gray = sample(0)?;
+            Ok([gray, gray, gray, u8::MAX])
+        }
+        PixelKind::GrayscaleAlpha => {
+            let gray = sample(0)?;
+            Ok([gray, gray, gray, sample(1)?])
+        }
+        PixelKind::RGB => Ok([sample(0)?, sample(1)?, sample(2)?, u8::MAX]),
+        PixelKind::RGBA => Ok([sample(0)?, sample(1)?, sample(2)?, sample(3)?]),
+        PixelKind::CMYK => {
+            let rgb = cmyk_to_rgb(sample(0)?, sample(1)?, sample(2)?, sample(3)?);
+            Ok([rgb[0], rgb[1], rgb[2], u8::MAX])
+        }
+        PixelKind::CMYKA => {
+            let rgb = cmyk_to_rgb(sample(0)?, sample(1)?, sample(2)?, sample(3)?);
+            Ok([rgb[0], rgb[1], rgb[2], sample(4)?])
+        }
+    }
 }
 
 fn scale_sample(value: u64, bit_depth: u8) -> u8 {
@@ -327,5 +368,36 @@ fn codec_error(source: &::tiff::TiffError) -> Error {
         )))
     } else {
         error(TIFFError::Codec(source.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parallel_normalization_preserves_rgba_pixel_order() {
+        let width = 512;
+        let height = 512;
+        let samples: Vec<_> = (0..width * height * 4)
+            .map(|index| u8::try_from(index % 256).expect("sample fits u8"))
+            .collect();
+        let format = PixelFormat {
+            kind: PixelKind::RGBA,
+            channels: 4,
+            bit_depth: 8,
+        };
+        let layout = SampleLayout {
+            row_stride: width * 4,
+            plane_stride: samples.len(),
+            planes: 1,
+            channels: 4,
+        };
+
+        let rgba =
+            normalize_unsigned_with_layout(&samples, width, height, format, layout, &u64::from)
+                .unwrap();
+
+        assert_eq!(rgba, samples);
     }
 }
