@@ -869,13 +869,29 @@ mod tests {
     fn bulk_mapping_matches_scalar_mapping_at_simd_boundaries() {
         let inputs = batch_inputs();
         let extended = ExtendedReinhard::new(WhitePoint::new(4.0).unwrap());
-        let mappers: [&dyn ToneMapper; 3] = [&Clamp, &extended, &ACESFitted];
+        let mappers: [&dyn ToneMapper; 4] = [&Clamp, &extended, &ACESFitted, &BT2446A];
 
         for mapper in mappers {
             for length in [0, 1, 3, 4, 5, 7, 8, 9, 17] {
                 assert_batch_matches_scalar(mapper, &inputs[..length]);
             }
         }
+    }
+
+    #[test]
+    fn bt2446a_bulk_matches_scalar_across_hdr_inputs() {
+        let inputs: Vec<_> = (0..=u16::MAX)
+            .map(|index| {
+                let level = f32::from(index) / f32::from(u16::MAX);
+                LinearRGB::new([
+                    12.0 * level,
+                    12.0 * (f32::from(index.wrapping_mul(25_157)) / f32::from(u16::MAX)),
+                    12.0 * (f32::from(index.wrapping_mul(40_511)) / f32::from(u16::MAX)),
+                ])
+            })
+            .collect();
+
+        assert_batch_matches_scalar(&BT2446A, &inputs);
     }
 
     #[test]

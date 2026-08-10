@@ -1,4 +1,21 @@
+use multiversion::multiversion;
+use std::simd::{
+    Select, Simd, StdFloat,
+    cmp::{SimdPartialEq, SimdPartialOrd},
+    num::SimdFloat,
+};
+
 use super::{LinearRGB, ToneMapper};
+
+const BT2446_LANES: usize = 16;
+type F64x16 = Simd<f64, BT2446_LANES>;
+
+const HDR_TO_SDR_PEAK_RATIO: f64 = 10.0;
+const BT2020_LUMA: [f64; 3] = [0.262_7, 0.678_0, 0.059_3];
+const CB_DIVISOR: f64 = 1.881_4;
+const CR_DIVISOR: f64 = 1.474_6;
+const RHO_HDR: f64 = 13.259_797_918_583_32;
+const RHO_SDR: f64 = 5.696_957_656_390_622;
 
 /// Applies BT.2446 HDR-to-SDR conversion Method A.
 ///
@@ -27,14 +44,95 @@ impl ToneMapper for BT2446A {
     fn map(&self, color: LinearRGB) -> LinearRGB {
         bt2446a(color)
     }
+
+    #[inline]
+    fn map_in_place(&self, colors: &mut [LinearRGB]) {
+        let simd_len = colors.len() / BT2446_LANES * BT2446_LANES;
+        let (simd_colors, tail) = colors.split_at_mut(simd_len);
+        if !simd_colors.is_empty() {
+            bt2446a_batch(simd_colors);
+        }
+        for color in tail {
+            *color = bt2446a(*color);
+        }
+    }
+}
+
+#[multiversion(targets("x86_64+avx2", "aarch64+neon"))]
+fn bt2446a_batch(colors: &mut [LinearRGB]) {
+    let zero = F64x16::splat(0.0);
+    let one = F64x16::splat(1.0);
+    let (chunks, tail) = colors.as_chunks_mut::<BT2446_LANES>();
+    debug_assert!(
+        tail.is_empty(),
+        "BT.2446 SIMD input must contain complete chunks"
+    );
+
+    for chunk in chunks {
+        let components = [0, 1, 2].map(|channel| {
+            F64x16::from_array(std::array::from_fn(|lane| {
+                f64::from(chunk[lane].0[channel])
+            }))
+        });
+
+        let nonlinear = components.map(|component| {
+            let normalized =
+                (component / F64x16::splat(HDR_TO_SDR_PEAK_RATIO)).simd_clamp(zero, one);
+            (normalized.log2() * F64x16::splat(1.0 / 2.4)).exp2()
+        });
+
+        let input_luma = F64x16::splat(BT2020_LUMA[0]) * nonlinear[0]
+            + F64x16::splat(BT2020_LUMA[1]) * nonlinear[1]
+            + F64x16::splat(BT2020_LUMA[2]) * nonlinear[2];
+
+        let perceptual_luma =
+            (one + F64x16::splat(RHO_HDR - 1.0) * input_luma).ln() / F64x16::splat(RHO_HDR.ln());
+
+        let compressed_luma = perceptual_luma.simd_le(F64x16::splat(0.739_9)).select(
+            F64x16::splat(1.077_0) * perceptual_luma,
+            perceptual_luma.simd_lt(F64x16::splat(0.990_9)).select(
+                F64x16::splat(-1.151_0) * perceptual_luma * perceptual_luma
+                    + F64x16::splat(2.781_1) * perceptual_luma
+                    - F64x16::splat(0.630_2),
+                F64x16::splat(0.5) * perceptual_luma + F64x16::splat(0.5),
+            ),
+        );
+
+        let output_luma =
+            (compressed_luma * F64x16::splat(RHO_SDR.ln())).exp() - F64x16::splat(1.0);
+
+        let output_luma = output_luma / F64x16::splat(RHO_SDR - 1.0);
+        let color_scale = input_luma
+            .simd_eq(zero)
+            .select(zero, output_luma / (F64x16::splat(1.1) * input_luma));
+
+        let blue_difference = color_scale * (nonlinear[2] - input_luma) / F64x16::splat(CB_DIVISOR);
+        let red_difference = color_scale * (nonlinear[0] - input_luma) / F64x16::splat(CR_DIVISOR);
+        let adjusted_luma = output_luma - F64x16::splat(0.1) * red_difference.simd_max(zero);
+
+        let output_nonlinear = [
+            adjusted_luma + F64x16::splat(CR_DIVISOR) * red_difference,
+            adjusted_luma
+                - F64x16::splat(BT2020_LUMA[2] * CB_DIVISOR / BT2020_LUMA[1]) * blue_difference
+                - F64x16::splat(BT2020_LUMA[0] * CR_DIVISOR / BT2020_LUMA[1]) * red_difference,
+            adjusted_luma + F64x16::splat(CB_DIVISOR) * blue_difference,
+        ];
+
+        let mapped = output_nonlinear.map(|component| {
+            let bounded = component.simd_clamp(zero, one);
+            (bounded.log2() * F64x16::splat(2.4))
+                .exp2()
+                .cast::<f32>()
+                .to_array()
+        });
+
+        for lane in 0..BT2446_LANES {
+            chunk[lane] = LinearRGB([mapped[0][lane], mapped[1][lane], mapped[2][lane]]);
+        }
+    }
 }
 
 fn bt2446a(color: LinearRGB) -> LinearRGB {
-    const HDR_TO_SDR_PEAK_RATIO: f64 = 10.0;
-    const BT2020_LUMA: [f64; 3] = [0.262_7, 0.678_0, 0.059_3];
-    const CB_DIVISOR: f64 = 1.881_4;
-    const CR_DIVISOR: f64 = 1.474_6;
-
     let nonlinear = color.components_f64().map(|component| {
         (component / HDR_TO_SDR_PEAK_RATIO)
             .clamp(0.0, 1.0)
@@ -69,9 +167,6 @@ fn bt2446a(color: LinearRGB) -> LinearRGB {
 }
 
 fn bt2446a_luma(input_luma: f64) -> f64 {
-    const RHO_HDR: f64 = 13.259_797_918_583_32;
-    const RHO_SDR: f64 = 5.696_957_656_390_622;
-
     let perceptual_luma = (1.0 + (RHO_HDR - 1.0) * input_luma).ln() / RHO_HDR.ln();
 
     let compressed_luma = if perceptual_luma <= 0.739_9 {
