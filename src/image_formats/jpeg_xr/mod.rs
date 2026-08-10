@@ -28,7 +28,7 @@ use tonemapping::{
     AcesApproximate, AcesFitted, Clamp, ColorChannel as ToneColorChannel,
     ExtendedLuminanceReinhard, ExtendedReinhard, LinearRgb, LuminanceReinhard, LuminanceWhitePoint,
     MaxCllEstimator, MaxCllMode, Reinhard, ReinhardJodie, ScaledClamp, ToneMapper,
-    ToneMappingMethod, Uncharted2, WhitePoint,
+    ToneMappingMethod, Hable, WhitePoint,
 };
 
 use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
@@ -924,9 +924,9 @@ impl ResolvedToneMapper {
                 ))
             }
             ToneMappingMethod::ReinhardJodie => Self::ReinhardJodie,
-            ToneMappingMethod::Uncharted2 => Self::Uncharted2,
-            ToneMappingMethod::AcesFitted => Self::AcesFitted,
-            ToneMappingMethod::AcesApproximate => Self::AcesApproximate,
+            ToneMappingMethod::Hable => Self::Uncharted2,
+            ToneMappingMethod::ACESFitted => Self::AcesFitted,
+            ToneMappingMethod::ACESApproximate => Self::AcesApproximate,
         }
     }
 }
@@ -941,7 +941,7 @@ impl ToneMapper for ResolvedToneMapper {
             Self::LuminanceReinhard => LuminanceReinhard.map(color),
             Self::ExtendedLuminanceReinhard(mapper) => mapper.map(color),
             Self::ReinhardJodie => ReinhardJodie.map(color),
-            Self::Uncharted2 => Uncharted2.map(color),
+            Self::Uncharted2 => Hable.map(color),
             Self::AcesFitted => AcesFitted.map(color),
             Self::AcesApproximate => AcesApproximate.map(color),
         }
@@ -956,7 +956,7 @@ impl ToneMapper for ResolvedToneMapper {
             Self::LuminanceReinhard => LuminanceReinhard.map_in_place(colors),
             Self::ExtendedLuminanceReinhard(mapper) => mapper.map_in_place(colors),
             Self::ReinhardJodie => ReinhardJodie.map_in_place(colors),
-            Self::Uncharted2 => Uncharted2.map_in_place(colors),
+            Self::Uncharted2 => Hable.map_in_place(colors),
             Self::AcesFitted => AcesFitted.map_in_place(colors),
             Self::AcesApproximate => AcesApproximate.map_in_place(colors),
         }

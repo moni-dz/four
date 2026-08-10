@@ -1,5 +1,5 @@
 [toolchain]
-# Portable SIMD is intentionally unstable, so make the nightly requirement explicit.
-channel = "nightly"
+# Portable SIMD is intentionally unstable, so pin the compiler for reproducible builds.
+channel = "nightly-2026-08-08"
 components = ["clippy", "rustfmt"]
 profile = "minimal"

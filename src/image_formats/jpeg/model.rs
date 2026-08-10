@@ -4,8 +4,7 @@ use exn::OptionExt;
 
 use super::{
     BLOCK_SIDE, COMPONENTS_MAX, DIMENSION_MAX, DecodedImage, JPEGError, JPEGLimit, JPEGTableKind,
-    PIXELS_MAX, PROGRESSIVE_COEFFICIENT_BYTES_MAX, QUANTIZATION_TABLES_MAX, Result, divide_ceil,
-    error, idct,
+    PIXELS_MAX, PROGRESSIVE_COEFFICIENT_BYTES_MAX, Result, divide_ceil, error, idct,
 };
 
 #[derive(Clone, Copy)]
@@ -60,6 +59,7 @@ impl Frame {
             .map(|component| component.horizontal_sampling)
             .max()
             .expect("frame has components");
+
         let max_vertical_sampling = components
             .iter()
             .map(|component| component.vertical_sampling)
@@ -101,19 +101,18 @@ impl Frame {
 
     pub(super) fn materialize_progressive(
         &mut self,
-        quantization_tables: &[Option<[u16; 64]>; QUANTIZATION_TABLES_MAX],
+        quantization_snapshots: &[Option<[u16; 64]>; COMPONENTS_MAX],
     ) -> Result<()> {
         invariant_eq!(self.process, CodingProcess::Progressive);
         invariant!(!self.components.is_empty());
 
-        for component in &mut self.components {
-            let quantization =
-                quantization_tables[component.quantization_table].ok_or_raise(|| {
-                    JPEGError::Table(
-                        JPEGTableKind::Quantization,
-                        "frame references a missing quantization table",
-                    )
-                })?;
+        for (component_index, component) in self.components.iter_mut().enumerate() {
+            let quantization = quantization_snapshots[component_index].ok_or_raise(|| {
+                JPEGError::Table(
+                    JPEGTableKind::Quantization,
+                    "progressive component is missing its quantization table snapshot",
+                )
+            })?;
 
             let block_count = component
                 .block_columns

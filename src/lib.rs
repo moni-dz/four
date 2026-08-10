@@ -1,4 +1,5 @@
 #![feature(portable_simd)]
+#![warn(missing_docs)]
 //! Decodes images into a small, format-independent RGBA representation.
 //!
 //! The crate provides GIF, JPEG, JPEG XL, JPEG XR, PNG, and TIFF decoding into RGBA8 pixels.

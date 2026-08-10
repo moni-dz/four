@@ -7,7 +7,15 @@ pub mod jpeg_xr;
 pub mod png;
 pub mod tiff;
 
-const BMP_HEADER_BYTES: u32 = 54;
+const BMP_FILE_HEADER_BYTES: u32 = 14;
+const BMP_DIB_HEADER_BYTES: u32 = 108;
+const BMP_HEADER_BYTES: u32 = BMP_FILE_HEADER_BYTES + BMP_DIB_HEADER_BYTES;
+const BMP_BITFIELDS_COMPRESSION: u32 = 3;
+const BMP_RED_MASK: u32 = 0x00ff_0000;
+const BMP_GREEN_MASK: u32 = 0x0000_ff00;
+const BMP_BLUE_MASK: u32 = 0x0000_00ff;
+const BMP_ALPHA_MASK: u32 = 0xff00_0000;
+const BMP_SRGB_COLOR_SPACE: u32 = 0x7352_4742;
 const DIMENSION_MAX: u32 = 16_384;
 const PIXELS_MAX: u64 = 64 * 1024 * 1024;
 const RGBA_BYTES_PER_PIXEL: u32 = 4;
@@ -112,7 +120,10 @@ impl Image for DecodedImage {
     }
 }
 
-/// GPUI accepts encoded images, so a trivial uncompressed BMP is used only as a pixel carrier.
+/// GPUI accepts encoded images, so an uncompressed BMP is used only as a pixel carrier.
+///
+/// A V4 header declares explicit BGRA channel masks. Without those masks, BMP readers commonly
+/// interpret the fourth byte of a 32-bit `BI_RGB` pixel as padding and discard image transparency.
 /// The source format has already been fully decoded before this adapter runs.
 ///
 /// # Panics
@@ -148,14 +159,20 @@ pub fn encode_bmp(image: &impl Image) -> Vec<u8> {
     bmp.extend_from_slice(&file_bytes.to_le_bytes());
     bmp.extend_from_slice(&[0; 4]);
     bmp.extend_from_slice(&BMP_HEADER_BYTES.to_le_bytes());
-    bmp.extend_from_slice(&40_u32.to_le_bytes());
+    bmp.extend_from_slice(&BMP_DIB_HEADER_BYTES.to_le_bytes());
     bmp.extend_from_slice(&width_i32.to_le_bytes());
     bmp.extend_from_slice(&(-height_i32).to_le_bytes());
     bmp.extend_from_slice(&1_u16.to_le_bytes());
     bmp.extend_from_slice(&32_u16.to_le_bytes());
-    bmp.extend_from_slice(&0_u32.to_le_bytes());
+    bmp.extend_from_slice(&BMP_BITFIELDS_COMPRESSION.to_le_bytes());
     bmp.extend_from_slice(&pixel_bytes.to_le_bytes());
     bmp.extend_from_slice(&[0; 16]);
+    bmp.extend_from_slice(&BMP_RED_MASK.to_le_bytes());
+    bmp.extend_from_slice(&BMP_GREEN_MASK.to_le_bytes());
+    bmp.extend_from_slice(&BMP_BLUE_MASK.to_le_bytes());
+    bmp.extend_from_slice(&BMP_ALPHA_MASK.to_le_bytes());
+    bmp.extend_from_slice(&BMP_SRGB_COLOR_SPACE.to_le_bytes());
+    bmp.extend_from_slice(&[0; 48]);
 
     let (pixels, remainder) = image
         .rgba8()
@@ -173,7 +190,9 @@ pub fn encode_bmp(image: &impl Image) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Image, encode_bmp};
+    use std::sync::Arc;
+
+    use super::{BMP_DIB_HEADER_BYTES, BMP_HEADER_BYTES, Image, encode_bmp};
 
     #[derive(Debug)]
     struct ContractTestImage {
@@ -231,8 +250,30 @@ mod tests {
         let bmp = encode_bmp(&image);
 
         assert_eq!(&bmp[..2], b"BM");
+        assert_eq!(&bmp[10..14], &BMP_HEADER_BYTES.to_le_bytes());
+        assert_eq!(&bmp[14..18], &BMP_DIB_HEADER_BYTES.to_le_bytes());
         assert_eq!(&bmp[18..22], &2_i32.to_le_bytes());
         assert_eq!(&bmp[22..26], &(-1_i32).to_le_bytes());
-        assert_eq!(&bmp[54..], &[3, 2, 1, 4, 7, 6, 5, 8]);
+        assert_eq!(&bmp[BMP_HEADER_BYTES as usize..], &[3, 2, 1, 4, 7, 6, 5, 8]);
+    }
+
+    #[test]
+    fn bmp_encoding_preserves_alpha_through_gpui() {
+        let image = ContractTestImage {
+            width: 1,
+            height: 1,
+            rgba: vec![1, 2, 3, 4],
+        };
+        let carrier = gpui::Image::from_bytes(gpui::ImageFormat::Bmp, encode_bmp(&image));
+        let decoded = carrier
+            .to_image_data(gpui::SvgRenderer::new(Arc::new(())))
+            .expect("the BMP carrier must decode through GPUI");
+
+        assert_eq!(
+            decoded
+                .as_bytes(0)
+                .expect("the static BMP carrier has one frame"),
+            &[3, 2, 1, 4]
+        );
     }
 }

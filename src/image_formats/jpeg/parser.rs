@@ -33,8 +33,9 @@ pub(super) fn decode(bytes: &[u8]) -> Result<DecodedImage> {
 }
 
 // The parser phases make it impossible to decode entropy before a frame exists or to produce an
-// image before at least one scan has completed. JPEG table presence stays dynamic because the file
-// format permits tables to be redefined between scans; that is input state, not parser lifecycle.
+// image before at least one scan has completed. Active JPEG tables stay dynamic because the file
+// format permits redefinition between scans. Progressive components snapshot their quantization
+// table when first scanned so later definitions cannot retroactively change decoded coefficients.
 struct Parser<'a, State> {
     reader: Reader<'a>,
     quantization_tables: [Option<[u16; 64]>; QUANTIZATION_TABLES_MAX],
@@ -50,6 +51,7 @@ struct FrameData {
     frame: Frame,
     coefficient_bits: [[Option<u8>; 64]; COMPONENTS_MAX],
     component_scanned: [bool; COMPONENTS_MAX],
+    quantization_snapshots: [Option<[u16; 64]>; COMPONENTS_MAX],
 }
 
 struct FrameReady {
@@ -198,6 +200,7 @@ impl<'a> Parser<'a, Headers> {
                 frame,
                 coefficient_bits: [[None; 64]; COMPONENTS_MAX],
                 component_scanned: [false; COMPONENTS_MAX],
+                quantization_snapshots: array::from_fn(|_| None),
             },
         }))
     }
@@ -240,20 +243,16 @@ impl<'a, State> Parser<'a, State> {
                 )));
             }
 
-            if precision > 1 {
+            if precision != 0 {
                 return Err(error(JPEGError::Table(
                     JPEGTableKind::Quantization,
-                    "quantization table precision is invalid",
+                    "8-bit JPEG requires 8-bit quantization tables",
                 )));
             }
 
             let mut table = [0_u16; 64];
             for natural_index in ZIGZAG_TO_NATURAL {
-                let value = if precision == 0 {
-                    u16::from(segment.read_u8()?)
-                } else {
-                    segment.read_u16()?
-                };
+                let value = u16::from(segment.read_u8()?);
 
                 if value == 0 {
                     return Err(error(JPEGError::Table(
@@ -392,6 +391,10 @@ impl Parser<'_, FrameReady> {
             [[None; 64]; COMPONENTS_MAX]
         );
         invariant_eq!(self.state.data.component_scanned, [false; COMPONENTS_MAX]);
+        invariant_eq!(
+            self.state.data.quantization_snapshots,
+            array::from_fn(|_| None)
+        );
         invariant!(!self.state.data.frame.components.is_empty());
 
         let mut marker = self.reader.marker()?;
@@ -479,7 +482,7 @@ impl Parser<'_, Scanned> {
                 )));
             }
 
-            frame.materialize_progressive(&self.quantization_tables)?;
+            frame.materialize_progressive(&self.state.data.quantization_snapshots)?;
         } else if self.state.data.component_scanned[..frame.components.len()]
             .iter()
             .any(|scanned| !scanned)
@@ -545,6 +548,7 @@ impl<State: FramePhase> Parser<'_, State> {
         let entropy = self.reader.remaining_slice();
         let conditioning = self.arithmetic_conditioning;
         let frame = &mut self.state.data_mut().frame;
+        
         arithmetic::decode_sequential(entropy, frame, &plans, &conditioning, self.restart_interval)
     }
 
@@ -554,6 +558,7 @@ impl<State: FramePhase> Parser<'_, State> {
         invariant_eq!(self.state.data().frame.process, CodingProcess::Progressive);
 
         self.validate_progression(scan)?;
+        self.snapshot_progressive_quantization(scan)?;
         let plans = self.build_arithmetic_progressive_plans(scan);
         let entropy = self.reader.remaining_slice();
         let conditioning = self.arithmetic_conditioning;
@@ -652,6 +657,31 @@ impl<State: FramePhase> Parser<'_, State> {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn snapshot_progressive_quantization(&mut self, scan: &ScanHeader) -> Result<()> {
+        invariant!(!scan.components.is_empty());
+        invariant!(scan.components.len() <= COMPONENTS_MAX);
+        invariant_eq!(self.state.data().frame.process, CodingProcess::Progressive);
+
+        let mut snapshots = self.state.data().quantization_snapshots;
+        for component in &scan.components {
+            if snapshots[component.frame_index].is_some() {
+                continue;
+            }
+
+            let table_index =
+                self.state.data().frame.components[component.frame_index].quantization_table;
+            snapshots[component.frame_index] =
+                Some(self.quantization_tables[table_index].ok_or_raise(|| {
+                    JPEGError::Table(
+                        JPEGTableKind::Quantization,
+                        "progressive scan references a missing quantization table",
+                    )
+                })?);
+        }
+        self.state.data_mut().quantization_snapshots = snapshots;
         Ok(())
     }
 

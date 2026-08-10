@@ -1,4 +1,5 @@
 #![feature(portable_simd)]
+#![warn(missing_docs)]
 //! Maps high-dynamic-range linear RGB colors into a displayable range.
 //!
 //! Tone-mapping operators accept [`LinearRgb`] values whose components are relative linear-light
@@ -7,7 +8,7 @@
 //! integer quantization remain the caller's responsibility.
 //!
 //! [`Clamp`] and [`ScaledClamp`] provide clipping baselines. The Reinhard family includes
-//! component-wise, luminance-preserving, white-point, and Reinhard-Jodie variants. [`Uncharted2`],
+//! component-wise, luminance-preserving, white-point, and Reinhard-Jodie variants. [`Hable`],
 //! [`AcesFitted`], and [`AcesApproximate`] provide filmic curves, while [`CameraResponse`] applies
 //! a caller-supplied normalized camera-response lookup table.
 //! [`ToneMappingMethod`] enumerates the built-in operator families that need no custom response.
@@ -202,11 +203,11 @@ pub enum ToneMappingMethod {
     /// Blends component-wise and luminance-based Reinhard results.
     ReinhardJodie,
     /// Applies the Uncharted 2 filmic curve.
-    Uncharted2,
+    Hable,
     /// Applies the fitted ACES reference and display transform.
-    AcesFitted,
+    ACESFitted,
     /// Applies the scalar ACES curve approximation.
-    AcesApproximate,
+    ACESApproximate,
 }
 
 impl ToneMappingMethod {
@@ -219,9 +220,9 @@ impl ToneMappingMethod {
         Self::LuminanceReinhard,
         Self::ExtendedLuminanceReinhard,
         Self::ReinhardJodie,
-        Self::Uncharted2,
-        Self::AcesFitted,
-        Self::AcesApproximate,
+        Self::Hable,
+        Self::ACESFitted,
+        Self::ACESApproximate,
     ];
 
     /// Returns the concise user-facing method name.
@@ -235,16 +236,16 @@ impl ToneMappingMethod {
             Self::LuminanceReinhard => "Luminance Reinhard",
             Self::ExtendedLuminanceReinhard => "Extended luminance Reinhard",
             Self::ReinhardJodie => "Reinhard-Jodie",
-            Self::Uncharted2 => "Uncharted 2",
-            Self::AcesFitted => "ACES fitted",
-            Self::AcesApproximate => "ACES approximate",
+            Self::Hable => "Hable",
+            Self::ACESFitted => "ACES fitted",
+            Self::ACESApproximate => "ACES approximate",
         }
     }
 }
 
 impl fmt::Display for ToneMappingMethod {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.label())
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.label())
     }
 }
 
@@ -377,9 +378,9 @@ impl MaxCllPixelCountError {
 }
 
 impl fmt::Display for MaxCllPixelCountError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
-            formatter,
+            f,
             "MaxCLL estimator expected {} pixels but observed {}",
             self.expected, self.observed
         )
@@ -858,21 +859,21 @@ impl ToneMapper for ReinhardJodie {
 /// The operator includes the article's exposure bias of two and normalizes the curve at its `11.2`
 /// reference input. Consequently, a scene component of `5.6` maps to display white.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Uncharted2;
+pub struct Hable;
 
-impl ToneMapper for Uncharted2 {
+impl ToneMapper for Hable {
     #[inline]
     fn map(&self, color: LinearRgb) -> LinearRgb {
-        let white_scale = 1.0 / uncharted2_partial(11.2);
+        let white_scale = 1.0 / hable_partial(11.2);
         LinearRgb::displayable(
             color
                 .components_f64()
-                .map(|component| uncharted2_partial(component * 2.0) * white_scale),
+                .map(|component| hable_partial(component * 2.0) * white_scale),
         )
     }
 }
 
-fn uncharted2_partial(value: f64) -> f64 {
+fn hable_partial(value: f64) -> f64 {
     const A: f64 = 0.15;
     const B: f64 = 0.50;
     const C: f64 = 0.10;
@@ -934,10 +935,12 @@ fn aces_fitted_batch(colors: &mut [LinearRgb]) {
                 f64::from(chunk[lane].0[channel])
             }))
         });
+        
         let transformed = ACES_INPUT_MATRIX.map(|row| {
             (F64x4::splat(row[0]) * color[0] + F64x4::splat(row[1]) * color[1])
                 + F64x4::splat(row[2]) * color[2]
         });
+        
         let fitted = transformed.map(|component| {
             let numerator =
                 component * (component + F64x4::splat(0.024_578_6)) - F64x4::splat(0.000_090_537);
@@ -946,10 +949,12 @@ fn aces_fitted_batch(colors: &mut [LinearRgb]) {
                 + F64x4::splat(0.238_081);
             numerator / denominator
         });
+        
         let mapped = ACES_OUTPUT_MATRIX.map(|row| {
             (F64x4::splat(row[0]) * fitted[0] + F64x4::splat(row[1]) * fitted[1])
                 + F64x4::splat(row[2]) * fitted[2]
         });
+        
         let mapped = mapped.map(|component| {
             let zero = F64x4::splat(0.0);
             let one = F64x4::splat(1.0);
@@ -1158,41 +1163,37 @@ pub enum CameraResponseError {
 }
 
 impl fmt::Display for CameraResponseError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
             Self::LengthMismatch {
                 irradiance,
                 intensity,
             } => write!(
-                formatter,
+                f,
                 "camera response has {irradiance} irradiance samples and {intensity} intensity samples"
             ),
             Self::TooFewSamples(count) => {
-                write!(
-                    formatter,
-                    "camera response requires two samples, got {count}"
-                )
+                write!(f, "camera response requires two samples, got {count}")
             }
             Self::IrradianceOutOfRange(index) => write!(
-                formatter,
+                f,
                 "camera irradiance sample {index} is not finite normalized data"
             ),
-            Self::IrradianceNotIncreasing(index) => write!(
-                formatter,
-                "camera irradiance sample {index} does not increase"
-            ),
+            Self::IrradianceNotIncreasing(index) => {
+                write!(f, "camera irradiance sample {index} does not increase")
+            }
             Self::IntensityOutOfRange(index) => write!(
-                formatter,
+                f,
                 "camera intensity sample {index} is not finite normalized data"
             ),
             Self::IntensityDecreases(index) => {
-                write!(formatter, "camera intensity sample {index} decreases")
+                write!(f, "camera intensity sample {index} decreases")
             }
             Self::IrradianceEndpoints => {
-                formatter.write_str("camera irradiance must start at zero and end at one")
+                f.write_str("camera irradiance must start at zero and end at one")
             }
             Self::IntensityEndpoints => {
-                formatter.write_str("camera intensity must start at zero and end at one")
+                f.write_str("camera intensity must start at zero and end at one")
             }
         }
     }
@@ -1445,7 +1446,7 @@ mod tests {
             &LuminanceReinhard,
             &extended_luminance,
             &ReinhardJodie,
-            &Uncharted2,
+            &Hable,
             &AcesFitted,
             &AcesApproximate,
             &camera,
@@ -1510,7 +1511,7 @@ mod tests {
 
     #[test]
     fn uncharted_two_uses_the_article_exposure_and_white_scale() {
-        let [middle_gray, reference_white, filmic_white] = Uncharted2
+        let [middle_gray, reference_white, filmic_white] = Hable
             .map(LinearRgb::new([0.18, 1.0, 5.6]))
             .components();
 
@@ -1576,14 +1577,17 @@ mod tests {
             CameraResponse::new(vec![0.0, 0.5, 0.5], vec![0.0, 0.5, 1.0]).unwrap_err(),
             CameraResponseError::IrradianceNotIncreasing(2)
         );
+        
         assert_eq!(
             CameraResponse::new(vec![0.0, 0.5, 1.0], vec![0.0, 0.75, 0.5]).unwrap_err(),
             CameraResponseError::IntensityDecreases(2)
         );
+        
         assert_eq!(
             CameraResponse::new(vec![0.1, 1.0], vec![0.0, 1.0]).unwrap_err(),
             CameraResponseError::IrradianceEndpoints
         );
+        
         assert_eq!(
             CameraResponse::new(vec![0.0, 1.0], vec![0.1, 1.0]).unwrap_err(),
             CameraResponseError::IntensityEndpoints
@@ -1609,16 +1613,19 @@ mod tests {
             LinearRgb::new([4.0, 0.0, 0.0]),
             LinearRgb::new([0.0, 0.0, 126.0]),
         ]);
+        
         let pixel_count = NonZeroUsize::new(colors.len()).expect("test MaxCLL input is nonempty");
 
         let mut percentile = MaxCllEstimator::with_mode(pixel_count, MaxCllMode::Percentile99_99);
         percentile.observe_many(&colors);
+        
         let percentile = percentile
             .finish()
             .expect("the percentile estimator observes every declared pixel");
 
         let mut true_maximum = MaxCllEstimator::with_mode(pixel_count, MaxCllMode::TrueMaximum);
         true_maximum.observe_many(&colors);
+        
         let true_maximum = true_maximum
             .finish()
             .expect("the maximum estimator observes every declared pixel");
@@ -1675,10 +1682,13 @@ mod tests {
             let colors: Vec<_> = (0..pixel_count)
                 .map(|index| palette[index % palette.len()])
                 .collect();
+            
             let expected = estimate_max_cll_scalarly(&colors);
+            
             let mut estimator = MaxCllEstimator::new(
                 NonZeroUsize::new(colors.len()).expect("test MaxCLL input is nonempty"),
             );
+            
             for batch in colors.chunks(257) {
                 estimator.observe_many(batch);
             }
@@ -1705,6 +1715,7 @@ mod tests {
             LinearRgb::default(),
             LinearRgb::new([0.5; 3]),
         ];
+        
         let mut estimator =
             MaxCllEstimator::new(NonZeroUsize::new(colors.len()).expect("test input is nonempty"));
         estimator.observe_many(&colors);
@@ -1712,6 +1723,7 @@ mod tests {
         let max_cll = estimator
             .finish()
             .expect("the batch test observes every declared pixel");
+        
         assert_eq!(max_cll.level(), 5.0);
         assert_eq!(max_cll.channel(), ColorChannel::Blue);
     }
@@ -1720,6 +1732,7 @@ mod tests {
     fn max_cll_batch_counts_lanes_filtered_below_the_threshold() {
         let mut colors = vec![LinearRgb::new([10.0, 0.0, 0.0])];
         colors.extend(std::iter::repeat_n(LinearRgb::new([1.0; 3]), 8));
+        
         let mut estimator =
             MaxCllEstimator::new(NonZeroUsize::new(colors.len()).expect("test input is nonempty"));
         estimator.observe_many(&colors);
@@ -1727,6 +1740,7 @@ mod tests {
         let max_cll = estimator
             .finish()
             .expect("filtered lanes still count as observations");
+        
         assert_eq!(max_cll.level(), 10.0);
         assert_eq!(max_cll.channel(), ColorChannel::Red);
     }

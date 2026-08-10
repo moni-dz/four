@@ -59,17 +59,21 @@ fn benchmark_mapper(
         iterations,
         || {
             scalar_scratch.copy_from_slice(colors);
-            for color in &mut scalar_scratch {
-                *color = mapper.map(*color);
-            }
-            std::hint::black_box(&scalar_scratch);
+            time_once(|| {
+                for color in &mut scalar_scratch {
+                    *color = mapper.map(*color);
+                }
+                std::hint::black_box(&scalar_scratch);
+            })
         },
         || {
             bulk_scratch.copy_from_slice(colors);
-            for batch in bulk_scratch.chunks_mut(BATCH_PIXELS) {
-                mapper.map_in_place(batch);
-            }
-            std::hint::black_box(&bulk_scratch);
+            time_once(|| {
+                for batch in bulk_scratch.chunks_mut(BATCH_PIXELS) {
+                    mapper.map_in_place(batch);
+                }
+                std::hint::black_box(&bulk_scratch);
+            })
         },
     );
 
@@ -81,26 +85,30 @@ fn benchmark_max_cll(colors: &[LinearRgb], iterations: NonZeroU32) {
     let (scalar, bulk) = benchmark_pair(
         iterations,
         || {
-            let mut estimator = MaxCllEstimator::new(pixel_count);
-            for color in colors {
-                estimator.observe(*color);
-            }
-            std::hint::black_box(
-                estimator
-                    .finish()
-                    .expect("the scalar benchmark observes every color"),
-            );
+            time_once(|| {
+                let mut estimator = MaxCllEstimator::new(pixel_count);
+                for color in colors {
+                    estimator.observe(*color);
+                }
+                std::hint::black_box(
+                    estimator
+                        .finish()
+                        .expect("the scalar benchmark observes every color"),
+                );
+            })
         },
         || {
-            let mut estimator = MaxCllEstimator::new(pixel_count);
-            for batch in colors.chunks(BATCH_PIXELS) {
-                estimator.observe_many(batch);
-            }
-            std::hint::black_box(
-                estimator
-                    .finish()
-                    .expect("the bulk benchmark observes every color"),
-            );
+            time_once(|| {
+                let mut estimator = MaxCllEstimator::new(pixel_count);
+                for batch in colors.chunks(BATCH_PIXELS) {
+                    estimator.observe_many(batch);
+                }
+                std::hint::black_box(
+                    estimator
+                        .finish()
+                        .expect("the bulk benchmark observes every color"),
+                );
+            })
         },
     );
 
@@ -109,21 +117,21 @@ fn benchmark_max_cll(colors: &[LinearRgb], iterations: NonZeroU32) {
 
 fn benchmark_pair(
     iterations: NonZeroU32,
-    mut scalar: impl FnMut(),
-    mut bulk: impl FnMut(),
+    mut scalar_sample: impl FnMut() -> Duration,
+    mut bulk_sample: impl FnMut() -> Duration,
 ) -> (Duration, Duration) {
-    scalar();
-    bulk();
+    let _scalar_warmup = scalar_sample();
+    let _bulk_warmup = bulk_sample();
 
     let mut scalar_elapsed = Duration::ZERO;
     let mut bulk_elapsed = Duration::ZERO;
     for iteration in 0..iterations.get() {
         if iteration % 2 == 0 {
-            scalar_elapsed += time_once(&mut scalar);
-            bulk_elapsed += time_once(&mut bulk);
+            scalar_elapsed += scalar_sample();
+            bulk_elapsed += bulk_sample();
         } else {
-            bulk_elapsed += time_once(&mut bulk);
-            scalar_elapsed += time_once(&mut scalar);
+            bulk_elapsed += bulk_sample();
+            scalar_elapsed += scalar_sample();
         }
     }
     (scalar_elapsed, bulk_elapsed)
