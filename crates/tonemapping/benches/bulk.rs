@@ -3,8 +3,9 @@ use std::time::{Duration, Instant};
 
 use mimalloc::MiMalloc;
 use tonemapping::{
-    ACESFitted, BT2446A, Clamp, ExtendedReinhard, LinearRGB, MaxCllEstimator, ToneMapper,
-    WhitePoint,
+    ACESFitted, AcesApproximate, BT2446A, Clamp, ExtendedLuminanceReinhard, ExtendedReinhard,
+    Hable, LinearRGB, LuminanceReinhard, LuminanceWhitePoint, MaxCllEstimator, Reinhard,
+    ReinhardJodie, ScaledClamp, ToneMapper, WhitePoint,
 };
 
 #[global_allocator]
@@ -24,11 +25,40 @@ fn main() {
     let iterations = env_nonzero_u32("FOUR_TONEMAPPING_BENCH_ITERATIONS", 20);
     let colors = benchmark_colors(pixel_count.get());
 
-    let extended =
-        ExtendedReinhard::new(WhitePoint::new(16.0).expect("benchmark white is positive"));
-    benchmark_mapper("Extended Reinhard", &extended, &colors, iterations);
+    let white = WhitePoint::new(16.0).expect("benchmark white is positive");
+    let luminance_white =
+        LuminanceWhitePoint::new(16.0).expect("benchmark luminance white is positive");
+
     benchmark_mapper("clamp", &Clamp, &colors, iterations);
+    benchmark_mapper(
+        "scaled clamp",
+        &ScaledClamp::new(white),
+        &colors,
+        iterations,
+    );
+    benchmark_mapper("Reinhard", &Reinhard, &colors, iterations);
+    benchmark_mapper(
+        "extended Reinhard",
+        &ExtendedReinhard::new(white),
+        &colors,
+        iterations,
+    );
+    benchmark_mapper(
+        "luminance Reinhard",
+        &LuminanceReinhard,
+        &colors,
+        iterations,
+    );
+    benchmark_mapper(
+        "extended luminance Reinhard",
+        &ExtendedLuminanceReinhard::new(luminance_white),
+        &colors,
+        iterations,
+    );
+    benchmark_mapper("Reinhard-Jodie", &ReinhardJodie, &colors, iterations);
+    benchmark_mapper("Hable", &Hable, &colors, iterations);
     benchmark_mapper("fitted ACES", &ACESFitted, &colors, iterations);
+    benchmark_mapper("approximate ACES", &AcesApproximate, &colors, iterations);
     benchmark_mapper("BT.2446A", &BT2446A, &colors, iterations);
     benchmark_max_cll(&colors, iterations);
 }
