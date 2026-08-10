@@ -147,16 +147,19 @@ fn normalize_rgba(
                     "JPEG XL RGBA output has an invalid length",
                 )));
             }
+
             Ok(samples)
         }
         PixelFormat::Rgb => {
             let mut rgba = Vec::with_capacity(output_len);
             let (pixels, remainder) = samples.as_chunks::<3>();
+
             if !remainder.is_empty() || pixels.len() != pixel_count {
                 return Err(error(JPEGXLError::Output(
                     "JPEG XL RGB output has an invalid length",
                 )));
             }
+
             rgba.extend(
                 pixels
                     .iter()
