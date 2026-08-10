@@ -1,10 +1,11 @@
 //! Decodes bounded JPEG XR images and tone-maps HDR pixels to SDR RGBA8.
 //!
 //! The JPEG XR reference codec produces pixels in their native WIC representation. Unsigned RGB
-//! and grayscale samples are normalized as sRGB. Fixed-point, half-float, floating-point, and RGBE
-//! samples are interpreted as linear scRGB and encoded with the sRGB transfer function. By default,
-//! HDR values are mapped with ITU-R BT.2446 Method A, whose fixed mastering assumptions avoid an
-//! image-wide white-point estimation pass.
+//! and grayscale samples are normalized as sRGB, except packed 10-bit RGB screenshot data, which
+//! is converted from BT.2100 PQ and Rec. 2020 to linear scRGB. Fixed-point, half-float,
+//! floating-point, and RGBE samples are also interpreted as linear scRGB and encoded with the sRGB
+//! transfer function. By default, HDR values are mapped with ITU-R BT.2446 Method A, whose fixed
+//! mastering assumptions avoid an image-wide white-point estimation pass.
 //!
 //! When requested for metadata or tone mapping, `MaxCLL` is estimated from the 99.99th-percentile
 //! `max(R, G, B)` light level. This rejects isolated outliers at the cost of clipping the brightest
@@ -282,11 +283,12 @@ pub fn has_signature(bytes: impl AsRef<[u8]>) -> bool {
 
 /// Decodes a JPEG XR image and normalizes it to SDR RGBA8.
 ///
-/// Unsigned integer RGB and grayscale inputs retain their sRGB encoding. Linear-light HDR inputs
-/// use extended Reinhard with a `MaxCLL` white point before conversion to sRGB. `MaxCLL` is
-/// estimated from the 99.99th-percentile brightest pixel to prevent isolated outliers from dimming
-/// the image. The white point is floored at display white so in-range content is unchanged.
-/// Premultiplied inputs are returned with straight alpha.
+/// Unsigned integer RGB and grayscale inputs retain their sRGB encoding, except packed 10-bit
+/// screenshot data, which is converted from BT.2100 PQ to linear scRGB. Linear-light HDR inputs use
+/// extended Reinhard with a `MaxCLL` white point before conversion to sRGB. `MaxCLL` is estimated
+/// from the 99.99th-percentile brightest pixel to prevent isolated outliers from dimming the image.
+/// The white point is floored at display white so in-range content is unchanged. Premultiplied
+/// inputs are returned with straight alpha.
 ///
 /// # Errors
 ///
@@ -395,6 +397,7 @@ enum SampleEncoding {
     Fixed32,
     Float16,
     Float32,
+    PackedRGB101010,
     RGBE,
     Unsigned8,
     Unsigned16,
@@ -405,20 +408,26 @@ impl SampleEncoding {
         match self {
             Self::Unsigned8 | Self::RGBE => 1,
             Self::Unsigned16 | Self::Fixed16 | Self::Float16 => 2,
-            Self::Fixed32 | Self::Float32 => 4,
+            Self::Fixed32 | Self::Float32 | Self::PackedRGB101010 => 4,
         }
     }
 
     const fn is_hdr(self) -> bool {
         matches!(
             self,
-            Self::Fixed16 | Self::Fixed32 | Self::Float16 | Self::Float32 | Self::RGBE
+            Self::Fixed16
+                | Self::Fixed32
+                | Self::Float16
+                | Self::Float32
+                | Self::PackedRGB101010
+                | Self::RGBE
         )
     }
 
     const fn bits_per_channel(self) -> u8 {
         match self {
             Self::Unsigned8 | Self::RGBE => 8,
+            Self::PackedRGB101010 => 10,
             Self::Unsigned16 | Self::Fixed16 | Self::Float16 => 16,
             Self::Fixed32 | Self::Float32 => 32,
         }
@@ -488,8 +497,11 @@ impl PixelLayout {
         let bytes_per_pixel = bits_per_pixel / 8;
         let sample_bytes = encoding.bytes();
 
-        if !bytes_per_pixel.is_multiple_of(sample_bytes)
-            || bytes_per_pixel / sample_bytes < source_channels
+        let packed_rgb101010 = encoding == SampleEncoding::PackedRGB101010;
+        if (packed_rgb101010 && bytes_per_pixel != sample_bytes)
+            || (!packed_rgb101010
+                && (!bytes_per_pixel.is_multiple_of(sample_bytes)
+                    || bytes_per_pixel / sample_bytes < source_channels))
         {
             return Err(unsupported(
                 format,
@@ -520,6 +532,10 @@ impl PixelLayout {
 
         if self.encoding == SampleEncoding::RGBE {
             return Ok((decode_rgbe(pixel)?, 1.0));
+        }
+
+        if self.encoding == SampleEncoding::PackedRGB101010 {
+            return Ok((decode_rgb101010(pixel), 1.0));
         }
 
         let sample = |channel: usize| -> Result<f32> {
@@ -566,6 +582,10 @@ impl PixelLayout {
 }
 
 fn sample_encoding(format: CodecPixelFormat, info: &PixelInfo) -> Result<SampleEncoding> {
+    if format == CodecPixelFormat::PixelFormat32bppRGB101010 {
+        return Ok(SampleEncoding::PackedRGB101010);
+    }
+
     if format == CodecPixelFormat::PixelFormat32bppRGBE {
         return Ok(SampleEncoding::RGBE);
     }
@@ -1436,10 +1456,57 @@ fn decode_sample(bytes: &[u8], encoding: SampleEncoding) -> f32 {
         SampleEncoding::Fixed32 => fixed32_to_f32(read_sample::<i32>(bytes)),
         SampleEncoding::Float16 => half_to_f32(read_sample::<u16>(bytes)),
         SampleEncoding::Float32 => read_sample::<f32>(bytes),
+        SampleEncoding::PackedRGB101010 => {
+            unreachable!("packed RGB101010 pixels are decoded as a unit")
+        }
         SampleEncoding::RGBE => {
             unreachable!("RGBE pixels are decoded as a unit")
         }
     }
+}
+
+fn decode_rgb101010(pixel: &[u8]) -> [f32; 3] {
+    rec2100_pq_to_scrgb(unpack_rgb101010(pixel))
+}
+
+fn unpack_rgb101010(pixel: &[u8]) -> [f32; 3] {
+    const MASK: u32 = 0x03ff;
+    const SCALE: f32 = 1.0 / 1023.0;
+
+    invariant_eq!(pixel.len(), SampleEncoding::PackedRGB101010.bytes());
+
+    let packed = read_sample::<u32>(pixel);
+    let channel = |shift| {
+        let sample = u16::try_from((packed >> shift) & MASK)
+            .expect("a masked 10-bit JPEG XR sample fits u16");
+        f32::from(sample) * SCALE
+    };
+
+    [channel(20), channel(10), channel(0)]
+}
+
+fn rec2100_pq_to_scrgb(encoded: [f32; 3]) -> [f32; 3] {
+    const REC2100_MAX_NITS: f32 = 10_000.0;
+    const SCALE: f32 = REC2100_MAX_NITS / SC_RGB_REFERENCE_WHITE_NITS;
+
+    let [red, green, blue] = encoded.map(pq_to_linear);
+
+    [
+        (1.660_491 * red - 0.587_641 * green - 0.072_850 * blue) * SCALE,
+        (-0.124_550 * red + 1.132_9 * green - 0.008_349 * blue) * SCALE,
+        (-0.018_151 * red - 0.100_579 * green + 1.118_73 * blue) * SCALE,
+    ]
+}
+
+fn pq_to_linear(encoded: f32) -> f32 {
+    const INVERSE_M1: f32 = 16_384.0 / 2_610.0;
+    const INVERSE_M2: f32 = 32.0 / 2_523.0;
+    const C1: f32 = 3_424.0 / 4_096.0;
+    const C2: f32 = 2_413.0 / 128.0;
+    const C3: f32 = 2_392.0 / 128.0;
+
+    let powered = encoded.powf(INVERSE_M2);
+    ((powered - C1).max(0.0) / (C2 - C3 * powered)).powf(INVERSE_M1)
 }
 
 fn read_sample<T: FromBytes + Sized>(bytes: &[u8]) -> T {
@@ -1676,6 +1743,29 @@ mod tests {
         assert_eq!(half_to_f32(0xc000), -2.0);
         assert!(half_to_f32(0x7c00).is_infinite());
         assert!(half_to_f32(0x7e00).is_nan());
+    }
+
+    #[test]
+    fn decodes_packed_rgb101010_as_rec2100_hdr() {
+        let layout = PixelLayout::new(CodecPixelFormat::PixelFormat32bppRGB101010).unwrap();
+        let packed = (0b11_u32 << 30) | (1023_u32 << 20);
+        let encoded = unpack_rgb101010(&packed.to_ne_bytes());
+        let (color, alpha) = layout.read_pixel(&packed.to_ne_bytes()).unwrap();
+        let metadata = JPEGXRMetadata::new(layout, None);
+
+        assert_eq!(layout.bytes_per_pixel, 4);
+        assert_eq!(encoded, [1.0, 0.0, 0.0]);
+        assert_approximately_equal(color[0], 207.561_37, 0.000_1);
+        assert_approximately_equal(color[1], -15.568_75, 0.000_1);
+        assert_approximately_equal(color[2], -2.268_875, 0.000_1);
+        assert_eq!(alpha, 1.0);
+        assert_eq!(metadata.bits_per_channel(), 10);
+        assert!(metadata.is_hdr());
+    }
+
+    #[test]
+    fn pq_eotf_maps_a_hundred_nits_to_one_percent_of_peak() {
+        assert_approximately_equal(pq_to_linear(0.508_078_4), 0.01, 0.000_001);
     }
 
     #[test]
