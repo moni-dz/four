@@ -31,6 +31,9 @@ tonemapping = { path = "crates/tonemapping" }
 zune-jpeg = "0.5.15"
 zerocopy = { version = "0.8.56", features = ["simd", "simd-nightly", "float-nightly"] }
 
+[build-dependencies]
+embed-resource = "3.0.11"
+
 [lints]
 workspace = true
 
@@ -39,6 +42,12 @@ debug = 1
 
 [profile.release]
 opt-level = 3
+debug = "none"
+strip = "debuginfo"
+lto = "fat"
+
+[profile.release-with-symbols]
+inherits = "release"
 debug = "full"
 strip = "none"
 

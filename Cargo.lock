@@ -1818,6 +1818,7 @@ dependencies = [
 name = "four"
 version = "0.1.0"
 dependencies = [
+ "embed-resource",
  "exn",
  "gif",
  "gpui",
