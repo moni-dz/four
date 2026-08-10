@@ -19,6 +19,21 @@ impl ToneMapper for Reinhard {
                 .map(|component| component / (1.0 + component)),
         )
     }
+
+    #[inline]
+    fn map_planes_in_place(&self, colors: &mut LinearRGBPlanes) {
+        let simd_len = colors.len() / COLOR_LANES * COLOR_LANES;
+        reinhard_batch(colors);
+        colors.map_from(simd_len, self);
+    }
+}
+
+#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+fn reinhard_batch(colors: &mut LinearRGBPlanes) {
+    let one = F64x4::splat(1.0);
+    map_colors(colors, |components| {
+        components.map(|component| component / (one + component))
+    });
 }
 
 /// Applies the white-point Reinhard curve independently to each component.
@@ -66,6 +81,24 @@ impl ToneMapper for ExtendedReinhard {
             *color = extended_reinhard(*color, white_squared);
         }
     }
+
+    #[inline]
+    fn map_planes_in_place(&self, colors: &mut LinearRGBPlanes) {
+        let white_squared = f64::from(self.white_point.level()).powi(2);
+        let simd_len = colors.len() / COLOR_LANES * COLOR_LANES;
+        extended_reinhard_batch(colors, white_squared);
+        colors.map_from(simd_len, self);
+    }
+}
+
+#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+fn extended_reinhard_batch(colors: &mut LinearRGBPlanes, white_squared: f64) {
+    let one = F64x4::splat(1.0);
+    let white_squared = F64x4::splat(white_squared);
+    map_colors(colors, |components| {
+        components
+            .map(|component| component * (one + component / white_squared) / (one + component))
+    });
 }
 
 #[inline]
@@ -96,7 +129,7 @@ impl ToneMapper for LuminanceReinhard {
     }
 }
 
-#[multiversion(targets("x86_64+avx2", "aarch64+neon"))]
+#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
 fn luminance_reinhard_batch(colors: &mut LinearRGBPlanes) {
     let one = F64x4::splat(1.0);
 
@@ -202,7 +235,7 @@ impl ToneMapper for ExtendedLuminanceReinhard {
     }
 }
 
-#[multiversion(targets("x86_64+avx2", "aarch64+neon"))]
+#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
 fn extended_luminance_reinhard_batch(colors: &mut LinearRGBPlanes, white_squared: f64) {
     let one = F64x4::splat(1.0);
     let white_squared = F64x4::splat(white_squared);
@@ -237,4 +270,31 @@ impl ToneMapper for ReinhardJodie {
 
         LinearRGB::displayable(blended)
     }
+
+    #[inline]
+    fn map_planes_in_place(&self, colors: &mut LinearRGBPlanes) {
+        let simd_len = colors.len() / COLOR_LANES * COLOR_LANES;
+        reinhard_jodie_batch(colors);
+        colors.map_from(simd_len, self);
+    }
+}
+
+#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+fn reinhard_jodie_batch(colors: &mut LinearRGBPlanes) {
+    let one = F64x4::splat(1.0);
+
+    map_colors(colors, |components| {
+        let luminance = F64x4::splat(super::REC709_LUMINANCE[0]) * components[0]
+            + F64x4::splat(super::REC709_LUMINANCE[1]) * components[1]
+            + F64x4::splat(super::REC709_LUMINANCE[2]) * components[2];
+
+        let luminance_scale = one / (one + luminance);
+        let component_mapped = components.map(|component| component / (one + component));
+        let luminance_mapped = components.map(|component| component * luminance_scale);
+
+        std::array::from_fn(|index| {
+            let weight = component_mapped[index];
+            luminance_mapped[index] * (one - weight) + component_mapped[index] * weight
+        })
+    });
 }

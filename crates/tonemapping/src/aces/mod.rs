@@ -65,7 +65,7 @@ fn aces_fitted(color: LinearRGB) -> LinearRGB {
     LinearRGB::displayable(multiply_rgb(ACES_OUTPUT_MATRIX, fitted))
 }
 
-#[multiversion(targets("x86_64+avx2", "aarch64+neon"))]
+#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
 fn aces_fitted_batch(colors: &mut [LinearRGB]) {
     let (chunks, tail) = colors.as_chunks_mut::<TONE_MAPPING_LANES>();
     debug_assert!(
@@ -116,7 +116,7 @@ fn aces_fitted_batch(colors: &mut [LinearRGB]) {
     }
 }
 
-#[multiversion(targets("x86_64+avx2", "aarch64+neon"))]
+#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
 fn aces_fitted_planes(colors: &mut LinearRGBPlanes) {
     map_colors(colors, |color| {
         let transformed = ACES_INPUT_MATRIX.map(|row| {
@@ -164,4 +164,28 @@ impl ToneMapper for ACESApproximate {
             exposed * (A * exposed + B) / (exposed * (C * exposed + D) + E)
         }))
     }
+
+    #[inline]
+    fn map_planes_in_place(&self, colors: &mut LinearRGBPlanes) {
+        let simd_len = colors.len() / TONE_MAPPING_LANES * TONE_MAPPING_LANES;
+        aces_approximate_planes(colors);
+        colors.map_from(simd_len, self);
+    }
+}
+
+#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+fn aces_approximate_planes(colors: &mut LinearRGBPlanes) {
+    let a = F64x4::splat(2.51);
+    let b = F64x4::splat(0.03);
+    let c = F64x4::splat(2.43);
+    let d = F64x4::splat(0.59);
+    let e = F64x4::splat(0.14);
+    let exposure = F64x4::splat(0.6);
+
+    map_colors(colors, |components| {
+        components.map(|component| {
+            let exposed = component * exposure;
+            exposed * (a * exposed + b) / (exposed * (c * exposed + d) + e)
+        })
+    });
 }

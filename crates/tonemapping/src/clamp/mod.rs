@@ -1,4 +1,7 @@
-use super::{LinearRGB, ToneMapper, WhitePoint, display_component_f32};
+use multiversion::multiversion;
+
+use super::{LinearRGB, LinearRGBPlanes, ToneMapper, WhitePoint, display_component_f32};
+use crate::simd::{COLOR_LANES, F64x4, map_colors};
 
 /// Clamps every component to the displayable range.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -16,6 +19,18 @@ impl ToneMapper for Clamp {
             *color = clamp_color(*color);
         }
     }
+
+    #[inline]
+    fn map_planes_in_place(&self, colors: &mut LinearRGBPlanes) {
+        let simd_len = colors.len() / COLOR_LANES * COLOR_LANES;
+        clamp_batch(colors);
+        colors.map_from(simd_len, self);
+    }
+}
+
+#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+fn clamp_batch(colors: &mut LinearRGBPlanes) {
+    map_colors(colors, |components| components);
 }
 
 #[inline]
@@ -49,4 +64,21 @@ impl ToneMapper for ScaledClamp {
         let divisor = f64::from(self.white_point.level());
         LinearRGB::displayable(color.components_f64().map(|component| component / divisor))
     }
+
+    #[inline]
+    fn map_planes_in_place(&self, colors: &mut LinearRGBPlanes) {
+        let divisor = f64::from(self.white_point.level());
+        let simd_len = colors.len() / COLOR_LANES * COLOR_LANES;
+        scaled_clamp_batch(colors, divisor);
+        colors.map_from(simd_len, self);
+    }
+}
+
+#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+fn scaled_clamp_batch(colors: &mut LinearRGBPlanes, divisor: f64) {
+    let divisor = F64x4::splat(divisor);
+
+    map_colors(colors, |components| {
+        components.map(|component| component / divisor)
+    });
 }

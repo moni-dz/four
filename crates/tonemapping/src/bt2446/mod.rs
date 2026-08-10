@@ -67,7 +67,7 @@ impl ToneMapper for BT2446A {
     }
 }
 
-#[multiversion(targets("x86_64+avx2", "aarch64+neon"))]
+#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
 fn bt2446a_batch(colors: &mut [LinearRGB]) {
     let (chunks, tail) = colors.as_chunks_mut::<BT2446_LANES>();
     debug_assert!(
@@ -90,7 +90,7 @@ fn bt2446a_batch(colors: &mut [LinearRGB]) {
     }
 }
 
-#[multiversion(targets("x86_64+avx2", "aarch64+neon"))]
+#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
 fn bt2446a_planes(colors: &mut LinearRGBPlanes) {
     let [red, green, blue] = colors.channels_mut();
     let [red_chunks, green_chunks, blue_chunks] = [red, green, blue].map(|channel| {
