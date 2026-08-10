@@ -22,9 +22,9 @@ const ACES_OUTPUT_MATRIX: [[f64; 3]; 3] = [
 /// This compact fit uses the article's linear sRGB input and output matrices. It is a practical
 /// filmic curve rather than a complete Academy Color Encoding System pipeline.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AcesFitted;
+pub struct ACESFitted;
 
-impl ToneMapper for AcesFitted {
+impl ToneMapper for ACESFitted {
     #[inline]
     fn map(&self, color: LinearRGB) -> LinearRGB {
         aces_fitted(color)

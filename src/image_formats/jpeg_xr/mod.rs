@@ -374,8 +374,10 @@ pub fn decode_with_metadata_and_options(
     decoder
         .copy_all(&mut source, row_stride)
         .map_err(|source| codec_error(&source))?;
+
     let normalized = normalize(&source, width, height, row_stride, layout, options)?;
     let metadata = JPEGXRMetadata::new(layout, normalized.hdr_metrics);
+
     Ok(DecodedJPEGXR {
         image: DecodedImage::new(width, height, normalized.rgba),
         metadata,
@@ -510,12 +512,14 @@ impl PixelLayout {
 
     fn read_pixel(self, pixel: &[u8]) -> Result<([f32; 3], f32)> {
         invariant_eq!(pixel.len(), self.bytes_per_pixel);
+
         if self.encoding == SampleEncoding::RGBE {
             return Ok((decode_rgbe(pixel)?, 1.0));
         }
 
         let sample = |channel: usize| -> Result<f32> {
             invariant!(channel < self.source_channels);
+
             let start = channel * self.encoding.bytes();
             let end = start + self.encoding.bytes();
             let bytes = pixel.get(start..end).ok_or_else(|| {
@@ -523,6 +527,7 @@ impl PixelLayout {
                     "JPEG XR sample exceeds its pixel stride",
                 ))
             })?;
+
             Ok(decode_sample(bytes, self.encoding))
         };
 
@@ -532,14 +537,17 @@ impl PixelLayout {
         } else {
             [sample(0)?, sample(1)?, sample(2)?]
         };
+
         if self.blue_first && self.color_channels == 3 {
             color.swap(0, 2);
         }
+
         let alpha = if self.has_alpha {
             normalize_alpha(sample(self.color_channels)?)
         } else {
             1.0
         };
+
         if self.premultiplied_alpha {
             if alpha > 0.0 {
                 color = color.map(|channel| channel / alpha);
@@ -547,6 +555,7 @@ impl PixelLayout {
                 color.fill(0.0);
             }
         }
+
         Ok((color, alpha))
     }
 }
@@ -555,6 +564,7 @@ fn sample_encoding(format: CodecPixelFormat, info: &PixelInfo) -> Result<SampleE
     if format == CodecPixelFormat::PixelFormat32bppRGBE {
         return Ok(SampleEncoding::RGBE);
     }
+
     if matches!(
         format,
         CodecPixelFormat::PixelFormat48bppRGBHalf
@@ -589,24 +599,30 @@ fn normalize(
 ) -> Result<NormalizedImage> {
     let width = usize::try_from(width).expect("validated JPEG XR width fits usize");
     let height = usize::try_from(height).expect("validated JPEG XR height fits usize");
+
     let expected_source_len = row_stride.checked_mul(height).ok_or_else(|| {
         error(JPEGXRError::Output(
             "JPEG XR source-buffer size exceeds usize",
         ))
     })?;
+
     if source.len() != expected_source_len {
         return Err(error(JPEGXRError::Output(
             "JPEG XR codec returned an incomplete source buffer",
         )));
     }
+
     let output_len = width
         .checked_mul(height)
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| error(JPEGXRError::Output("JPEG XR RGBA size exceeds usize")))?;
+
     let method = options.tone_mapping();
+
     let needs_hdr_analysis = options.includes_hdr_metrics()
         || method.uses_white_point()
         || method.uses_luminance_white_point();
+
     let analysis = if layout.encoding.is_hdr() && needs_hdr_analysis {
         Some(HDRAnalysis::estimate(
             source,
@@ -620,8 +636,10 @@ fn normalize(
     } else {
         None
     };
+
     let hdr_metrics = analysis.and_then(|analysis| analysis.hdr_metrics);
     let mut rgba = vec![0; output_len];
+
     let has_nonzero_alpha = if layout.encoding.is_hdr() {
         if method == ToneMappingMethod::Clamp {
             write_pixel_slabs(source, width, row_stride, &mut rgba, |source, rgba| {
@@ -631,10 +649,13 @@ fn normalize(
             let white_point = analysis
                 .and_then(|analysis| analysis.max_cll)
                 .map_or_else(display_white_point, hdr_white_point);
+
             let luminance_white_point = analysis
                 .and_then(|analysis| analysis.luminance_white_point)
                 .map_or_else(display_luminance_white_point, hdr_luminance_white_point);
+
             let mapper = method.resolve(white_point, luminance_white_point);
+
             write_pixel_slabs(source, width, row_stride, &mut rgba, |source, rgba| {
                 write_hdr_pixels(source, width, row_stride, layout, &mapper, rgba)
             })?
@@ -644,6 +665,7 @@ fn normalize(
             write_sdr_pixels(source, width, row_stride, layout, rgba)
         })?
     };
+
     if layout.encoding.is_hdr()
         && layout.has_alpha
         && !layout.premultiplied_alpha
@@ -653,6 +675,7 @@ fn normalize(
             *alpha = u8::MAX;
         }
     }
+
     invariant_eq!(rgba.len(), output_len);
     Ok(NormalizedImage { rgba, hdr_metrics })
 }
@@ -665,9 +688,11 @@ fn write_pixel_slabs(
     writer: impl Fn(&[u8], &mut [u8]) -> Result<bool> + Sync,
 ) -> Result<bool> {
     let row_count = source.len() / row_stride;
+
     let pixel_count = width
         .checked_mul(row_count)
         .expect("validated JPEG XR pixel count fits usize");
+
     if pixel_count < PARALLEL_PIXELS_MIN {
         return writer(source, rgba);
     }
@@ -675,6 +700,7 @@ fn write_pixel_slabs(
     let rows_per_job = PARALLEL_PIXELS_PER_JOB.div_ceil(width);
     let source_bytes_per_job = rows_per_job * row_stride;
     let rgba_bytes_per_job = rows_per_job * width * 4;
+
     source
         .par_chunks(source_bytes_per_job)
         .zip(rgba.par_chunks_mut(rgba_bytes_per_job))
@@ -695,15 +721,20 @@ fn write_sdr_pixels(
         .zip(rgba.chunks_exact_mut(width * 4))
     {
         let (targets, remainder) = target_row.as_chunks_mut::<4>();
+
         invariant!(remainder.is_empty());
+
         for (x, target) in targets.iter_mut().enumerate() {
             let pixel = pixel_at(row, x, layout)?;
             let (color, alpha) = layout.read_pixel(pixel)?;
+
             has_nonzero_alpha |= alpha > 0.0;
+
             let color = color.map(normalized_to_u8);
             target.copy_from_slice(&[color[0], color[1], color[2], normalized_to_u8(alpha)]);
         }
     }
+
     Ok(has_nonzero_alpha)
 }
 
@@ -721,11 +752,15 @@ fn write_hdr_pixels_scalar(
         .zip(rgba.chunks_exact_mut(width * 4))
     {
         let (targets, remainder) = target_row.as_chunks_mut::<4>();
+
         invariant!(remainder.is_empty());
+
         for (x, target) in targets.iter_mut().enumerate() {
             let pixel = pixel_at(row, x, layout)?;
             let (color, alpha) = layout.read_pixel(pixel)?;
+
             has_nonzero_alpha |= alpha > 0.0;
+
             let color = display_linear_to_srgb8(mapper.map(LinearRGB::new(color)));
             target.copy_from_slice(&[color[0], color[1], color[2], normalized_to_u8(alpha)]);
         }
@@ -742,9 +777,11 @@ fn write_hdr_pixels(
     rgba: &mut [u8],
 ) -> Result<bool> {
     let row_count = source.len() / row_stride;
+
     let pixel_count = width
         .checked_mul(row_count)
         .expect("validated JPEG XR pixel count fits usize");
+
     let batch_capacity = HDR_BATCH_PIXELS.min(pixel_count);
     let mut colors = Vec::with_capacity(batch_capacity);
     let mut alphas = Vec::with_capacity(batch_capacity);
@@ -755,7 +792,9 @@ fn write_hdr_pixels(
         for x in 0..width {
             let pixel = pixel_at(row, x, layout)?;
             let (color, alpha) = layout.read_pixel(pixel)?;
+
             has_nonzero_alpha |= alpha > 0.0;
+
             colors.push(LinearRGB::new(color));
             alphas.push(normalized_to_u8(alpha));
 
@@ -1090,6 +1129,7 @@ impl LuminanceWhitePointEstimator {
     fn new(pixel_count: usize) -> Self {
         invariant!(pixel_count > 0);
         let retained = pixel_count / 10_000 + 1;
+
         Self {
             retained,
             luminances: BinaryHeap::with_capacity(retained),
@@ -1098,6 +1138,7 @@ impl LuminanceWhitePointEstimator {
 
     fn observe(&mut self, color: LinearRGB) {
         let luminance = OrderedLuminance(color.luminance());
+
         if self.luminances.len() < self.retained {
             self.luminances.push(Reverse(luminance));
         } else if let Some(mut threshold) = self.luminances.peek_mut()
@@ -1200,6 +1241,7 @@ fn gamut_membership(color: [f64; 3]) -> GamutMembership {
         0.033_199_51 * color[0] + 0.966_783_50 * color[1],
         0.017_085_35 * color[0] + 0.072_395_72 * color[1] + 0.910_301_48 * color[2],
     ];
+
     if display_p3.iter().all(|channel| *channel >= -epsilon) {
         GamutMembership::DisplayP3Only
     } else {
@@ -1232,6 +1274,7 @@ fn nonnegative_f64_to_f32(value: f64) -> f32 {
 fn percentage(part: u64, total: u64) -> f32 {
     invariant!(part <= total);
     invariant!(total > 0);
+
     let part = u32::try_from(part).expect("the bounded JPEG XR pixel count fits u32");
     let total = u32::try_from(total).expect("the bounded JPEG XR pixel count fits u32");
     percentage_from_u32(part, total)
@@ -1292,8 +1335,8 @@ fn visible_alpha_pixel_count(
     layout: PixelLayout,
 ) -> Result<usize> {
     invariant!(layout.has_alpha);
-
     let mut visible_pixels = 0_usize;
+
     visit_pixels(source, row_stride, layout, |_color, alpha| {
         if alpha > 0.0 {
             visible_pixels = visible_pixels
@@ -1301,6 +1344,7 @@ fn visible_alpha_pixel_count(
                 .expect("validated JPEG XR pixel count fits usize");
         }
     })?;
+
     Ok(visible_pixels)
 }
 
@@ -1338,12 +1382,8 @@ fn decode_sample(bytes: &[u8], encoding: SampleEncoding) -> f32 {
     invariant_eq!(bytes.len(), encoding.bytes());
 
     match encoding {
-        SampleEncoding::Unsigned8 => {
-            f32::from(read_sample::<u8>(bytes)) / f32::from(u8::MAX)
-        }
-        SampleEncoding::Unsigned16 => {
-            f32::from(read_sample::<u16>(bytes)) / f32::from(u16::MAX)
-        }
+        SampleEncoding::Unsigned8 => f32::from(read_sample::<u8>(bytes)) / f32::from(u8::MAX),
+        SampleEncoding::Unsigned16 => f32::from(read_sample::<u16>(bytes)) / f32::from(u16::MAX),
         SampleEncoding::Fixed16 => f32::from(read_sample::<i16>(bytes)) / 8192.0,
         SampleEncoding::Fixed32 => fixed32_to_f32(read_sample::<i32>(bytes)),
         SampleEncoding::Float16 => half_to_f32(read_sample::<u16>(bytes)),
@@ -1456,7 +1496,7 @@ fn codec_error(source: &JXRError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tonemapping::{AcesFitted, BT2446A, ExtendedLuminanceReinhard, ExtendedReinhard};
+    use tonemapping::{ACESFitted, BT2446A, ExtendedLuminanceReinhard, ExtendedReinhard};
 
     fn float_rgb_layout() -> PixelLayout {
         PixelLayout {
@@ -1567,7 +1607,7 @@ mod tests {
             &colors,
             512,
             ToneMappingMethod::ACESFitted,
-            &AcesFitted,
+            &ACESFitted,
         );
     }
 
@@ -1607,8 +1647,10 @@ mod tests {
             ToneMappingMethod::ExtendedLuminanceReinhard,
         ] {
             let options = DecodeOptions::new(method, MaxCllMode::Percentile99_99);
+
             let with_metrics = normalize(&source, 2, 1, row_stride, layout, options)
                 .expect("synthetic HDR pixels normalize with metrics");
+
             let without_metrics = normalize(
                 &source,
                 2,
@@ -1673,6 +1715,7 @@ mod tests {
     fn extended_luminance_method_uses_the_luminance_white_point() {
         let color = [4.0, 2.0, 1.0];
         let source = float_rgb_source(&[color]);
+
         let metrics = HDRMetrics::estimate(
             &source,
             source.len(),
@@ -1681,9 +1724,11 @@ mod tests {
             true,
         )
         .unwrap();
+
         let white_point = metrics
             .luminance_white_point
             .expect("a nonblack HDR pixel has a luminance white point");
+
         let mapper = ExtendedLuminanceReinhard::new(white_point);
         let expected = hdr_to_srgb8(color, &mapper);
         let actual = normalize_float_rgb(&[color], 1, ToneMappingMethod::ExtendedLuminanceReinhard);
@@ -1698,6 +1743,7 @@ mod tests {
             relative_light_level: 1.0,
             channel: JPEGXRColorChannel::Red,
         };
+
         let hdr = MaxCll {
             relative_light_level: 4.0,
             channel: JPEGXRColorChannel::Red,
@@ -1708,6 +1754,7 @@ mod tests {
 
         let colors = [[0.25, 0.5, 1.0]];
         let expected = normalize_float_rgb(&colors, 1, ToneMappingMethod::Clamp);
+
         for method in [
             ToneMappingMethod::ScaledClamp,
             ToneMappingMethod::ExtendedReinhard,
@@ -1715,6 +1762,7 @@ mod tests {
         ] {
             assert_eq!(normalize_float_rgb(&colors, 1, method), expected);
         }
+
         assert_ne!(
             normalize_float_rgb(&colors, 1, ToneMappingMethod::Reinhard),
             expected
@@ -1725,6 +1773,7 @@ mod tests {
     fn max_cll_rejects_the_brightest_point_zero_one_percent() {
         let layout = float_rgb_layout();
         let mut source = Vec::with_capacity(10_000 * layout.bytes_per_pixel);
+
         source.extend(
             std::iter::repeat_n(1.0_f32, 9_998)
                 .chain([4.0, 126.0])
@@ -1740,6 +1789,7 @@ mod tests {
             false,
         )
         .unwrap();
+
         let metadata = JPEGXRMetadata::new(layout, Some(metrics));
 
         assert_eq!(metrics.max_cll.nits(), 320.0);
@@ -1805,7 +1855,9 @@ mod tests {
         let colors: Vec<_> = std::iter::repeat_n([1.0_f32; 3], 9_998)
             .chain([[4.0; 3], [126.0; 3]])
             .collect();
+
         let source = float_rgb_source(&colors);
+
         let metrics = HDRMetrics::estimate(
             &source,
             source.len(),
@@ -1831,7 +1883,9 @@ mod tests {
             [-1.0, 0.0, 0.0],
             [-0.000_000_5, 0.0, 0.0],
         ];
+
         let source = float_rgb_source(&colors);
+
         let metrics = HDRMetrics::estimate(
             &source,
             source.len(),
@@ -1851,6 +1905,7 @@ mod tests {
     #[test]
     fn max_cll_reports_the_winning_color_channel() {
         let source = float_rgb_source(&[[1.0, 2.0, 5.0]]);
+
         let metrics = HDRMetrics::estimate(
             &source,
             source.len(),
@@ -1859,6 +1914,7 @@ mod tests {
             false,
         )
         .unwrap();
+
         let metadata = JPEGXRMetadata::new(float_rgb_layout(), Some(metrics));
 
         assert_eq!(metadata.max_cll_scrgb(), Some(5.0));
@@ -1872,6 +1928,7 @@ mod tests {
     #[test]
     fn max_cll_preserves_float32_levels_above_binary16_range() {
         let source = float_rgb_source(&[[70_000.0, 0.0, 100_000.0]]);
+
         let metrics = HDRMetrics::estimate(
             &source,
             source.len(),
@@ -1880,6 +1937,7 @@ mod tests {
             false,
         )
         .unwrap();
+
         let metadata = JPEGXRMetadata::new(float_rgb_layout(), Some(metrics));
 
         assert_eq!(metadata.max_cll_scrgb(), Some(100_000.0));
@@ -1890,6 +1948,7 @@ mod tests {
     #[test]
     fn normalization_quantizes_alpha_to_eight_bits() {
         let layout = float_rgba_layout();
+
         let source: Vec<u8> = std::iter::repeat_n([0.01_f32, 0.01, 0.01, 0.5], 16)
             .flatten()
             .flat_map(f32::to_ne_bytes)
@@ -1915,7 +1974,9 @@ mod tests {
                 _ => [1.0, 3.0, 0.75],
             })
             .collect();
+
         let extended = ExtendedReinhard::new(WhitePoint::new(4.0).unwrap());
+
         assert_hdr_normalization_matches_scalar(
             &extended_colors,
             WIDTH,
@@ -1930,6 +1991,7 @@ mod tests {
                 _ => [0.01, 0.02, 0.03],
             })
             .collect();
+
         assert_hdr_normalization_matches_scalar(
             &clamp_colors,
             WIDTH,
@@ -1960,6 +2022,7 @@ mod tests {
                 [color[0], color[1], color[2], alpha]
             })
             .collect();
+
         let layout = float_rgba_layout();
         let source = float_rgba_source(&pixels);
         let row_stride = WIDTH * layout.bytes_per_pixel;
@@ -1967,6 +2030,7 @@ mod tests {
 
         let has_nonzero_alpha =
             append_hdr_pixels(&source, WIDTH, row_stride, layout, &Clamp, &mut actual).unwrap();
+
         let expected: Vec<_> = pixels
             .iter()
             .copied()
@@ -1983,6 +2047,7 @@ mod tests {
     #[test]
     fn positive_hdr_alpha_below_one_byte_step_does_not_become_opaque() {
         let layout = float_rgba_layout();
+
         let source =
             float_rgba_source(&[[0.5, 0.5, 0.5, f32::from_bits(1)], [0.25, 0.25, 0.25, 0.0]]);
 
@@ -2029,6 +2094,7 @@ mod tests {
             false,
         )
         .unwrap();
+
         let rgba = normalize(&source, 2, 1, 32, layout, DecodeOptions::default())
             .unwrap()
             .rgba;

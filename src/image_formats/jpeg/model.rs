@@ -16,7 +16,7 @@ const PARALLEL_BLOCKS_PER_JOB: usize = 1_024;
 #[derive(Clone, Copy)]
 pub(super) enum ColorTransform {
     YCbCr,
-    Rgb,
+    RGB,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,9 +152,12 @@ impl Frame {
         invariant!(u64::from(self.width) * u64::from(self.height) <= PIXELS_MAX);
 
         let byte_count = u64::from(self.width) * u64::from(self.height) * 4;
+
         let capacity = usize::try_from(byte_count)
             .expect("the decoded pixel limit fits every supported pointer width");
+
         let pixel_count = capacity / 4;
+
         let rgba = if pixel_count >= PARALLEL_PIXELS_MIN {
             self.rgba_pixels_parallel(transform, capacity)
         } else {
@@ -206,12 +209,15 @@ impl Frame {
         invariant!(y < self.height);
 
         let component = &self.components[component_index];
+
         let sample_x =
             x * u32::from(component.horizontal_sampling) / u32::from(self.max_horizontal_sampling);
         let sample_y =
             y * u32::from(component.vertical_sampling) / u32::from(self.max_vertical_sampling);
+
         let index = u64::from(sample_y) * u64::from(component.plane_width) + u64::from(sample_x);
         let index = usize::try_from(index).expect("the bounded component plane index fits usize");
+
         component.plane[index]
     }
 }
@@ -223,11 +229,13 @@ fn materialize_component_sequential(
     for block_index_usize in 0..component.coefficients.len() {
         let block_index =
             u32::try_from(block_index_usize).expect("the bounded component block count fits u32");
+
         let quantized = component.coefficients[block_index_usize];
         let coefficients = dequantize_block(&quantized, quantization)?;
         let samples = idct::inverse(&coefficients);
         let block_x = block_index % component.block_columns;
         let block_y = block_index / component.block_columns;
+
         write_block(component, block_x, block_y, &samples);
     }
     Ok(())
@@ -239,8 +247,10 @@ fn materialize_component_parallel(
 ) -> Result<()> {
     let block_columns = usize::try_from(component.block_columns)
         .expect("the bounded component block width fits usize");
+
     let plane_width = usize::try_from(component.plane_width)
         .expect("the bounded component plane width fits usize");
+
     let block_side = usize::try_from(BLOCK_SIDE).expect("JPEG block side fits usize");
     let plane_bytes_per_block_row = plane_width * block_side;
     let block_rows_per_job = PARALLEL_BLOCKS_PER_JOB.div_ceil(block_columns);
@@ -264,9 +274,11 @@ fn materialize_component_parallel(
 fn write_block_row(plane: &mut [u8], plane_width: usize, block_x: usize, samples: &[u8; 64]) {
     let block_side = usize::try_from(BLOCK_SIDE).expect("JPEG block side fits usize");
     let pixel_x = block_x * block_side;
+
     for y in 0..block_side {
         let target_start = y * plane_width + pixel_x;
         let source_start = y * block_side;
+
         plane[target_start..target_start + block_side]
             .copy_from_slice(&samples[source_start..source_start + block_side]);
     }
@@ -302,13 +314,16 @@ pub(super) fn write_block(
         let target_start =
             u64::from(pixel_y + y) * u64::from(component.plane_width) + u64::from(pixel_x);
         let target_end = target_start + u64::from(BLOCK_SIDE);
+
         let source_start =
             usize::try_from(y * BLOCK_SIDE).expect("an eight-row JPEG block always fits usize");
         let source_end = source_start + BLOCK_SIDE as usize;
+
         let target_start =
             usize::try_from(target_start).expect("the bounded component plane offset fits usize");
         let target_end =
             usize::try_from(target_end).expect("the bounded component plane offset fits usize");
+
         component.plane[target_start..target_end]
             .copy_from_slice(&samples[source_start..source_end]);
     }
@@ -339,6 +354,7 @@ fn validate_progressive_storage(
             * u64::from(component.horizontal_sampling)
             * u64::from(layout.mcu_rows)
             * u64::from(component.vertical_sampling);
+
         let component_bytes = blocks * 64 * size_of::<i32>() as u64;
 
         byte_count.checked_add(component_bytes).ok_or_raise(|| {
@@ -365,31 +381,39 @@ fn allocate_component_storage(
         .mcu_columns
         .checked_mul(u32::from(component.horizontal_sampling))
         .ok_or_raise(|| JPEGError::ArithmeticOverflow("component block width overflowed"))?;
+
     let block_rows = layout
         .mcu_rows
         .checked_mul(u32::from(component.vertical_sampling))
         .ok_or_raise(|| JPEGError::ArithmeticOverflow("component block height overflowed"))?;
+
     let plane_width = block_columns
         .checked_mul(BLOCK_SIDE)
         .ok_or_raise(|| JPEGError::ArithmeticOverflow("component plane width overflowed"))?;
+
     let plane_height = block_rows
         .checked_mul(BLOCK_SIDE)
         .ok_or_raise(|| JPEGError::ArithmeticOverflow("component plane height overflowed"))?;
+
     let sample_count = plane_width
         .checked_mul(plane_height)
         .ok_or_raise(|| JPEGError::ArithmeticOverflow("component plane size overflowed"))?;
+
     let data_width = layout
         .width
         .checked_mul(u32::from(component.horizontal_sampling))
         .ok_or_raise(|| JPEGError::ArithmeticOverflow("component data width overflowed"))?;
+
     let data_height = layout
         .height
         .checked_mul(u32::from(component.vertical_sampling))
         .ok_or_raise(|| JPEGError::ArithmeticOverflow("component data height overflowed"))?;
+
     let data_block_columns = divide_ceil(
         data_width,
         u32::from(layout.max_horizontal_sampling) * BLOCK_SIDE,
     );
+
     let data_block_rows = divide_ceil(
         data_height,
         u32::from(layout.max_vertical_sampling) * BLOCK_SIDE,
@@ -401,19 +425,21 @@ fn allocate_component_storage(
     component.block_rows = block_rows;
     component.data_block_columns = data_block_columns;
     component.data_block_rows = data_block_rows;
+
     if layout.process == CodingProcess::Progressive {
         let block_count = block_columns.checked_mul(block_rows).ok_or_raise(|| {
             JPEGError::ArithmeticOverflow("component coefficient count overflowed")
         })?;
         component.coefficients = vec![[0; 64]; block_count as usize];
     }
+
     invariant_eq!(component.plane.len(), sample_count as usize);
     Ok(())
 }
 
 fn convert_color(first: u8, second: u8, third: u8, transform: ColorTransform) -> [u8; 4] {
     match transform {
-        ColorTransform::Rgb => [first, second, third, 255],
+        ColorTransform::RGB => [first, second, third, 255],
         ColorTransform::YCbCr => {
             let luminance = f32::from(first);
             let blue_difference = f32::from(second) - 128.0;
@@ -463,6 +489,7 @@ mod tests {
     fn component(width: u32, height: u32, value: impl Fn(usize) -> u8) -> FrameComponent {
         let sample_count = usize::try_from(u64::from(width) * u64::from(height))
             .expect("test sample count fits usize");
+
         FrameComponent {
             identifier: 1,
             horizontal_sampling: 1,
@@ -495,6 +522,7 @@ mod tests {
         let mut component = component(width, height, |_| 0);
         let block_count = usize::try_from(component.block_columns * component.block_rows)
             .expect("test block count fits usize");
+
         component.coefficients = vec![coefficients; block_count];
         component
     }
@@ -503,9 +531,11 @@ mod tests {
     fn parallel_pixel_materialization_preserves_grayscale_order() {
         let width = 512;
         let height = 512;
+
         let component = component(width, height, |index| {
             u8::try_from(index % 256).expect("test sample fits u8")
         });
+
         let expected: Vec<_> = component
             .plane
             .iter()
@@ -513,7 +543,7 @@ mod tests {
             .flat_map(|sample| [sample, sample, sample, 255])
             .collect();
 
-        let image = frame(width, height, vec![component]).into_image(ColorTransform::Rgb);
+        let image = frame(width, height, vec![component]).into_image(ColorTransform::RGB);
 
         assert_eq!(image.rgba8(), expected);
     }
@@ -522,19 +552,24 @@ mod tests {
     fn parallel_progressive_materialization_writes_complete_block_rows() {
         let width = 512;
         let height = 512;
+
         let mut component = progressive_component(width, height, [0; 64]);
         for (index, coefficients) in component.coefficients.iter_mut().enumerate() {
             coefficients[0] = i32::try_from(index % 16 * 8).expect("test coefficient fits i32");
         }
+
         let block_columns = component.block_columns;
+
         let mut frame = frame(width, height, vec![component]);
         frame.process = CodingProcess::Progressive;
+
         let mut quantization = [None; COMPONENTS_MAX];
         quantization[0] = Some([1; 64]);
 
         frame.materialize_progressive(&quantization).unwrap();
 
         assert_eq!(frame.components[0].coefficients.len(), 0);
+
         for y in 0..height {
             for x in 0..width {
                 let block_index = y / BLOCK_SIDE * block_columns + x / BLOCK_SIDE;

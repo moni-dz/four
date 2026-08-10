@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use mimalloc::MiMalloc;
 use tonemapping::{
-    AcesFitted, Clamp, ExtendedReinhard, LinearRGB, MaxCllEstimator, ToneMapper, WhitePoint,
+    ACESFitted, Clamp, ExtendedReinhard, LinearRGB, MaxCllEstimator, ToneMapper, WhitePoint,
 };
 
 #[global_allocator]
@@ -27,7 +27,7 @@ fn main() {
         ExtendedReinhard::new(WhitePoint::new(16.0).expect("benchmark white is positive"));
     benchmark_mapper("Extended Reinhard", &extended, &colors, iterations);
     benchmark_mapper("clamp", &Clamp, &colors, iterations);
-    benchmark_mapper("fitted ACES", &AcesFitted, &colors, iterations);
+    benchmark_mapper("fitted ACES", &ACESFitted, &colors, iterations);
     benchmark_max_cll(&colors, iterations);
 }
 

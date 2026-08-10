@@ -224,7 +224,7 @@ impl Root {
 
         invariant!(position.x >= px(0.0));
         invariant!(position.y >= px(DRAG_REGION_HEIGHT));
-        
+
         self.tone_mapping_menu_open = false;
         self.context_menu_position = Some(position);
     }
@@ -248,7 +248,7 @@ impl Root {
         active_options: HDROptions,
     ) -> Option<LoadRequest> {
         self.preferred_hdr_options = options;
-        
+
         if options == active_options {
             if self.pending_hdr_options.take().is_some() {
                 let _cancelled_request = self.begin_load_request();
@@ -256,7 +256,7 @@ impl Root {
             }
             return None;
         }
-        
+
         if self
             .pending_hdr_options
             .is_some_and(|(_, pending_options)| pending_options == options)
@@ -345,7 +345,7 @@ impl Root {
                     )
                 })
                 .await;
-            
+
             let _ = root.update_in(cx, move |root, window, cx| {
                 let next = root.decode_coordinator.complete(request);
                 if root.hdr_metrics_request == Some(request) {
@@ -404,20 +404,20 @@ impl Root {
             .viewer
             .displayed()
             .and_then(|displayed| displayed.hdr_options);
-        
+
         let resolved_options = result
             .as_ref()
             .ok()
             .and_then(|loaded| loaded.displayed.hdr_options)
             .or(displayed_options);
-        
+
         self.viewer.apply_result(result);
-        
+
         self.pending_hdr_options = None;
         if let Some(options) = resolved_options {
             self.preferred_hdr_options = options;
         }
-        
+
         self.tone_mapping_menu_open = false;
 
         invariant!(!self.viewer.status().is_empty());
@@ -842,24 +842,24 @@ impl Render for Root {
         let context_menu_position = self.context_menu_position;
         let displayed = self.viewer.displayed().cloned();
         let has_image = displayed.is_some();
-        
+
         let image = displayed
             .as_ref()
             .map(|displayed| Arc::clone(&displayed.image));
-        
+
         let metadata = displayed
             .as_ref()
             .map(|displayed| Arc::clone(&displayed.metadata));
-        
+
         let active_hdr_options = displayed
             .as_ref()
             .and_then(|displayed| displayed.hdr_options);
-        
+
         let hdr_options = active_hdr_options.map(|active_options| {
             self.pending_hdr_options
                 .map_or(active_options, |(_, pending_options)| pending_options)
         });
-        
+
         let metadata_visible = self.metadata_visible;
         let tone_mapping_menu_open = self.tone_mapping_menu_open;
         let status = self.viewer.status().clone();
@@ -1044,12 +1044,12 @@ mod tests {
             request: LoadRequest(1),
             payload: "first",
         };
-        
+
         let second = DecodeJob {
             request: LoadRequest(2),
             payload: "second",
         };
-        
+
         let latest = DecodeJob {
             request: LoadRequest(3),
             payload: "latest",
@@ -1058,7 +1058,7 @@ mod tests {
         let started = coordinator
             .submit(first)
             .expect("the first request starts immediately");
-        
+
         assert_eq!(started.payload, "first");
         assert!(coordinator.submit(second).is_none());
         assert!(coordinator.submit(latest).is_none());
@@ -1066,7 +1066,7 @@ mod tests {
         let started = coordinator
             .complete(LoadRequest(1))
             .expect("the latest waiting request starts next");
-        
+
         assert_eq!(started.request, LoadRequest(3));
         assert_eq!(started.payload, "latest");
         assert!(coordinator.complete(LoadRequest(3)).is_none());
@@ -1075,12 +1075,12 @@ mod tests {
     #[test]
     fn load_coordinator_can_discard_waiting_work_without_cancelling_active_work() {
         let mut coordinator = LatestLoadCoordinator::new();
-        
+
         let active = DecodeJob {
             request: LoadRequest(1),
             payload: "active",
         };
-        
+
         let waiting = DecodeJob {
             request: LoadRequest(2),
             payload: "waiting",
@@ -1169,11 +1169,11 @@ mod tests {
         let active = HDROptions::default();
         let selected = active.with_tone_mapping(ToneMappingMethod::ACESFitted);
         let mut root = Root::new(loaded_hdr_viewer(active));
-        
+
         let request = root
             .begin_hdr_options_selection(selected, active)
             .expect("different HDR options start a request");
-        
+
         let error = LoadError::new("HDR options reload failed").raise();
 
         assert_eq!(root.preferred_hdr_options, selected);
@@ -1192,7 +1192,7 @@ mod tests {
         let mut root = Root::new(ViewerState::empty());
         let active = HDROptions::default();
         let true_maximum = active.with_max_cll_mode(MaxCllMode::TrueMaximum);
-        
+
         let max_cll_request = root
             .begin_hdr_options_selection(true_maximum, active)
             .expect("a MaxCLL change starts a request");
@@ -1200,7 +1200,7 @@ mod tests {
         let combined = root
             .preferred_hdr_options
             .with_tone_mapping(ToneMappingMethod::ACESFitted);
-        
+
         let combined_request = root
             .begin_hdr_options_selection(combined, active)
             .expect("a composed HDR option change starts a new request");

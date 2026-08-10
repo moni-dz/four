@@ -364,7 +364,7 @@ impl<'a, State> Parser<'a, State> {
 
         if marker == 0xee && bytes.starts_with(b"Adobe") && bytes.len() >= 12 {
             self.color_transform = match bytes[11] {
-                0 => ColorTransform::Rgb,
+                0 => ColorTransform::RGB,
                 1 => ColorTransform::YCbCr,
                 value => {
                     return Err(error(JPEGError::Unsupported(
@@ -548,7 +548,7 @@ impl<State: FramePhase> Parser<'_, State> {
         let entropy = self.reader.remaining_slice();
         let conditioning = self.arithmetic_conditioning;
         let frame = &mut self.state.data_mut().frame;
-        
+
         arithmetic::decode_sequential(entropy, frame, &plans, &conditioning, self.restart_interval)
     }
 
@@ -563,6 +563,7 @@ impl<State: FramePhase> Parser<'_, State> {
         let entropy = self.reader.remaining_slice();
         let conditioning = self.arithmetic_conditioning;
         let frame = &mut self.state.data_mut().frame;
+
         arithmetic::decode_progressive(
             entropy,
             frame,
@@ -673,6 +674,7 @@ impl<State: FramePhase> Parser<'_, State> {
 
             let table_index =
                 self.state.data().frame.components[component.frame_index].quantization_table;
+
             snapshots[component.frame_index] =
                 Some(self.quantization_tables[table_index].ok_or_raise(|| {
                     JPEGError::Table(

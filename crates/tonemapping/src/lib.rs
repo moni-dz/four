@@ -9,7 +9,7 @@
 //!
 //! [`Clamp`] and [`ScaledClamp`] provide clipping baselines. The Reinhard family includes
 //! component-wise, luminance-preserving, white-point, and Reinhard-Jodie variants. [`BT2446A`]
-//! applies the standardized HDR-to-SDR conversion Method A. [`Hable`], [`AcesFitted`], and
+//! applies the standardized HDR-to-SDR conversion Method A. [`Hable`], [`ACESFitted`], and
 //! [`AcesApproximate`] provide filmic curves. [`ToneMappingMethod`] enumerates the built-in
 //! operator families.
 //!
@@ -324,7 +324,7 @@ define_tone_mapping_methods! {
     /// Applies the fitted ACES reference and display transform.
     ACESFitted {
         label: "ACES fitted",
-        mapper: AcesFitted = |_, _| AcesFitted,
+        mapper: ACESFitted = |_, _| ACESFitted,
         uses_luminance_white_point: false,
     }
     /// Applies the scalar ACES curve approximation.
@@ -698,7 +698,7 @@ mod hable;
 mod reinhard;
 
 #[doc(inline)]
-pub use aces::{AcesApproximate, AcesFitted};
+pub use aces::{ACESFitted, AcesApproximate};
 #[doc(inline)]
 pub use bt2446::BT2446A;
 pub use clamp::{Clamp, ScaledClamp};
@@ -869,7 +869,7 @@ mod tests {
     fn bulk_mapping_matches_scalar_mapping_at_simd_boundaries() {
         let inputs = batch_inputs();
         let extended = ExtendedReinhard::new(WhitePoint::new(4.0).unwrap());
-        let mappers: [&dyn ToneMapper; 3] = [&Clamp, &extended, &AcesFitted];
+        let mappers: [&dyn ToneMapper; 3] = [&Clamp, &extended, &ACESFitted];
 
         for mapper in mappers {
             for length in [0, 1, 3, 4, 5, 7, 8, 9, 17] {
@@ -949,7 +949,7 @@ mod tests {
             &ReinhardJodie,
             &BT2446A,
             &Hable,
-            &AcesFitted,
+            &ACESFitted,
             &AcesApproximate,
         ];
 
@@ -1052,15 +1052,15 @@ mod tests {
     #[test]
     fn aces_fitted_uses_the_reference_matrix_orientation() {
         assert_components_close(
-            AcesFitted.map(LinearRGB::new([1.0, 0.0, 0.0])),
+            ACESFitted.map(LinearRGB::new([1.0, 0.0, 0.0])),
             [0.688_027_86, 0.0, 0.002_639_006_8],
         );
         assert_components_close(
-            AcesFitted.map(LinearRGB::new([0.0, 1.0, 0.0])),
+            ACESFitted.map(LinearRGB::new([0.0, 1.0, 0.0])),
             [0.101_613_28, 0.623_659, 0.028_843_72],
         );
         assert_components_close(
-            AcesFitted.map(LinearRGB::new([0.0, 0.0, 1.0])),
+            ACESFitted.map(LinearRGB::new([0.0, 0.0, 1.0])),
             [0.0, 0.0, 0.601_758_84],
         );
     }
