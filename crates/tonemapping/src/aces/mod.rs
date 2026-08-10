@@ -1,7 +1,8 @@
 use multiversion::multiversion;
 use std::simd::{Select, Simd, cmp::SimdPartialOrd, num::SimdFloat};
 
-use super::{LinearRGB, ToneMapper};
+use super::{LinearRGB, LinearRGBPlanes, ToneMapper};
+use crate::simd::map_colors;
 
 const TONE_MAPPING_LANES: usize = 4;
 type F64x4 = Simd<f64, TONE_MAPPING_LANES>;
@@ -34,12 +35,21 @@ impl ToneMapper for ACESFitted {
     fn map_in_place(&self, colors: &mut [LinearRGB]) {
         let simd_len = colors.len() / TONE_MAPPING_LANES * TONE_MAPPING_LANES;
         let (simd_colors, tail) = colors.split_at_mut(simd_len);
+
         if !simd_colors.is_empty() {
             aces_fitted_batch(simd_colors);
         }
+
         for color in tail {
             *color = aces_fitted(*color);
         }
+    }
+
+    #[inline]
+    fn map_planes_in_place(&self, colors: &mut LinearRGBPlanes) {
+        let simd_len = colors.len() / TONE_MAPPING_LANES * TONE_MAPPING_LANES;
+        aces_fitted_planes(colors);
+        colors.map_from(simd_len, self);
     }
 }
 
@@ -49,6 +59,7 @@ fn aces_fitted(color: LinearRGB) -> LinearRGB {
     let fitted = transformed.map(|component| {
         let numerator = component * (component + 0.024_578_6) - 0.000_090_537;
         let denominator = component * (0.983_729 * component + 0.432_951) + 0.238_081;
+
         numerator / denominator
     });
     LinearRGB::displayable(multiply_rgb(ACES_OUTPUT_MATRIX, fitted))
@@ -77,9 +88,11 @@ fn aces_fitted_batch(colors: &mut [LinearRGB]) {
         let fitted = transformed.map(|component| {
             let numerator =
                 component * (component + F64x4::splat(0.024_578_6)) - F64x4::splat(0.000_090_537);
+
             let denominator = component
                 * (F64x4::splat(0.983_729) * component + F64x4::splat(0.432_951))
                 + F64x4::splat(0.238_081);
+
             numerator / denominator
         });
 
@@ -93,6 +106,7 @@ fn aces_fitted_batch(colors: &mut [LinearRGB]) {
             let one = F64x4::splat(1.0);
             let below = component.is_nan() | component.simd_le(zero);
             let bounded = below.select(zero, component.simd_ge(one).select(one, component));
+
             bounded.cast::<f32>().to_array()
         });
 
@@ -100,6 +114,30 @@ fn aces_fitted_batch(colors: &mut [LinearRGB]) {
             chunk[lane] = LinearRGB([mapped[0][lane], mapped[1][lane], mapped[2][lane]]);
         }
     }
+}
+
+#[multiversion(targets("x86_64+avx2", "aarch64+neon"))]
+fn aces_fitted_planes(colors: &mut LinearRGBPlanes) {
+    map_colors(colors, |color| {
+        let transformed = ACES_INPUT_MATRIX.map(|row| {
+            (F64x4::splat(row[0]) * color[0] + F64x4::splat(row[1]) * color[1])
+                + F64x4::splat(row[2]) * color[2]
+        });
+
+        let fitted = transformed.map(|component| {
+            let numerator =
+                component * (component + F64x4::splat(0.024_578_6)) - F64x4::splat(0.000_090_537);
+            let denominator = component
+                * (F64x4::splat(0.983_729) * component + F64x4::splat(0.432_951))
+                + F64x4::splat(0.238_081);
+            numerator / denominator
+        });
+
+        ACES_OUTPUT_MATRIX.map(|row| {
+            (F64x4::splat(row[0]) * fitted[0] + F64x4::splat(row[1]) * fitted[1])
+                + F64x4::splat(row[2]) * fitted[2]
+        })
+    });
 }
 
 fn multiply_rgb(matrix: [[f64; 3]; 3], color: [f64; 3]) -> [f64; 3] {
@@ -110,9 +148,9 @@ fn multiply_rgb(matrix: [[f64; 3]; 3], color: [f64; 3]) -> [f64; 3] {
 ///
 /// The input is pre-exposed by `0.6`, matching the article's comparison with the fitted transform.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AcesApproximate;
+pub struct ACESApproximate;
 
-impl ToneMapper for AcesApproximate {
+impl ToneMapper for ACESApproximate {
     #[inline]
     fn map(&self, color: LinearRGB) -> LinearRGB {
         const A: f64 = 2.51;

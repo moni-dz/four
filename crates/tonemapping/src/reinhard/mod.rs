@@ -1,7 +1,10 @@
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-use super::{LinearRGB, MaxCll, OrderedLevel, ToneMapper, WhitePoint};
+use multiversion::multiversion;
+
+use super::{LinearRGB, LinearRGBPlanes, MaxCll, OrderedLevel, ToneMapper, WhitePoint};
+use crate::simd::{COLOR_LANES, F64x4, map_colors};
 
 /// Applies the simple Reinhard curve independently to each component.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -84,6 +87,28 @@ impl ToneMapper for LuminanceReinhard {
         let scale = 1.0 / (1.0 + color.luminance_f64());
         LinearRGB::displayable(color.components_f64().map(|component| component * scale))
     }
+
+    #[inline]
+    fn map_planes_in_place(&self, colors: &mut LinearRGBPlanes) {
+        let simd_len = colors.len() / COLOR_LANES * COLOR_LANES;
+        luminance_reinhard_batch(colors);
+        colors.map_from(simd_len, self);
+    }
+}
+
+#[multiversion(targets("x86_64+avx2", "aarch64+neon"))]
+fn luminance_reinhard_batch(colors: &mut LinearRGBPlanes) {
+    let one = F64x4::splat(1.0);
+
+    map_colors(colors, |components| {
+        let luminance = F64x4::splat(super::REC709_LUMINANCE[0]) * components[0]
+            + F64x4::splat(super::REC709_LUMINANCE[1]) * components[1]
+            + F64x4::splat(super::REC709_LUMINANCE[2]) * components[2];
+
+        let scale = one / (one + luminance);
+
+        components.map(|component| component * scale)
+    });
 }
 
 /// Identifies a positive finite luminance that maps to display white.
@@ -122,6 +147,7 @@ pub fn estimate_luminance_white_point(colors: &[LinearRGB]) -> Option<LuminanceW
 
     let retained = pixel_count / 10_000 + 1;
     let mut luminances = BinaryHeap::with_capacity(retained);
+
     for color in colors {
         let luminance = OrderedLevel(color.luminance());
         if luminances.len() < retained {
@@ -166,6 +192,30 @@ impl ToneMapper for ExtendedLuminanceReinhard {
         let scale = (1.0 + luminance / white_squared) / (1.0 + luminance);
         LinearRGB::displayable(color.components_f64().map(|component| component * scale))
     }
+
+    #[inline]
+    fn map_planes_in_place(&self, colors: &mut LinearRGBPlanes) {
+        let white_squared = f64::from(self.white_point.luminance()).powi(2);
+        let simd_len = colors.len() / COLOR_LANES * COLOR_LANES;
+        extended_luminance_reinhard_batch(colors, white_squared);
+        colors.map_from(simd_len, self);
+    }
+}
+
+#[multiversion(targets("x86_64+avx2", "aarch64+neon"))]
+fn extended_luminance_reinhard_batch(colors: &mut LinearRGBPlanes, white_squared: f64) {
+    let one = F64x4::splat(1.0);
+    let white_squared = F64x4::splat(white_squared);
+
+    map_colors(colors, |components| {
+        let luminance = F64x4::splat(super::REC709_LUMINANCE[0]) * components[0]
+            + F64x4::splat(super::REC709_LUMINANCE[1]) * components[1]
+            + F64x4::splat(super::REC709_LUMINANCE[2]) * components[2];
+
+        let scale = (one + luminance / white_squared) / (one + luminance);
+
+        components.map(|component| component * scale)
+    });
 }
 
 /// Blends component-wise and luminance-based Reinhard results per component.
@@ -179,10 +229,12 @@ impl ToneMapper for ReinhardJodie {
         let luminance_scale = 1.0 / (1.0 + color.luminance_f64());
         let component_mapped = components.map(|component| component / (1.0 + component));
         let luminance_mapped = components.map(|component| component * luminance_scale);
+
         let blended = std::array::from_fn(|index| {
             let weight = component_mapped[index];
             luminance_mapped[index] * (1.0 - weight) + component_mapped[index] * weight
         });
+
         LinearRGB::displayable(blended)
     }
 }

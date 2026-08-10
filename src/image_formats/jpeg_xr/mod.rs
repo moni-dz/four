@@ -28,8 +28,8 @@ use ::jpegxr::{
 use multiversion::multiversion;
 use rayon::prelude::*;
 use tonemapping::{
-    Clamp, ColorChannel as ToneColorChannel, LinearRGB, LuminanceWhitePoint, MaxCllEstimator,
-    MaxCllMode, ToneMapper, ToneMappingMethod, WhitePoint,
+    Clamp, ColorChannel as ToneColorChannel, LinearRGB, LinearRGBPlanes, LuminanceWhitePoint,
+    MaxCllEstimator, MaxCllMode, ToneMapper, ToneMappingMethod, WhitePoint,
 };
 use zerocopy::FromBytes;
 
@@ -788,7 +788,7 @@ fn write_hdr_pixels(
         .expect("validated JPEG XR pixel count fits usize");
 
     let batch_capacity = HDR_BATCH_PIXELS.min(pixel_count);
-    let mut colors = Vec::with_capacity(batch_capacity);
+    let mut colors = LinearRGBPlanes::with_capacity(batch_capacity);
     let mut alphas = Vec::with_capacity(batch_capacity);
     let mut has_nonzero_alpha = false;
     let mut rgba_offset = 0;
@@ -816,42 +816,52 @@ fn write_hdr_pixels(
 
 fn write_tone_mapped_batch(
     mapper: &(impl ToneMapper + Sync),
-    colors: &mut Vec<LinearRGB>,
+    colors: &mut LinearRGBPlanes,
     alphas: &mut Vec<u8>,
     rgba: &mut [u8],
     rgba_offset: &mut usize,
 ) {
     invariant_eq!(colors.len(), alphas.len());
+
     if colors.is_empty() {
         return;
     }
-    mapper.map_in_place(colors);
+
+    mapper.map_planes_in_place(colors);
 
     let byte_count = colors.len() * 4;
     let target = &mut rgba[*rgba_offset..*rgba_offset + byte_count];
     let (targets, remainder) = target.as_chunks_mut::<4>();
+
     invariant!(remainder.is_empty());
     write_display_pixels(colors, alphas, targets);
+
     *rgba_offset += byte_count;
     colors.clear();
     alphas.clear();
 }
 
 #[multiversion(targets("x86_64+avx2", "aarch64+neon"))]
-fn write_display_pixels(colors: &[LinearRGB], alphas: &[u8], targets: &mut [[u8; 4]]) {
+fn write_display_pixels(colors: &LinearRGBPlanes, alphas: &[u8], targets: &mut [[u8; 4]]) {
     invariant_eq!(colors.len(), alphas.len());
     invariant_eq!(colors.len(), targets.len());
 
-    let (color_chunks, color_tail) = colors.as_chunks::<SRGB_LANES>();
+    let [red, green, blue] = colors.channels();
+    let (red_chunks, red_tail) = red.as_chunks::<SRGB_LANES>();
+    let (green_chunks, green_tail) = green.as_chunks::<SRGB_LANES>();
+    let (blue_chunks, blue_tail) = blue.as_chunks::<SRGB_LANES>();
     let (alpha_chunks, alpha_tail) = alphas.as_chunks::<SRGB_LANES>();
     let (target_chunks, target_tail) = targets.as_chunks_mut::<SRGB_LANES>();
 
-    for ((colors, alphas), targets) in color_chunks.iter().zip(alpha_chunks).zip(target_chunks) {
-        let components = colors.map(LinearRGB::components);
-        let encoded = [0, 1, 2].map(|channel| {
-            linear_to_srgb_simd(F32x8::from_array(components.map(|color| color[channel])))
-                .to_array()
-        });
+    for ((((red, green), blue), alphas), targets) in red_chunks
+        .iter()
+        .zip(green_chunks)
+        .zip(blue_chunks)
+        .zip(alpha_chunks)
+        .zip(target_chunks)
+    {
+        let encoded = [*red, *green, *blue]
+            .map(|channel| linear_to_srgb_simd(F32x8::from_array(channel)).to_array());
 
         for lane in 0..SRGB_LANES {
             targets[lane] = [
@@ -863,7 +873,14 @@ fn write_display_pixels(colors: &[LinearRGB], alphas: &[u8], targets: &mut [[u8;
         }
     }
 
-    for ((color, alpha), target) in color_tail.iter().copied().zip(alpha_tail).zip(target_tail) {
+    for ((((red, green), blue), alpha), target) in red_tail
+        .iter()
+        .zip(green_tail)
+        .zip(blue_tail)
+        .zip(alpha_tail)
+        .zip(target_tail)
+    {
+        let color = LinearRGB::new([*red, *green, *blue]);
         let [red, green, blue] = display_linear_to_srgb8(color);
         *target = [red, green, blue, *alpha];
     }
@@ -895,7 +912,9 @@ fn pixel_at(row: &[u8], x: usize, layout: PixelLayout) -> Result<&[u8]> {
     let start = x
         .checked_mul(layout.bytes_per_pixel)
         .ok_or_else(|| error(JPEGXRError::Output("JPEG XR pixel offset exceeds usize")))?;
+
     let end = start + layout.bytes_per_pixel;
+
     row.get(start..end)
         .ok_or_else(|| error(JPEGXRError::Output("JPEG XR pixel exceeds its decoded row")))
 }

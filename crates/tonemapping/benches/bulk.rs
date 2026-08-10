@@ -3,9 +3,9 @@ use std::time::{Duration, Instant};
 
 use mimalloc::MiMalloc;
 use tonemapping::{
-    ACESFitted, AcesApproximate, BT2446A, Clamp, ExtendedLuminanceReinhard, ExtendedReinhard,
-    Hable, LinearRGB, LuminanceReinhard, LuminanceWhitePoint, MaxCllEstimator, Reinhard,
-    ReinhardJodie, ScaledClamp, ToneMapper, WhitePoint,
+    ACESApproximate, ACESFitted, BT2446A, Clamp, ExtendedLuminanceReinhard, ExtendedReinhard,
+    Hable, LinearRGB, LinearRGBPlanes, LuminanceReinhard, LuminanceWhitePoint, MaxCllEstimator,
+    Reinhard, ReinhardJodie, ScaledClamp, ToneMapper, WhitePoint,
 };
 
 #[global_allocator]
@@ -58,7 +58,7 @@ fn main() {
     benchmark_mapper("Reinhard-Jodie", &ReinhardJodie, &colors, iterations);
     benchmark_mapper("Hable", &Hable, &colors, iterations);
     benchmark_mapper("fitted ACES", &ACESFitted, &colors, iterations);
-    benchmark_mapper("approximate ACES", &AcesApproximate, &colors, iterations);
+    benchmark_mapper("approximate ACES", &ACESApproximate, &colors, iterations);
     benchmark_mapper("BT.2446A", &BT2446A, &colors, iterations);
     benchmark_max_cll(&colors, iterations);
 }
@@ -86,7 +86,11 @@ fn benchmark_mapper(
     iterations: NonZeroU32,
 ) {
     let mut scalar_scratch = colors.to_vec();
-    let mut bulk_scratch = colors.to_vec();
+    let bulk_source: Vec<LinearRGBPlanes> = colors
+        .chunks(BATCH_PIXELS)
+        .map(|batch| batch.iter().copied().collect())
+        .collect();
+    let mut bulk_scratch = bulk_source.clone();
     let (scalar, bulk) = benchmark_pair(
         iterations,
         || {
@@ -99,10 +103,10 @@ fn benchmark_mapper(
             })
         },
         || {
-            bulk_scratch.copy_from_slice(colors);
+            bulk_scratch.clone_from(&bulk_source);
             time_once(|| {
-                for batch in bulk_scratch.chunks_mut(BATCH_PIXELS) {
-                    mapper.map_in_place(batch);
+                for batch in &mut bulk_scratch {
+                    mapper.map_planes_in_place(batch);
                 }
                 std::hint::black_box(&bulk_scratch);
             })

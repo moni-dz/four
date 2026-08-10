@@ -10,7 +10,7 @@
 //! [`Clamp`] and [`ScaledClamp`] provide clipping baselines. The Reinhard family includes
 //! component-wise, luminance-preserving, white-point, and Reinhard-Jodie variants. [`BT2446A`]
 //! applies the standardized HDR-to-SDR conversion Method A. [`Hable`], [`ACESFitted`], and
-//! [`AcesApproximate`] provide filmic curves. [`ToneMappingMethod`] enumerates the built-in
+//! [`ACESApproximate`] provide filmic curves. [`ToneMappingMethod`] enumerates the built-in
 //! operator families.
 //!
 //! [`MaxCllEstimator`] selects either the nearest-rank 99.99th percentile of per-pixel
@@ -133,6 +133,94 @@ impl From<LinearRGB> for [f32; 3] {
     }
 }
 
+/// Stores linear RGB colors in separate contiguous channel planes in the interest of trivial vectorization.
+///
+/// All inserted colors retain the sanitization guarantees of [`LinearRGB`].
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LinearRGBPlanes {
+    red: Vec<f32>,
+    green: Vec<f32>,
+    blue: Vec<f32>,
+}
+
+impl LinearRGBPlanes {
+    /// Creates empty channel planes with space for at least `capacity` colors.
+    #[must_use]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            red: Vec::with_capacity(capacity),
+            green: Vec::with_capacity(capacity),
+            blue: Vec::with_capacity(capacity),
+        }
+    }
+
+    /// Appends `color` to the channel planes.
+    pub fn push(&mut self, color: LinearRGB) {
+        let [red, green, blue] = color.components();
+        self.red.push(red);
+        self.green.push(green);
+        self.blue.push(blue);
+    }
+
+    /// Returns the number of stored colors.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.red.len()
+    }
+
+    /// Returns whether the channel planes contain no colors.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.red.is_empty()
+    }
+
+    /// Removes all colors while retaining the allocated storage.
+    pub fn clear(&mut self) {
+        self.red.clear();
+        self.green.clear();
+        self.blue.clear();
+    }
+
+    /// Returns the red, green, and blue channel planes in that order.
+    #[must_use]
+    pub fn channels(&self) -> [&[f32]; 3] {
+        [&self.red, &self.green, &self.blue]
+    }
+
+    fn channels_mut(&mut self) -> [&mut [f32]; 3] {
+        [&mut self.red, &mut self.green, &mut self.blue]
+    }
+
+    fn color(&self, index: usize) -> LinearRGB {
+        LinearRGB([self.red[index], self.green[index], self.blue[index]])
+    }
+
+    fn set_color(&mut self, index: usize, color: LinearRGB) {
+        let [red, green, blue] = color.components();
+        self.red[index] = red;
+        self.green[index] = green;
+        self.blue[index] = blue;
+    }
+
+    fn map_from(&mut self, start: usize, mapper: &(impl ToneMapper + ?Sized)) {
+        for index in start..self.len() {
+            self.set_color(index, mapper.map(self.color(index)));
+        }
+    }
+}
+
+impl FromIterator<LinearRGB> for LinearRGBPlanes {
+    fn from_iter<T: IntoIterator<Item = LinearRGB>>(iter: T) -> Self {
+        let colors = iter.into_iter();
+        let (lower, _) = colors.size_hint();
+        let mut planes = Self::with_capacity(lower);
+        for color in colors {
+            planes.push(color);
+        }
+        planes
+    }
+}
+
 /// Maps a linear HDR color into display-linear RGB.
 pub trait ToneMapper {
     /// Maps `color` into finite `0.0..=1.0` display-linear components.
@@ -161,6 +249,15 @@ pub trait ToneMapper {
         for color in colors {
             *color = self.map(*color);
         }
+    }
+
+    /// Maps separate red, green, and blue channel planes in place.
+    ///
+    /// The default implementation calls [`ToneMapper::map`] for each color. Built-in operators may
+    /// override this method with a SIMD batch implementation while preserving the scalar result.
+    #[inline]
+    fn map_planes_in_place(&self, colors: &mut LinearRGBPlanes) {
+        colors.map_from(0, self);
     }
 }
 
@@ -266,6 +363,12 @@ macro_rules! define_tone_mapping_methods {
                     $(Self::$method(mapper) => mapper.map_in_place(colors),)+
                 }
             }
+
+            fn map_planes_in_place(&self, colors: &mut LinearRGBPlanes) {
+                match self {
+                    $(Self::$method(mapper) => mapper.map_planes_in_place(colors),)+
+                }
+            }
         }
     };
 }
@@ -330,7 +433,7 @@ define_tone_mapping_methods! {
     /// Applies the scalar ACES curve approximation.
     ACESApproximate {
         label: "ACES approximate",
-        mapper: AcesApproximate = |_, _| AcesApproximate,
+        mapper: ACESApproximate = |_, _| ACESApproximate,
         uses_luminance_white_point: false,
     }
     /// Applies ITU-R BT.2446-2 Method A.
@@ -696,9 +799,10 @@ mod bt2446;
 mod clamp;
 mod hable;
 mod reinhard;
+mod simd;
 
 #[doc(inline)]
-pub use aces::{ACESFitted, AcesApproximate};
+pub use aces::{ACESApproximate, ACESFitted};
 #[doc(inline)]
 pub use bt2446::BT2446A;
 pub use clamp::{Clamp, ScaledClamp};
@@ -813,15 +917,33 @@ mod tests {
             .copied()
             .map(|color| mapper.map(color))
             .collect();
+
         let mut actual = inputs.to_vec();
         mapper.map_in_place(&mut actual);
 
         assert_eq!(actual.len(), expected.len());
-        for (actual, expected) in actual.into_iter().zip(expected) {
+
+        for (actual, expected) in actual.into_iter().zip(expected.iter().copied()) {
             assert_eq!(
                 actual.components().map(f32::to_bits),
                 expected.components().map(f32::to_bits)
             );
+        }
+
+        let mut planes: LinearRGBPlanes = inputs.iter().copied().collect();
+        mapper.map_planes_in_place(&mut planes);
+
+        let channels = planes.channels();
+
+        for (index, expected) in expected.into_iter().enumerate() {
+            let expected = expected.components();
+
+            for channel in 0..3 {
+                assert_eq!(
+                    channels[channel][index].to_bits(),
+                    expected[channel].to_bits()
+                );
+            }
         }
     }
 
@@ -868,8 +990,24 @@ mod tests {
     #[test]
     fn bulk_mapping_matches_scalar_mapping_at_simd_boundaries() {
         let inputs = batch_inputs();
-        let extended = ExtendedReinhard::new(WhitePoint::new(4.0).unwrap());
-        let mappers: [&dyn ToneMapper; 4] = [&Clamp, &extended, &ACESFitted, &BT2446A];
+        let white = WhitePoint::new(4.0).unwrap();
+        let scaled = ScaledClamp::new(white);
+        let extended = ExtendedReinhard::new(white);
+        let extended_luminance =
+            ExtendedLuminanceReinhard::new(LuminanceWhitePoint::new(4.0).unwrap());
+        let mappers: [&dyn ToneMapper; 11] = [
+            &Clamp,
+            &scaled,
+            &Reinhard,
+            &extended,
+            &LuminanceReinhard,
+            &extended_luminance,
+            &ReinhardJodie,
+            &Hable,
+            &ACESFitted,
+            &ACESApproximate,
+            &BT2446A,
+        ];
 
         for mapper in mappers {
             for length in [0, 1, 3, 4, 5, 7, 8, 9, 17] {
@@ -966,7 +1104,7 @@ mod tests {
             &BT2446A,
             &Hable,
             &ACESFitted,
-            &AcesApproximate,
+            &ACESApproximate,
         ];
 
         for mapper in mappers {
@@ -1083,7 +1221,7 @@ mod tests {
 
     #[test]
     fn aces_approximate_includes_the_article_pre_exposure() {
-        let [middle_gray, reference_white, clipped] = AcesApproximate
+        let [middle_gray, reference_white, clipped] = ACESApproximate
             .map(LinearRGB::new([0.18, 1.0, 100.0]))
             .components();
 
