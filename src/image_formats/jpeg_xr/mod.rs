@@ -25,10 +25,8 @@ use ::jpegxr::{
     BitDepthBits, ColorFormat, ImageDecode, JXRError, PixelFormat as CodecPixelFormat, PixelInfo,
 };
 use tonemapping::{
-    AcesApproximate, AcesFitted, Clamp, ColorChannel as ToneColorChannel,
-    ExtendedLuminanceReinhard, ExtendedReinhard, Hable, LinearRGB, LuminanceReinhard,
-    LuminanceWhitePoint, MaxCllEstimator, MaxCllMode, Reinhard, ReinhardJodie, ScaledClamp,
-    ToneMapper, ToneMappingMethod, WhitePoint,
+    Clamp, ColorChannel as ToneColorChannel, LinearRGB, LuminanceWhitePoint, MaxCllEstimator,
+    MaxCllMode, ToneMapper, ToneMappingMethod, WhitePoint,
 };
 use zerocopy::FromBytes;
 
@@ -624,17 +622,21 @@ fn normalize(
             row_stride,
             layout,
             options.max_cll_mode(),
-            options.tone_mapping() == ToneMappingMethod::ExtendedLuminanceReinhard,
+            options.tone_mapping().uses_luminance_white_point(),
         )?)
     } else {
         None
     };
     let mut rgba = Vec::with_capacity(output_len);
     let has_nonzero_alpha = if let Some(metrics) = hdr_metrics {
-        let mapper = ResolvedToneMapper::new(options.tone_mapping(), metrics);
-        if matches!(mapper, ResolvedToneMapper::Clamp) {
+        let method = options.tone_mapping();
+        if method == ToneMappingMethod::Clamp {
             append_hdr_pixels_scalar(source, width, row_stride, layout, &Clamp, &mut rgba)?
         } else {
+            let mapper = method.resolve(
+                hdr_white_point(metrics.max_cll),
+                hdr_luminance_white_point(metrics),
+            );
             append_hdr_pixels(source, width, row_stride, layout, &mapper, &mut rgba)?
         }
     } else {
@@ -887,81 +889,13 @@ fn hdr_white_point(max_cll: MaxCll) -> WhitePoint {
         .expect("MaxCLL floored at display white is a positive finite white point")
 }
 
-enum ResolvedToneMapper {
-    Clamp,
-    ScaledClamp(ScaledClamp),
-    Reinhard,
-    ExtendedReinhard(ExtendedReinhard),
-    LuminanceReinhard,
-    ExtendedLuminanceReinhard(ExtendedLuminanceReinhard),
-    ReinhardJodie,
-    Uncharted2,
-    AcesFitted,
-    AcesApproximate,
-}
-
-impl ResolvedToneMapper {
-    fn new(method: ToneMappingMethod, metrics: HDRMetrics) -> Self {
-        let white_point = hdr_white_point(metrics.max_cll);
-
-        match method {
-            ToneMappingMethod::Clamp => Self::Clamp,
-            ToneMappingMethod::ScaledClamp => Self::ScaledClamp(ScaledClamp::new(white_point)),
-            ToneMappingMethod::Reinhard => Self::Reinhard,
-            ToneMappingMethod::ExtendedReinhard => {
-                Self::ExtendedReinhard(ExtendedReinhard::new(white_point))
-            }
-            ToneMappingMethod::LuminanceReinhard => Self::LuminanceReinhard,
-            ToneMappingMethod::ExtendedLuminanceReinhard => {
-                let luminance = metrics
-                    .luminance_white_point
-                    .map_or(1.0, LuminanceWhitePoint::luminance)
-                    .max(1.0);
-                let luminance_white_point = LuminanceWhitePoint::new(luminance).expect(
-                    "p99.99 luminance floored at display white is a positive finite white point",
-                );
-                Self::ExtendedLuminanceReinhard(ExtendedLuminanceReinhard::new(
-                    luminance_white_point,
-                ))
-            }
-            ToneMappingMethod::ReinhardJodie => Self::ReinhardJodie,
-            ToneMappingMethod::Hable => Self::Uncharted2,
-            ToneMappingMethod::ACESFitted => Self::AcesFitted,
-            ToneMappingMethod::ACESApproximate => Self::AcesApproximate,
-        }
-    }
-}
-
-impl ToneMapper for ResolvedToneMapper {
-    fn map(&self, color: LinearRGB) -> LinearRGB {
-        match self {
-            Self::Clamp => Clamp.map(color),
-            Self::ScaledClamp(mapper) => mapper.map(color),
-            Self::Reinhard => Reinhard.map(color),
-            Self::ExtendedReinhard(mapper) => mapper.map(color),
-            Self::LuminanceReinhard => LuminanceReinhard.map(color),
-            Self::ExtendedLuminanceReinhard(mapper) => mapper.map(color),
-            Self::ReinhardJodie => ReinhardJodie.map(color),
-            Self::Uncharted2 => Hable.map(color),
-            Self::AcesFitted => AcesFitted.map(color),
-            Self::AcesApproximate => AcesApproximate.map(color),
-        }
-    }
-
-    fn map_in_place(&self, colors: &mut [LinearRGB]) {
-        match self {
-            Self::Clamp => Clamp.map_in_place(colors),
-            Self::ScaledClamp(mapper) => mapper.map_in_place(colors),
-            Self::Reinhard => Reinhard.map_in_place(colors),
-            Self::ExtendedReinhard(mapper) => mapper.map_in_place(colors),
-            Self::LuminanceReinhard => LuminanceReinhard.map_in_place(colors),
-            Self::ExtendedLuminanceReinhard(mapper) => mapper.map_in_place(colors),
-            Self::ReinhardJodie => ReinhardJodie.map_in_place(colors),
-            Self::Uncharted2 => Hable.map_in_place(colors),
-            Self::AcesFitted => AcesFitted.map_in_place(colors),
-            Self::AcesApproximate => AcesApproximate.map_in_place(colors),
-        }
-    }
+fn hdr_luminance_white_point(metrics: HDRMetrics) -> LuminanceWhitePoint {
+    let luminance = metrics
+        .luminance_white_point
+        .map_or(1.0, LuminanceWhitePoint::luminance)
+        .max(1.0);
+    LuminanceWhitePoint::new(luminance)
+        .expect("p99.99 luminance floored at display white is a positive finite white point")
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1362,6 +1296,7 @@ fn codec_error(source: &JXRError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tonemapping::{BT2446A, ExtendedLuminanceReinhard, ExtendedReinhard};
 
     fn float_rgb_layout() -> PixelLayout {
         PixelLayout {
@@ -1512,6 +1447,15 @@ mod tests {
 
         assert_eq!(clamped, [u8::MAX, u8::MAX, u8::MAX, u8::MAX]);
         assert_eq!(reinhard, [231, 213, 188, u8::MAX]);
+    }
+
+    #[test]
+    fn bt2446_method_dispatches_to_bt2446a() {
+        let color = [4.0, 2.0, 1.0];
+        let actual = normalize_float_rgb(&[color], 1, ToneMappingMethod::BT2446);
+        let [red, green, blue] = hdr_to_srgb8(color, &BT2446A);
+
+        assert_eq!(actual, [red, green, blue, u8::MAX]);
     }
 
     #[test]

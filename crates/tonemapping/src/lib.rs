@@ -8,9 +8,10 @@
 //! integer quantization remain the caller's responsibility.
 //!
 //! [`Clamp`] and [`ScaledClamp`] provide clipping baselines. The Reinhard family includes
-//! component-wise, luminance-preserving, white-point, and Reinhard-Jodie variants. [`Hable`],
-//! [`AcesFitted`], and [`AcesApproximate`] provide filmic curves, while [`CameraResponse`] applies
-//! a caller-supplied normalized camera-response lookup table.
+//! component-wise, luminance-preserving, white-point, and Reinhard-Jodie variants. [`BT2446A`]
+//! applies the standardized HDR-to-SDR conversion Method A. [`Hable`], [`AcesFitted`], and
+//! [`AcesApproximate`] provide filmic curves, while [`CameraResponse`] applies a caller-supplied
+//! normalized camera-response lookup table.
 //! [`ToneMappingMethod`] enumerates the built-in operator families that need no custom response.
 //!
 //! [`estimate_max_cll`] selects the nearest-rank 99.99th percentile of per-pixel `max(R, G, B)`.
@@ -43,27 +44,13 @@ use std::num::NonZeroUsize;
 use std::simd::{
     Select, Simd,
     cmp::{SimdPartialEq, SimdPartialOrd},
-    num::SimdFloat,
 };
 
 const REC709_LUMINANCE: [f64; 3] = [0.212_6, 0.715_2, 0.072_2];
-const TONE_MAPPING_LANES: usize = 4;
 const MAX_CLL_LANES: usize = 8;
 
-type F64x4 = Simd<f64, TONE_MAPPING_LANES>;
 type F32x8 = Simd<f32, MAX_CLL_LANES>;
 type I32x8 = Simd<i32, MAX_CLL_LANES>;
-
-const ACES_INPUT_MATRIX: [[f64; 3]; 3] = [
-    [0.597_19, 0.354_58, 0.048_23],
-    [0.076_00, 0.908_34, 0.015_66],
-    [0.028_40, 0.133_83, 0.837_77],
-];
-const ACES_OUTPUT_MATRIX: [[f64; 3]; 3] = [
-    [1.604_75, -0.531_08, -0.073_67],
-    [-0.102_08, 1.108_13, -0.006_05],
-    [-0.003_27, -0.072_76, 1.076_02],
-];
 
 /// Stores a finite, nonnegative linear RGB color.
 ///
@@ -180,72 +167,176 @@ pub trait ToneMapper {
     }
 }
 
-/// Identifies a built-in tone-mapping operator family.
-///
-/// White-point methods still require an image-specific white point when they are constructed.
-/// [`CameraToneMapper`] is not listed because it additionally requires a caller-supplied
-/// [`CameraResponse`], for which there is no universal built-in preset.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum ToneMappingMethod {
-    /// Clips each component to the display range.
-    Clamp,
-    /// Scales components by an image white point before clipping.
-    ScaledClamp,
-    /// Applies simple Reinhard independently to each component.
-    Reinhard,
-    /// Applies white-point Reinhard independently to each component.
-    #[default]
-    ExtendedReinhard,
-    /// Applies simple Reinhard to luminance while preserving color ratios.
-    LuminanceReinhard,
-    /// Applies white-point Reinhard to luminance while preserving color ratios.
-    ExtendedLuminanceReinhard,
-    /// Blends component-wise and luminance-based Reinhard results.
-    ReinhardJodie,
-    /// Applies the Uncharted 2 filmic curve.
-    Hable,
-    /// Applies the fitted ACES reference and display transform.
-    ACESFitted,
-    /// Applies the scalar ACES curve approximation.
-    ACESApproximate,
+macro_rules! count_tone_mapping_methods {
+    () => {
+        0_usize
+    };
+    ($method:ident $($remaining:ident)*) => {
+        1_usize + count_tone_mapping_methods!($($remaining)*)
+    };
 }
 
-impl ToneMappingMethod {
-    /// Contains every selectable built-in method in display order.
-    pub const ALL: [Self; 10] = [
-        Self::Clamp,
-        Self::ScaledClamp,
-        Self::Reinhard,
-        Self::ExtendedReinhard,
-        Self::LuminanceReinhard,
-        Self::ExtendedLuminanceReinhard,
-        Self::ReinhardJodie,
-        Self::Hable,
-        Self::ACESFitted,
-        Self::ACESApproximate,
-    ];
-
-    /// Returns the concise user-facing method name.
-    #[must_use]
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Clamp => "Clamp",
-            Self::ScaledClamp => "Scaled clamp",
-            Self::Reinhard => "Reinhard",
-            Self::ExtendedReinhard => "Extended Reinhard",
-            Self::LuminanceReinhard => "Luminance Reinhard",
-            Self::ExtendedLuminanceReinhard => "Extended luminance Reinhard",
-            Self::ReinhardJodie => "Reinhard-Jodie",
-            Self::Hable => "Hable",
-            Self::ACESFitted => "ACES fitted",
-            Self::ACESApproximate => "ACES approximate",
+macro_rules! define_tone_mapping_methods {
+    (
+        $(
+            $(#[$method_meta:meta])*
+            $method:ident {
+                label: $label:literal,
+                mapper: $mapper:ty = $constructor:expr,
+                uses_luminance_white_point: $uses_luminance_white_point:literal,
+            }
+        )+
+    ) => {
+        /// Identifies a built-in tone-mapping operator family.
+        ///
+        /// White-point methods require image-specific white points when resolved. [`BT2446A`]
+        /// uses its standardized fixed mastering and display assumptions. [`CameraToneMapper`]
+        /// requires a caller-supplied [`CameraResponse`].
+        #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+        pub enum ToneMappingMethod {
+            $(
+                $(#[$method_meta])*
+                $method,
+            )+
         }
-    }
+
+        impl ToneMappingMethod {
+            /// Contains every selectable built-in method in display order.
+            pub const ALL: [Self; count_tone_mapping_methods!($($method)*)] = [
+                $(Self::$method,)+
+            ];
+
+            /// Returns the concise user-facing method name.
+            #[must_use]
+            pub const fn label(self) -> &'static str {
+                match self {
+                    $(Self::$method => $label,)+
+                }
+            }
+
+            /// Reports whether this method uses an image luminance white point.
+            #[must_use]
+            pub const fn uses_luminance_white_point(self) -> bool {
+                match self {
+                    $(Self::$method => $uses_luminance_white_point,)+
+                }
+            }
+
+            /// Resolves this method with image-specific white points.
+            ///
+            /// Methods that do not use one or both white points ignore those arguments.
+            #[must_use]
+            pub fn resolve(
+                self,
+                white_point: WhitePoint,
+                luminance_white_point: LuminanceWhitePoint,
+            ) -> impl ToneMapper {
+                match self {
+                    $(
+                        Self::$method => ResolvedToneMapper::$method(
+                            ($constructor)(white_point, luminance_white_point),
+                        ),
+                    )+
+                }
+            }
+        }
+
+        impl fmt::Display for ToneMappingMethod {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.label())
+            }
+        }
+
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum ResolvedToneMapper {
+            $($method($mapper),)+
+        }
+
+        impl ToneMapper for ResolvedToneMapper {
+            fn map(&self, color: LinearRGB) -> LinearRGB {
+                match self {
+                    $(Self::$method(mapper) => mapper.map(color),)+
+                }
+            }
+
+            fn map_in_place(&self, colors: &mut [LinearRGB]) {
+                match self {
+                    $(Self::$method(mapper) => mapper.map_in_place(colors),)+
+                }
+            }
+        }
+    };
 }
 
-impl fmt::Display for ToneMappingMethod {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.label())
+define_tone_mapping_methods! {
+    /// Clips each component to the display range.
+    Clamp {
+        label: "Clamp",
+        mapper: Clamp = |_, _| Clamp,
+        uses_luminance_white_point: false,
+    }
+    /// Scales components by an image white point before clipping.
+    ScaledClamp {
+        label: "Scaled clamp",
+        mapper: ScaledClamp = |white_point, _| ScaledClamp::new(white_point),
+        uses_luminance_white_point: false,
+    }
+    /// Applies simple Reinhard independently to each component.
+    Reinhard {
+        label: "Reinhard",
+        mapper: Reinhard = |_, _| Reinhard,
+        uses_luminance_white_point: false,
+    }
+    /// Applies white-point Reinhard independently to each component.
+    ExtendedReinhard {
+        label: "Extended Reinhard",
+        mapper: ExtendedReinhard = |white_point, _| ExtendedReinhard::new(white_point),
+        uses_luminance_white_point: false,
+    }
+    /// Applies simple Reinhard to luminance while preserving color ratios.
+    LuminanceReinhard {
+        label: "Luminance Reinhard",
+        mapper: LuminanceReinhard = |_, _| LuminanceReinhard,
+        uses_luminance_white_point: false,
+    }
+    /// Applies white-point Reinhard to luminance while preserving color ratios.
+    ExtendedLuminanceReinhard {
+        label: "Extended luminance Reinhard",
+        mapper: ExtendedLuminanceReinhard = |_, luminance_white_point| {
+            ExtendedLuminanceReinhard::new(luminance_white_point)
+        },
+        uses_luminance_white_point: true,
+    }
+    /// Blends component-wise and luminance-based Reinhard results.
+    ReinhardJodie {
+        label: "Reinhard-Jodie",
+        mapper: ReinhardJodie = |_, _| ReinhardJodie,
+        uses_luminance_white_point: false,
+    }
+    /// Applies the Uncharted 2 filmic curve.
+    Hable {
+        label: "Hable",
+        mapper: Hable = |_, _| Hable,
+        uses_luminance_white_point: false,
+    }
+    /// Applies the fitted ACES reference and display transform.
+    ACESFitted {
+        label: "ACES fitted",
+        mapper: AcesFitted = |_, _| AcesFitted,
+        uses_luminance_white_point: false,
+    }
+    /// Applies the scalar ACES curve approximation.
+    ACESApproximate {
+        label: "ACES approximate",
+        mapper: AcesApproximate = |_, _| AcesApproximate,
+        uses_luminance_white_point: false,
+    }
+    /// Applies ITU-R BT.2446-2 Method A.
+    #[default]
+    BT2446 {
+        label: "ITU-R BT2446-2 A",
+        mapper: BT2446A = |_, _| BT2446A,
+        uses_luminance_white_point: false,
     }
 }
 
@@ -618,588 +709,28 @@ fn observe_max_cll_candidates(estimator: &mut MaxCllEstimator, colors: &[LinearR
     }
 }
 
-/// Clamps every component to the displayable range.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Clamp;
+mod aces;
+mod bt2446;
+mod camera_response;
+mod clamp;
+mod hable;
+mod reinhard;
 
-impl ToneMapper for Clamp {
-    #[inline]
-    fn map(&self, color: LinearRGB) -> LinearRGB {
-        clamp_color(color)
-    }
-
-    #[inline]
-    fn map_in_place(&self, colors: &mut [LinearRGB]) {
-        for color in colors {
-            *color = clamp_color(*color);
-        }
-    }
-}
-
-#[inline]
-fn clamp_color(color: LinearRGB) -> LinearRGB {
-    LinearRGB(color.0.map(display_component_f32))
-}
-
-/// Scales a scene white point to one before clamping.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ScaledClamp {
-    white_point: WhitePoint,
-}
-
-impl ScaledClamp {
-    /// Creates a scaled clamp that maps `white_point` to one.
-    #[must_use]
-    pub const fn new(white_point: WhitePoint) -> Self {
-        Self { white_point }
-    }
-
-    /// Returns the scene white point mapped to the display maximum.
-    #[must_use]
-    pub const fn white_point(self) -> WhitePoint {
-        self.white_point
-    }
-}
-
-impl ToneMapper for ScaledClamp {
-    #[inline]
-    fn map(&self, color: LinearRGB) -> LinearRGB {
-        let divisor = f64::from(self.white_point.level());
-        LinearRGB::displayable(color.components_f64().map(|component| component / divisor))
-    }
-}
-
-/// Applies the simple Reinhard curve independently to each component.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Reinhard;
-
-impl ToneMapper for Reinhard {
-    #[inline]
-    fn map(&self, color: LinearRGB) -> LinearRGB {
-        LinearRGB::displayable(
-            color
-                .components_f64()
-                .map(|component| component / (1.0 + component)),
-        )
-    }
-}
-
-/// Applies the white-point Reinhard curve independently to each component.
-///
-/// Components at the white point map to one, while brighter components clip at the display
-/// boundary. For a still image, [`MaxCll`] supplies a `max(R, G, B)` white point selected through
-/// [`MaxCllMode`].
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ExtendedReinhard {
-    white_point: WhitePoint,
-}
-
-impl ExtendedReinhard {
-    /// Creates an extended Reinhard operator with `white_point`.
-    #[must_use]
-    pub const fn new(white_point: WhitePoint) -> Self {
-        Self { white_point }
-    }
-
-    /// Creates an operator from a selected nonzero `MaxCLL` statistic.
-    ///
-    /// Returns `None` for an entirely black image, whose `MaxCLL` is zero.
-    #[must_use]
-    pub fn from_max_cll(max_cll: MaxCll) -> Option<Self> {
-        max_cll.white_point().map(Self::new)
-    }
-
-    /// Returns the scene white point mapped to the display maximum.
-    #[must_use]
-    pub const fn white_point(self) -> WhitePoint {
-        self.white_point
-    }
-}
-
-impl ToneMapper for ExtendedReinhard {
-    #[inline]
-    fn map(&self, color: LinearRGB) -> LinearRGB {
-        let white_squared = f64::from(self.white_point.level()).powi(2);
-        extended_reinhard(color, white_squared)
-    }
-
-    #[inline]
-    fn map_in_place(&self, colors: &mut [LinearRGB]) {
-        let white_squared = f64::from(self.white_point.level()).powi(2);
-        for color in colors {
-            *color = extended_reinhard(*color, white_squared);
-        }
-    }
-}
-
-#[inline]
-fn extended_reinhard(color: LinearRGB, white_squared: f64) -> LinearRGB {
-    LinearRGB::displayable(
-        color
-            .components_f64()
-            .map(|component| component * (1.0 + component / white_squared) / (1.0 + component)),
-    )
-}
-
-/// Applies the simple Reinhard curve to luminance while retaining color ratios.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct LuminanceReinhard;
-
-impl ToneMapper for LuminanceReinhard {
-    #[inline]
-    fn map(&self, color: LinearRGB) -> LinearRGB {
-        let scale = 1.0 / (1.0 + color.luminance_f64());
-        LinearRGB::displayable(color.components_f64().map(|component| component * scale))
-    }
-}
-
-/// Identifies a positive finite luminance that maps to display white.
-///
-/// This type is distinct from [`MaxCll`], which is computed from `max(R, G, B)` rather than
-/// luminance.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LuminanceWhitePoint(WhitePoint);
-
-impl LuminanceWhitePoint {
-    /// Creates a white point from a positive finite luminance.
-    ///
-    /// Returns `None` when `luminance` is zero, negative, or non-finite.
-    #[must_use]
-    pub fn new(luminance: f32) -> Option<Self> {
-        WhitePoint::new(luminance).map(Self)
-    }
-
-    /// Returns the linear luminance represented by this white point.
-    #[must_use]
-    pub const fn luminance(self) -> f32 {
-        self.0.level()
-    }
-}
-
-/// Estimates a p99.99 luminance white point for a complete still image.
-///
-/// This applies the paper's spatial outlier-rejection percentile to Rec. 709 luminance. It is an
-/// analogous statistic for luminance-based curves, not `MaxCLL`.
-#[must_use]
-pub fn estimate_luminance_white_point(colors: &[LinearRGB]) -> Option<LuminanceWhitePoint> {
-    let pixel_count = colors.len();
-    if pixel_count == 0 {
-        return None;
-    }
-
-    let retained = pixel_count / 10_000 + 1;
-    let mut luminances = BinaryHeap::with_capacity(retained);
-    for color in colors {
-        let luminance = OrderedLevel(color.luminance());
-        if luminances.len() < retained {
-            luminances.push(Reverse(luminance));
-        } else if let Some(mut threshold) = luminances.peek_mut()
-            && luminance > threshold.0
-        {
-            *threshold = Reverse(luminance);
-        }
-    }
-
-    luminances
-        .peek()
-        .and_then(|luminance| LuminanceWhitePoint::new(luminance.0.0))
-}
-
-/// Applies extended Reinhard to luminance while retaining color ratios.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ExtendedLuminanceReinhard {
-    white_point: LuminanceWhitePoint,
-}
-
-impl ExtendedLuminanceReinhard {
-    /// Creates an operator with the supplied luminance `white_point`.
-    #[must_use]
-    pub const fn new(white_point: LuminanceWhitePoint) -> Self {
-        Self { white_point }
-    }
-
-    /// Returns the luminance mapped to display white.
-    #[must_use]
-    pub const fn white_point(self) -> LuminanceWhitePoint {
-        self.white_point
-    }
-}
-
-impl ToneMapper for ExtendedLuminanceReinhard {
-    #[inline]
-    fn map(&self, color: LinearRGB) -> LinearRGB {
-        let luminance = color.luminance_f64();
-        let white_squared = f64::from(self.white_point.luminance()).powi(2);
-        let scale = (1.0 + luminance / white_squared) / (1.0 + luminance);
-        LinearRGB::displayable(color.components_f64().map(|component| component * scale))
-    }
-}
-
-/// Blends component-wise and luminance-based Reinhard results per component.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ReinhardJodie;
-
-impl ToneMapper for ReinhardJodie {
-    #[inline]
-    fn map(&self, color: LinearRGB) -> LinearRGB {
-        let components = color.components_f64();
-        let luminance_scale = 1.0 / (1.0 + color.luminance_f64());
-        let component_mapped = components.map(|component| component / (1.0 + component));
-        let luminance_mapped = components.map(|component| component * luminance_scale);
-        let blended = std::array::from_fn(|index| {
-            let weight = component_mapped[index];
-            luminance_mapped[index] * (1.0 - weight) + component_mapped[index] * weight
-        });
-        LinearRGB::displayable(blended)
-    }
-}
-
-/// Applies John Hable's Uncharted 2 filmic curve component-wise.
-///
-/// The operator includes the article's exposure bias of two and normalizes the curve at its `11.2`
-/// reference input. Consequently, a scene component of `5.6` maps to display white.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct Hable;
-
-impl ToneMapper for Hable {
-    #[inline]
-    fn map(&self, color: LinearRGB) -> LinearRGB {
-        let white_scale = 1.0 / hable_partial(11.2);
-        LinearRGB::displayable(
-            color
-                .components_f64()
-                .map(|component| hable_partial(component * 2.0) * white_scale),
-        )
-    }
-}
-
-fn hable_partial(value: f64) -> f64 {
-    const A: f64 = 0.15;
-    const B: f64 = 0.50;
-    const C: f64 = 0.10;
-    const D: f64 = 0.20;
-    const E: f64 = 0.02;
-    const F: f64 = 0.30;
-
-    ((value * (A * value + C * B) + D * E) / (value * (A * value + B) + D * F)) - E / F
-}
-
-/// Applies Stephen Hill's fitted ACES reference and display transform.
-///
-/// This compact fit uses the article's linear sRGB input and output matrices. It is a practical
-/// filmic curve rather than a complete Academy Color Encoding System pipeline.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AcesFitted;
-
-impl ToneMapper for AcesFitted {
-    #[inline]
-    fn map(&self, color: LinearRGB) -> LinearRGB {
-        aces_fitted(color)
-    }
-
-    #[inline]
-    fn map_in_place(&self, colors: &mut [LinearRGB]) {
-        let simd_len = colors.len() / TONE_MAPPING_LANES * TONE_MAPPING_LANES;
-        let (simd_colors, tail) = colors.split_at_mut(simd_len);
-        if !simd_colors.is_empty() {
-            aces_fitted_batch(simd_colors);
-        }
-        for color in tail {
-            *color = aces_fitted(*color);
-        }
-    }
-}
-
-#[inline]
-fn aces_fitted(color: LinearRGB) -> LinearRGB {
-    let transformed = multiply_rgb(ACES_INPUT_MATRIX, color.components_f64());
-    let fitted = transformed.map(|component| {
-        let numerator = component * (component + 0.024_578_6) - 0.000_090_537;
-        let denominator = component * (0.983_729 * component + 0.432_951) + 0.238_081;
-        numerator / denominator
-    });
-    LinearRGB::displayable(multiply_rgb(ACES_OUTPUT_MATRIX, fitted))
-}
-
-#[multiversion(targets("x86_64+avx2", "aarch64+neon"))]
-fn aces_fitted_batch(colors: &mut [LinearRGB]) {
-    let (chunks, tail) = colors.as_chunks_mut::<TONE_MAPPING_LANES>();
-    debug_assert!(
-        tail.is_empty(),
-        "fitted ACES SIMD input must contain complete four-pixel chunks"
-    );
-
-    for chunk in chunks {
-        let color = [0, 1, 2].map(|channel| {
-            F64x4::from_array(std::array::from_fn(|lane| {
-                f64::from(chunk[lane].0[channel])
-            }))
-        });
-        
-        let transformed = ACES_INPUT_MATRIX.map(|row| {
-            (F64x4::splat(row[0]) * color[0] + F64x4::splat(row[1]) * color[1])
-                + F64x4::splat(row[2]) * color[2]
-        });
-        
-        let fitted = transformed.map(|component| {
-            let numerator =
-                component * (component + F64x4::splat(0.024_578_6)) - F64x4::splat(0.000_090_537);
-            let denominator = component
-                * (F64x4::splat(0.983_729) * component + F64x4::splat(0.432_951))
-                + F64x4::splat(0.238_081);
-            numerator / denominator
-        });
-        
-        let mapped = ACES_OUTPUT_MATRIX.map(|row| {
-            (F64x4::splat(row[0]) * fitted[0] + F64x4::splat(row[1]) * fitted[1])
-                + F64x4::splat(row[2]) * fitted[2]
-        });
-        
-        let mapped = mapped.map(|component| {
-            let zero = F64x4::splat(0.0);
-            let one = F64x4::splat(1.0);
-            let below = component.is_nan() | component.simd_le(zero);
-            let bounded = below.select(zero, component.simd_ge(one).select(one, component));
-            bounded.cast::<f32>().to_array()
-        });
-
-        for lane in 0..TONE_MAPPING_LANES {
-            chunk[lane] = LinearRGB([mapped[0][lane], mapped[1][lane], mapped[2][lane]]);
-        }
-    }
-}
-
-fn multiply_rgb(matrix: [[f64; 3]; 3], color: [f64; 3]) -> [f64; 3] {
-    matrix.map(|row| row[0] * color[0] + row[1] * color[1] + row[2] * color[2])
-}
-
-/// Applies Krzysztof Narkowicz's scalar ACES approximation component-wise.
-///
-/// The input is pre-exposed by `0.6`, matching the article's comparison with the fitted transform.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct AcesApproximate;
-
-impl ToneMapper for AcesApproximate {
-    #[inline]
-    fn map(&self, color: LinearRGB) -> LinearRGB {
-        const A: f64 = 2.51;
-        const B: f64 = 0.03;
-        const C: f64 = 2.43;
-        const D: f64 = 0.59;
-        const E: f64 = 0.14;
-
-        LinearRGB::displayable(color.components_f64().map(|component| {
-            let exposed = component * 0.6;
-            exposed * (A * exposed + B) / (exposed * (C * exposed + D) + E)
-        }))
-    }
-}
-
-/// Stores a normalized camera response function sampled as a lookup table.
-///
-/// Irradiance samples must run from zero to one and be strictly increasing. Intensity samples must
-/// run from zero to one and be nondecreasing. Mapping uses linear interpolation between adjacent
-/// samples.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CameraResponse {
-    irradiance: Box<[f32]>,
-    intensity: Box<[f32]>,
-}
-
-impl CameraResponse {
-    /// Creates a validated camera response from corresponding sample arrays.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CameraResponseError`] when the arrays have different lengths, contain fewer than
-    /// two samples, do not span normalized black through white, contain non-finite or out-of-range
-    /// values, or are not ordered as required.
-    pub fn new(
-        irradiance: impl Into<Box<[f32]>>,
-        intensity: impl Into<Box<[f32]>>,
-    ) -> Result<Self, CameraResponseError> {
-        let irradiance = irradiance.into();
-        let intensity = intensity.into();
-
-        if irradiance.len() != intensity.len() {
-            return Err(CameraResponseError::LengthMismatch {
-                irradiance: irradiance.len(),
-                intensity: intensity.len(),
-            });
-        }
-        if irradiance.len() < 2 {
-            return Err(CameraResponseError::TooFewSamples(irradiance.len()));
-        }
-
-        for (index, sample) in irradiance.iter().copied().enumerate() {
-            if !sample.is_finite() || !(0.0..=1.0).contains(&sample) {
-                return Err(CameraResponseError::IrradianceOutOfRange(index));
-            }
-            if index > 0 && sample <= irradiance[index - 1] {
-                return Err(CameraResponseError::IrradianceNotIncreasing(index));
-            }
-        }
-
-        for (index, sample) in intensity.iter().copied().enumerate() {
-            if !sample.is_finite() || !(0.0..=1.0).contains(&sample) {
-                return Err(CameraResponseError::IntensityOutOfRange(index));
-            }
-            if index > 0 && sample < intensity[index - 1] {
-                return Err(CameraResponseError::IntensityDecreases(index));
-            }
-        }
-
-        #[allow(
-            clippy::float_cmp,
-            reason = "normalized camera curves must contain the exact conventional endpoints"
-        )]
-        if irradiance[0] != 0.0 || irradiance[irradiance.len() - 1] != 1.0 {
-            return Err(CameraResponseError::IrradianceEndpoints);
-        }
-        #[allow(
-            clippy::float_cmp,
-            reason = "normalized camera curves must contain the exact conventional endpoints"
-        )]
-        if intensity[0] != 0.0 || intensity[intensity.len() - 1] != 1.0 {
-            return Err(CameraResponseError::IntensityEndpoints);
-        }
-
-        Ok(Self {
-            irradiance,
-            intensity,
-        })
-    }
-
-    /// Returns the number of samples in the response curve.
-    #[must_use]
-    pub fn sample_count(&self) -> usize {
-        self.irradiance.len()
-    }
-
-    /// Creates a tone mapper whose horizontal curve extent is `white_point`.
-    ///
-    /// The article calls this parameter "ISO", but it acts as a linear-light white point: larger
-    /// values darken the same input color.
-    #[must_use]
-    pub const fn tone_mapper(&self, white_point: WhitePoint) -> CameraToneMapper<'_> {
-        CameraToneMapper {
-            response: self,
-            white_point,
-        }
-    }
-
-    fn intensity_at(&self, irradiance: f64) -> f64 {
-        match self
-            .irradiance
-            .binary_search_by(|sample| f64::from(*sample).total_cmp(&irradiance))
-        {
-            Ok(index) => f64::from(self.intensity[index]),
-            Err(0) => f64::from(self.intensity[0]),
-            Err(upper) if upper == self.irradiance.len() => f64::from(self.intensity[upper - 1]),
-            Err(upper) => {
-                let lower = upper - 1;
-                let low_irradiance = f64::from(self.irradiance[lower]);
-                let high_irradiance = f64::from(self.irradiance[upper]);
-                let position = (irradiance - low_irradiance) / (high_irradiance - low_irradiance);
-                let low_intensity = f64::from(self.intensity[lower]);
-                let high_intensity = f64::from(self.intensity[upper]);
-                low_intensity * (1.0 - position) + high_intensity * position
-            }
-        }
-    }
-}
-
-/// Maps colors through a sampled camera response curve.
-#[derive(Clone, Copy, Debug)]
-pub struct CameraToneMapper<'a> {
-    response: &'a CameraResponse,
-    white_point: WhitePoint,
-}
-
-impl CameraToneMapper<'_> {
-    /// Returns the scene level normalized to the end of the response curve.
-    #[must_use]
-    pub const fn white_point(self) -> WhitePoint {
-        self.white_point
-    }
-}
-
-impl ToneMapper for CameraToneMapper<'_> {
-    #[inline]
-    fn map(&self, color: LinearRGB) -> LinearRGB {
-        let white = f64::from(self.white_point.level());
-        let mapped = color.components_f64().map(|component| {
-            let irradiance = (component / white).clamp(0.0, 1.0);
-            self.response.intensity_at(irradiance)
-        });
-        LinearRGB::displayable(mapped)
-    }
-}
-
-/// Describes invalid camera-response lookup-table data.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CameraResponseError {
-    /// The irradiance and intensity arrays have different lengths.
-    LengthMismatch {
-        /// Number of irradiance samples.
-        irradiance: usize,
-        /// Number of intensity samples.
-        intensity: usize,
-    },
-    /// The curve contains fewer than two samples.
-    TooFewSamples(usize),
-    /// An irradiance sample is non-finite or outside `0.0..=1.0`.
-    IrradianceOutOfRange(usize),
-    /// An irradiance sample does not exceed its predecessor.
-    IrradianceNotIncreasing(usize),
-    /// An intensity sample is non-finite or outside `0.0..=1.0`.
-    IntensityOutOfRange(usize),
-    /// An intensity sample is lower than its predecessor.
-    IntensityDecreases(usize),
-    /// The irradiance domain does not start at zero and end at one.
-    IrradianceEndpoints,
-    /// The intensity range does not start at zero and end at one.
-    IntensityEndpoints,
-}
-
-impl fmt::Display for CameraResponseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Self::LengthMismatch {
-                irradiance,
-                intensity,
-            } => write!(
-                f,
-                "camera response has {irradiance} irradiance samples and {intensity} intensity samples"
-            ),
-            Self::TooFewSamples(count) => {
-                write!(f, "camera response requires two samples, got {count}")
-            }
-            Self::IrradianceOutOfRange(index) => write!(
-                f,
-                "camera irradiance sample {index} is not finite normalized data"
-            ),
-            Self::IrradianceNotIncreasing(index) => {
-                write!(f, "camera irradiance sample {index} does not increase")
-            }
-            Self::IntensityOutOfRange(index) => write!(
-                f,
-                "camera intensity sample {index} is not finite normalized data"
-            ),
-            Self::IntensityDecreases(index) => {
-                write!(f, "camera intensity sample {index} decreases")
-            }
-            Self::IrradianceEndpoints => {
-                f.write_str("camera irradiance must start at zero and end at one")
-            }
-            Self::IntensityEndpoints => {
-                f.write_str("camera intensity must start at zero and end at one")
-            }
-        }
-    }
-}
-
-impl std::error::Error for CameraResponseError {}
+#[doc(inline)]
+pub use aces::{AcesApproximate, AcesFitted};
+#[doc(inline)]
+pub use bt2446::BT2446A;
+#[doc(inline)]
+pub use camera_response::{CameraResponse, CameraResponseError, CameraToneMapper};
+#[doc(inline)]
+pub use clamp::{Clamp, ScaledClamp};
+#[doc(inline)]
+pub use hable::Hable;
+#[doc(inline)]
+pub use reinhard::{
+    ExtendedLuminanceReinhard, ExtendedReinhard, LuminanceReinhard, LuminanceWhitePoint, Reinhard,
+    ReinhardJodie, estimate_luminance_white_point,
+};
 
 fn sanitize_component(component: f32) -> f32 {
     if component.is_nan() || component <= 0.0 {
@@ -1438,7 +969,7 @@ mod tests {
         let extended_luminance = ExtendedLuminanceReinhard::new(tiny_luminance);
         let camera_response = CameraResponse::new(vec![0.0, 1.0], vec![0.0, 1.0]).unwrap();
         let camera = camera_response.tone_mapper(tiny);
-        let mappers: [&dyn ToneMapper; 11] = [
+        let mappers: [&dyn ToneMapper; 12] = [
             &Clamp,
             &ScaledClamp::new(tiny),
             &Reinhard,
@@ -1446,6 +977,7 @@ mod tests {
             &LuminanceReinhard,
             &extended_luminance,
             &ReinhardJodie,
+            &BT2446A,
             &Hable,
             &AcesFitted,
             &AcesApproximate,
@@ -1485,6 +1017,35 @@ mod tests {
     }
 
     #[test]
+    fn bt2446a_matches_the_report_grayscale_functions() {
+        let cases = [
+            (0.0, 0.0),
+            (0.1, 0.031_311_903),
+            (1.0, 0.226_634_16),
+            (2.0, 0.401_323_68),
+            (5.0, 0.731_492_7),
+            (10.0, 1.0),
+            (20.0, 1.0),
+        ];
+
+        for (input, expected) in cases {
+            assert_components_close(BT2446A.map(LinearRGB::new([input; 3])), [expected; 3]);
+        }
+    }
+
+    #[test]
+    fn bt2446a_applies_the_report_color_correction() {
+        assert_components_close(
+            BT2446A.map(LinearRGB::new([1.0, 0.5, 0.25])),
+            [0.229_176_3, 0.120_463_48, 0.064_287_245],
+        );
+        assert_components_close(
+            BT2446A.map(LinearRGB::new([0.0, 10.0, 0.0])),
+            [0.002_021_509, 1.0, 0.002_021_509],
+        );
+    }
+
+    #[test]
     fn luminance_white_point_rejects_the_brightest_outlier() {
         let mut colors = vec![LinearRGB::new([1.0; 3]); 9_998];
         colors.extend([LinearRGB::new([4.0; 3]), LinearRGB::new([126.0; 3])]);
@@ -1511,9 +1072,8 @@ mod tests {
 
     #[test]
     fn uncharted_two_uses_the_article_exposure_and_white_scale() {
-        let [middle_gray, reference_white, filmic_white] = Hable
-            .map(LinearRGB::new([0.18, 1.0, 5.6]))
-            .components();
+        let [middle_gray, reference_white, filmic_white] =
+            Hable.map(LinearRGB::new([0.18, 1.0, 5.6])).components();
 
         assert_approximately_equal(middle_gray, 0.128_338_45);
         assert_approximately_equal(reference_white, 0.492_918_55);
@@ -1577,17 +1137,17 @@ mod tests {
             CameraResponse::new(vec![0.0, 0.5, 0.5], vec![0.0, 0.5, 1.0]).unwrap_err(),
             CameraResponseError::IrradianceNotIncreasing(2)
         );
-        
+
         assert_eq!(
             CameraResponse::new(vec![0.0, 0.5, 1.0], vec![0.0, 0.75, 0.5]).unwrap_err(),
             CameraResponseError::IntensityDecreases(2)
         );
-        
+
         assert_eq!(
             CameraResponse::new(vec![0.1, 1.0], vec![0.0, 1.0]).unwrap_err(),
             CameraResponseError::IrradianceEndpoints
         );
-        
+
         assert_eq!(
             CameraResponse::new(vec![0.0, 1.0], vec![0.1, 1.0]).unwrap_err(),
             CameraResponseError::IntensityEndpoints
@@ -1613,19 +1173,19 @@ mod tests {
             LinearRGB::new([4.0, 0.0, 0.0]),
             LinearRGB::new([0.0, 0.0, 126.0]),
         ]);
-        
+
         let pixel_count = NonZeroUsize::new(colors.len()).expect("test MaxCLL input is nonempty");
 
         let mut percentile = MaxCllEstimator::with_mode(pixel_count, MaxCllMode::Percentile99_99);
         percentile.observe_many(&colors);
-        
+
         let percentile = percentile
             .finish()
             .expect("the percentile estimator observes every declared pixel");
 
         let mut true_maximum = MaxCllEstimator::with_mode(pixel_count, MaxCllMode::TrueMaximum);
         true_maximum.observe_many(&colors);
-        
+
         let true_maximum = true_maximum
             .finish()
             .expect("the maximum estimator observes every declared pixel");
@@ -1682,13 +1242,13 @@ mod tests {
             let colors: Vec<_> = (0..pixel_count)
                 .map(|index| palette[index % palette.len()])
                 .collect();
-            
+
             let expected = estimate_max_cll_scalarly(&colors);
-            
+
             let mut estimator = MaxCllEstimator::new(
                 NonZeroUsize::new(colors.len()).expect("test MaxCLL input is nonempty"),
             );
-            
+
             for batch in colors.chunks(257) {
                 estimator.observe_many(batch);
             }
@@ -1715,7 +1275,7 @@ mod tests {
             LinearRGB::default(),
             LinearRGB::new([0.5; 3]),
         ];
-        
+
         let mut estimator =
             MaxCllEstimator::new(NonZeroUsize::new(colors.len()).expect("test input is nonempty"));
         estimator.observe_many(&colors);
@@ -1723,7 +1283,7 @@ mod tests {
         let max_cll = estimator
             .finish()
             .expect("the batch test observes every declared pixel");
-        
+
         assert_eq!(max_cll.level(), 5.0);
         assert_eq!(max_cll.channel(), ColorChannel::Blue);
     }
@@ -1732,7 +1292,7 @@ mod tests {
     fn max_cll_batch_counts_lanes_filtered_below_the_threshold() {
         let mut colors = vec![LinearRGB::new([10.0, 0.0, 0.0])];
         colors.extend(std::iter::repeat_n(LinearRGB::new([1.0; 3]), 8));
-        
+
         let mut estimator =
             MaxCllEstimator::new(NonZeroUsize::new(colors.len()).expect("test input is nonempty"));
         estimator.observe_many(&colors);
@@ -1740,7 +1300,7 @@ mod tests {
         let max_cll = estimator
             .finish()
             .expect("filtered lanes still count as observations");
-        
+
         assert_eq!(max_cll.level(), 10.0);
         assert_eq!(max_cll.channel(), ColorChannel::Red);
     }
