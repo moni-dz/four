@@ -1,11 +1,15 @@
 //! Owns frame geometry, bounded coefficient storage, and pixel materialization.
 
 use exn::OptionExt;
+use rayon::prelude::*;
 
 use super::{
     BLOCK_SIDE, COMPONENTS_MAX, DIMENSION_MAX, DecodedImage, JPEGError, JPEGLimit, JPEGTableKind,
     PIXELS_MAX, PROGRESSIVE_COEFFICIENT_BYTES_MAX, Result, divide_ceil, error, idct,
 };
+
+const PARALLEL_PIXELS_MIN: usize = 256 * 1024;
+const PARALLEL_PIXELS_PER_JOB: usize = 64 * 1024;
 
 #[derive(Clone, Copy)]
 pub(super) enum ColorTransform {
@@ -151,24 +155,50 @@ impl Frame {
         let byte_count = u64::from(self.width) * u64::from(self.height) * 4;
         let capacity = usize::try_from(byte_count)
             .expect("the decoded pixel limit fits every supported pointer width");
-        let mut rgba = Vec::with_capacity(capacity);
-
-        for y in 0..self.height {
-            for x in 0..self.width {
-                let first = self.sample(0, x, y);
-                let pixel = if self.components.len() == 1 {
-                    [first, first, first, 255]
-                } else {
-                    let second = self.sample(1, x, y);
-                    let third = self.sample(2, x, y);
-                    convert_color(first, second, third, transform)
-                };
-                rgba.extend_from_slice(&pixel);
-            }
-        }
+        let pixel_count = capacity / 4;
+        let rgba = if pixel_count >= PARALLEL_PIXELS_MIN {
+            self.rgba_pixels_parallel(transform, capacity)
+        } else {
+            self.rgba_pixels_sequential(transform, capacity)
+        };
 
         invariant_eq!(rgba.len(), capacity);
         DecodedImage::new(self.width, self.height, rgba)
+    }
+
+    fn rgba_pixels_sequential(&self, transform: ColorTransform, capacity: usize) -> Vec<u8> {
+        let mut rgba = Vec::with_capacity(capacity);
+        for y in 0..self.height {
+            for x in 0..self.width {
+                rgba.extend_from_slice(&self.rgba_pixel(x, y, transform));
+            }
+        }
+        rgba
+    }
+
+    fn rgba_pixels_parallel(&self, transform: ColorTransform, capacity: usize) -> Vec<u8> {
+        let width = usize::try_from(self.width).expect("validated JPEG width fits usize");
+        let mut rgba = vec![0; capacity];
+        rgba.par_chunks_exact_mut(4)
+            .with_min_len(PARALLEL_PIXELS_PER_JOB)
+            .enumerate()
+            .for_each(|(index, target)| {
+                let x = u32::try_from(index % width).expect("JPEG pixel x fits u32");
+                let y = u32::try_from(index / width).expect("JPEG pixel y fits u32");
+                target.copy_from_slice(&self.rgba_pixel(x, y, transform));
+            });
+        rgba
+    }
+
+    fn rgba_pixel(&self, x: u32, y: u32, transform: ColorTransform) -> [u8; 4] {
+        let first = self.sample(0, x, y);
+        if self.components.len() == 1 {
+            [first, first, first, 255]
+        } else {
+            let second = self.sample(1, x, y);
+            let third = self.sample(2, x, y);
+            convert_color(first, second, third, transform)
+        }
     }
 
     pub(super) fn sample(&self, component_index: usize, x: u32, y: u32) -> u8 {
@@ -369,4 +399,59 @@ pub(super) fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn component(width: u32, height: u32, value: impl Fn(usize) -> u8) -> FrameComponent {
+        let sample_count = usize::try_from(u64::from(width) * u64::from(height))
+            .expect("test sample count fits usize");
+        FrameComponent {
+            identifier: 1,
+            horizontal_sampling: 1,
+            vertical_sampling: 1,
+            quantization_table: 0,
+            plane_width: width,
+            plane: (0..sample_count).map(value).collect(),
+            block_columns: width.div_ceil(BLOCK_SIDE),
+            block_rows: height.div_ceil(BLOCK_SIDE),
+            data_block_columns: width.div_ceil(BLOCK_SIDE),
+            data_block_rows: height.div_ceil(BLOCK_SIDE),
+            coefficients: Vec::new(),
+        }
+    }
+
+    fn frame(width: u32, height: u32, components: Vec<FrameComponent>) -> Frame {
+        Frame {
+            width,
+            height,
+            mcu_columns: width.div_ceil(BLOCK_SIDE),
+            mcu_rows: height.div_ceil(BLOCK_SIDE),
+            max_horizontal_sampling: 1,
+            max_vertical_sampling: 1,
+            components,
+            process: CodingProcess::Sequential,
+        }
+    }
+
+    #[test]
+    fn parallel_pixel_materialization_preserves_grayscale_order() {
+        let width = 512;
+        let height = 512;
+        let component = component(width, height, |index| {
+            u8::try_from(index % 256).expect("test sample fits u8")
+        });
+        let expected: Vec<_> = component
+            .plane
+            .iter()
+            .copied()
+            .flat_map(|sample| [sample, sample, sample, 255])
+            .collect();
+
+        let image = frame(width, height, vec![component]).into_image(ColorTransform::Rgb);
+
+        assert_eq!(image.rgba8(), expected);
+    }
 }
