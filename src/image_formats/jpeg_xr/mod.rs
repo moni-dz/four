@@ -24,6 +24,7 @@ use std::num::NonZeroUsize;
 use ::jpegxr::{
     BitDepthBits, ColorFormat, ImageDecode, JXRError, PixelFormat as CodecPixelFormat, PixelInfo,
 };
+use rayon::prelude::*;
 use tonemapping::{
     Clamp, ColorChannel as ToneColorChannel, LinearRGB, LuminanceWhitePoint, MaxCllEstimator,
     MaxCllMode, ToneMapper, ToneMappingMethod, WhitePoint,
@@ -42,6 +43,8 @@ const SC_RGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 const SOURCE_BUFFER_MAX: usize = 512 * 1024 * 1024;
 // Three f32 channels plus staged alpha occupy roughly 13 KiB, leaving room in common L1 caches.
 const HDR_BATCH_PIXELS: usize = 1_024;
+const PARALLEL_PIXELS_MIN: usize = 256 * 1024;
+const PARALLEL_PIXELS_PER_JOB: usize = 64 * 1024;
 
 /// Identifies a color channel in decoded JPEG XR RGB data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -618,10 +621,12 @@ fn normalize(
         None
     };
     let hdr_metrics = analysis.and_then(|analysis| analysis.hdr_metrics);
-    let mut rgba = Vec::with_capacity(output_len);
+    let mut rgba = vec![0; output_len];
     let has_nonzero_alpha = if layout.encoding.is_hdr() {
         if method == ToneMappingMethod::Clamp {
-            append_hdr_pixels_scalar(source, width, row_stride, layout, &Clamp, &mut rgba)?
+            write_pixel_slabs(source, width, row_stride, &mut rgba, |source, rgba| {
+                write_hdr_pixels_scalar(source, width, row_stride, layout, &Clamp, rgba)
+            })?
         } else {
             let white_point = analysis
                 .and_then(|analysis| analysis.max_cll)
@@ -630,10 +635,14 @@ fn normalize(
                 .and_then(|analysis| analysis.luminance_white_point)
                 .map_or_else(display_luminance_white_point, hdr_luminance_white_point);
             let mapper = method.resolve(white_point, luminance_white_point);
-            append_hdr_pixels(source, width, row_stride, layout, &mapper, &mut rgba)?
+            write_pixel_slabs(source, width, row_stride, &mut rgba, |source, rgba| {
+                write_hdr_pixels(source, width, row_stride, layout, &mapper, rgba)
+            })?
         }
     } else {
-        append_sdr_pixels(source, width, row_stride, layout, &mut rgba)?
+        write_pixel_slabs(source, width, row_stride, &mut rgba, |source, rgba| {
+            write_sdr_pixels(source, width, row_stride, layout, rgba)
+        })?
     };
     if layout.encoding.is_hdr()
         && layout.has_alpha
@@ -648,54 +657,89 @@ fn normalize(
     Ok(NormalizedImage { rgba, hdr_metrics })
 }
 
-fn append_sdr_pixels(
+fn write_pixel_slabs(
+    source: &[u8],
+    width: usize,
+    row_stride: usize,
+    rgba: &mut [u8],
+    writer: impl Fn(&[u8], &mut [u8]) -> Result<bool> + Sync,
+) -> Result<bool> {
+    let row_count = source.len() / row_stride;
+    let pixel_count = width
+        .checked_mul(row_count)
+        .expect("validated JPEG XR pixel count fits usize");
+    if pixel_count < PARALLEL_PIXELS_MIN {
+        return writer(source, rgba);
+    }
+
+    let rows_per_job = PARALLEL_PIXELS_PER_JOB.div_ceil(width);
+    let source_bytes_per_job = rows_per_job * row_stride;
+    let rgba_bytes_per_job = rows_per_job * width * 4;
+    source
+        .par_chunks(source_bytes_per_job)
+        .zip(rgba.par_chunks_mut(rgba_bytes_per_job))
+        .map(|(source, rgba)| writer(source, rgba))
+        .try_reduce(|| false, |left, right| Ok::<bool, Error>(left || right))
+}
+
+fn write_sdr_pixels(
     source: &[u8],
     width: usize,
     row_stride: usize,
     layout: PixelLayout,
-    rgba: &mut Vec<u8>,
+    rgba: &mut [u8],
 ) -> Result<bool> {
     let mut has_nonzero_alpha = false;
-    for row in source.chunks_exact(row_stride) {
-        for x in 0..width {
+    for (row, target_row) in source
+        .chunks_exact(row_stride)
+        .zip(rgba.chunks_exact_mut(width * 4))
+    {
+        let (targets, remainder) = target_row.as_chunks_mut::<4>();
+        invariant!(remainder.is_empty());
+        for (x, target) in targets.iter_mut().enumerate() {
             let pixel = pixel_at(row, x, layout)?;
             let (color, alpha) = layout.read_pixel(pixel)?;
             has_nonzero_alpha |= alpha > 0.0;
             let color = color.map(normalized_to_u8);
-            rgba.extend_from_slice(&[color[0], color[1], color[2], normalized_to_u8(alpha)]);
+            target.copy_from_slice(&[color[0], color[1], color[2], normalized_to_u8(alpha)]);
         }
     }
     Ok(has_nonzero_alpha)
 }
 
-fn append_hdr_pixels_scalar(
+fn write_hdr_pixels_scalar(
     source: &[u8],
     width: usize,
     row_stride: usize,
     layout: PixelLayout,
-    mapper: &impl ToneMapper,
-    rgba: &mut Vec<u8>,
+    mapper: &(impl ToneMapper + Sync),
+    rgba: &mut [u8],
 ) -> Result<bool> {
     let mut has_nonzero_alpha = false;
-    for row in source.chunks_exact(row_stride) {
-        for x in 0..width {
+    for (row, target_row) in source
+        .chunks_exact(row_stride)
+        .zip(rgba.chunks_exact_mut(width * 4))
+    {
+        let (targets, remainder) = target_row.as_chunks_mut::<4>();
+        invariant!(remainder.is_empty());
+        for (x, target) in targets.iter_mut().enumerate() {
             let pixel = pixel_at(row, x, layout)?;
             let (color, alpha) = layout.read_pixel(pixel)?;
             has_nonzero_alpha |= alpha > 0.0;
             let color = display_linear_to_srgb8(mapper.map(LinearRGB::new(color)));
-            rgba.extend_from_slice(&[color[0], color[1], color[2], normalized_to_u8(alpha)]);
+            target.copy_from_slice(&[color[0], color[1], color[2], normalized_to_u8(alpha)]);
         }
     }
     Ok(has_nonzero_alpha)
 }
 
-fn append_hdr_pixels(
+fn write_hdr_pixels(
     source: &[u8],
     width: usize,
     row_stride: usize,
     layout: PixelLayout,
-    mapper: &impl ToneMapper,
-    rgba: &mut Vec<u8>,
+    mapper: &(impl ToneMapper + Sync),
+    rgba: &mut [u8],
 ) -> Result<bool> {
     let row_count = source.len() / row_stride;
     let pixel_count = width
@@ -705,6 +749,7 @@ fn append_hdr_pixels(
     let mut colors = Vec::with_capacity(batch_capacity);
     let mut alphas = Vec::with_capacity(batch_capacity);
     let mut has_nonzero_alpha = false;
+    let mut rgba_offset = 0;
 
     for row in source.chunks_exact(row_stride) {
         for x in 0..width {
@@ -715,20 +760,22 @@ fn append_hdr_pixels(
             alphas.push(normalized_to_u8(alpha));
 
             if colors.len() == HDR_BATCH_PIXELS {
-                append_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba);
+                write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
             }
         }
     }
 
-    append_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba);
+    write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
+    invariant_eq!(rgba_offset, rgba.len());
     Ok(has_nonzero_alpha)
 }
 
-fn append_tone_mapped_batch(
-    mapper: &impl ToneMapper,
+fn write_tone_mapped_batch(
+    mapper: &(impl ToneMapper + Sync),
     colors: &mut Vec<LinearRGB>,
     alphas: &mut Vec<u8>,
-    rgba: &mut Vec<u8>,
+    rgba: &mut [u8],
+    rgba_offset: &mut usize,
 ) {
     invariant_eq!(colors.len(), alphas.len());
     if colors.is_empty() {
@@ -736,12 +783,44 @@ fn append_tone_mapped_batch(
     }
     mapper.map_in_place(colors);
 
-    for (color, alpha) in colors.iter().copied().zip(alphas.iter().copied()) {
+    let byte_count = colors.len() * 4;
+    let target = &mut rgba[*rgba_offset..*rgba_offset + byte_count];
+    let (targets, remainder) = target.as_chunks_mut::<4>();
+    invariant!(remainder.is_empty());
+    for ((color, alpha), target) in colors
+        .iter()
+        .copied()
+        .zip(alphas.iter().copied())
+        .zip(targets.iter_mut())
+    {
         let color = display_linear_to_srgb8(color);
-        rgba.extend_from_slice(&[color[0], color[1], color[2], alpha]);
+        target.copy_from_slice(&[color[0], color[1], color[2], alpha]);
     }
+    *rgba_offset += byte_count;
     colors.clear();
     alphas.clear();
+}
+
+#[cfg(test)]
+fn append_hdr_pixels(
+    source: &[u8],
+    width: usize,
+    row_stride: usize,
+    layout: PixelLayout,
+    mapper: &(impl ToneMapper + Sync),
+    rgba: &mut Vec<u8>,
+) -> Result<bool> {
+    let byte_count = source.len() / row_stride * width * 4;
+    let start = rgba.len();
+    rgba.resize(start + byte_count, 0);
+    write_hdr_pixels(
+        source,
+        width,
+        row_stride,
+        layout,
+        mapper,
+        &mut rgba[start..],
+    )
 }
 
 fn pixel_at(row: &[u8], x: usize, layout: PixelLayout) -> Result<&[u8]> {
@@ -1377,7 +1456,7 @@ fn codec_error(source: &JXRError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tonemapping::{BT2446A, ExtendedLuminanceReinhard, ExtendedReinhard};
+    use tonemapping::{AcesFitted, BT2446A, ExtendedLuminanceReinhard, ExtendedReinhard};
 
     fn float_rgb_layout() -> PixelLayout {
         PixelLayout {
@@ -1479,6 +1558,17 @@ mod tests {
             .collect();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn parallel_hdr_normalization_matches_scalar() {
+        let colors = vec![[4.0, 2.0, 0.5]; PARALLEL_PIXELS_MIN];
+        assert_hdr_normalization_matches_scalar(
+            &colors,
+            512,
+            ToneMappingMethod::ACESFitted,
+            &AcesFitted,
+        );
     }
 
     #[test]
