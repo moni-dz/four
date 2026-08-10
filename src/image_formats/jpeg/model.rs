@@ -4,12 +4,14 @@ use exn::OptionExt;
 use rayon::prelude::*;
 
 use super::{
-    BLOCK_SIDE, COMPONENTS_MAX, DIMENSION_MAX, DecodedImage, JPEGError, JPEGLimit, JPEGTableKind,
-    PIXELS_MAX, PROGRESSIVE_COEFFICIENT_BYTES_MAX, Result, divide_ceil, error, idct,
+    BLOCK_SIDE, COMPONENTS_MAX, DIMENSION_MAX, DecodedImage, Error, JPEGError, JPEGLimit,
+    JPEGTableKind, PIXELS_MAX, PROGRESSIVE_COEFFICIENT_BYTES_MAX, Result, divide_ceil, error, idct,
 };
 
 const PARALLEL_PIXELS_MIN: usize = 256 * 1024;
 const PARALLEL_PIXELS_PER_JOB: usize = 64 * 1024;
+const PARALLEL_BLOCKS_MIN: usize = 4 * 1024;
+const PARALLEL_BLOCKS_PER_JOB: usize = 1_024;
 
 #[derive(Clone, Copy)]
 pub(super) enum ColorTransform {
@@ -131,15 +133,12 @@ impl Frame {
                 )));
             }
 
-            for block_index in 0..block_count {
-                let block_index_usize = usize::try_from(block_index)
-                    .expect("the bounded component block count fits usize");
-                let quantized = component.coefficients[block_index_usize];
-                let coefficients = dequantize_block(&quantized, &quantization)?;
-                let samples = idct::inverse(&coefficients);
-                let block_x = block_index % component.block_columns;
-                let block_y = block_index / component.block_columns;
-                write_block(component, block_x, block_y, &samples);
+            let block_count =
+                usize::try_from(block_count).expect("the bounded component block count fits usize");
+            if block_count >= PARALLEL_BLOCKS_MIN {
+                materialize_component_parallel(component, &quantization)?;
+            } else {
+                materialize_component_sequential(component, &quantization)?;
             }
 
             component.coefficients = Vec::new();
@@ -214,6 +213,62 @@ impl Frame {
         let index = u64::from(sample_y) * u64::from(component.plane_width) + u64::from(sample_x);
         let index = usize::try_from(index).expect("the bounded component plane index fits usize");
         component.plane[index]
+    }
+}
+
+fn materialize_component_sequential(
+    component: &mut FrameComponent,
+    quantization: &[u16; 64],
+) -> Result<()> {
+    for block_index_usize in 0..component.coefficients.len() {
+        let block_index =
+            u32::try_from(block_index_usize).expect("the bounded component block count fits u32");
+        let quantized = component.coefficients[block_index_usize];
+        let coefficients = dequantize_block(&quantized, quantization)?;
+        let samples = idct::inverse(&coefficients);
+        let block_x = block_index % component.block_columns;
+        let block_y = block_index / component.block_columns;
+        write_block(component, block_x, block_y, &samples);
+    }
+    Ok(())
+}
+
+fn materialize_component_parallel(
+    component: &mut FrameComponent,
+    quantization: &[u16; 64],
+) -> Result<()> {
+    let block_columns = usize::try_from(component.block_columns)
+        .expect("the bounded component block width fits usize");
+    let plane_width = usize::try_from(component.plane_width)
+        .expect("the bounded component plane width fits usize");
+    let block_side = usize::try_from(BLOCK_SIDE).expect("JPEG block side fits usize");
+    let plane_bytes_per_block_row = plane_width * block_side;
+    let block_rows_per_job = PARALLEL_BLOCKS_PER_JOB.div_ceil(block_columns);
+    let coefficients = &component.coefficients;
+
+    component
+        .plane
+        .par_chunks_mut(plane_bytes_per_block_row)
+        .zip(coefficients.par_chunks(block_columns))
+        .with_min_len(block_rows_per_job)
+        .try_for_each(|(plane, coefficient_row)| {
+            for (block_x, quantized) in coefficient_row.iter().enumerate() {
+                let coefficients = dequantize_block(quantized, quantization)?;
+                let samples = idct::inverse(&coefficients);
+                write_block_row(plane, plane_width, block_x, &samples);
+            }
+            Ok::<(), Error>(())
+        })
+}
+
+fn write_block_row(plane: &mut [u8], plane_width: usize, block_x: usize, samples: &[u8; 64]) {
+    let block_side = usize::try_from(BLOCK_SIDE).expect("JPEG block side fits usize");
+    let pixel_x = block_x * block_side;
+    for y in 0..block_side {
+        let target_start = y * plane_width + pixel_x;
+        let source_start = y * block_side;
+        plane[target_start..target_start + block_side]
+            .copy_from_slice(&samples[source_start..source_start + block_side]);
     }
 }
 
@@ -436,6 +491,14 @@ mod tests {
         }
     }
 
+    fn progressive_component(width: u32, height: u32, coefficients: [i32; 64]) -> FrameComponent {
+        let mut component = component(width, height, |_| 0);
+        let block_count = usize::try_from(component.block_columns * component.block_rows)
+            .expect("test block count fits usize");
+        component.coefficients = vec![coefficients; block_count];
+        component
+    }
+
     #[test]
     fn parallel_pixel_materialization_preserves_grayscale_order() {
         let width = 512;
@@ -453,5 +516,32 @@ mod tests {
         let image = frame(width, height, vec![component]).into_image(ColorTransform::Rgb);
 
         assert_eq!(image.rgba8(), expected);
+    }
+
+    #[test]
+    fn parallel_progressive_materialization_writes_complete_block_rows() {
+        let width = 512;
+        let height = 512;
+        let mut component = progressive_component(width, height, [0; 64]);
+        for (index, coefficients) in component.coefficients.iter_mut().enumerate() {
+            coefficients[0] = i32::try_from(index % 16 * 8).expect("test coefficient fits i32");
+        }
+        let block_columns = component.block_columns;
+        let mut frame = frame(width, height, vec![component]);
+        frame.process = CodingProcess::Progressive;
+        let mut quantization = [None; COMPONENTS_MAX];
+        quantization[0] = Some([1; 64]);
+
+        frame.materialize_progressive(&quantization).unwrap();
+
+        assert_eq!(frame.components[0].coefficients.len(), 0);
+        for y in 0..height {
+            for x in 0..width {
+                let block_index = y / BLOCK_SIDE * block_columns + x / BLOCK_SIDE;
+                let expected = 128 + u8::try_from(block_index % 16).expect("test sample fits u8");
+                let index = usize::try_from(y * width + x).expect("test sample index fits usize");
+                assert_eq!(frame.components[0].plane[index], expected);
+            }
+        }
     }
 }
