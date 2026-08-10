@@ -19,7 +19,7 @@ mod error;
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
-use std::io::Cursor;
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::num::NonZeroUsize;
 use std::simd::{Select, Simd, StdFloat, cmp::SimdPartialOrd, num::SimdFloat};
 
@@ -348,8 +348,8 @@ pub fn decode_with_metadata_and_options(
         return Err(error(JPEGXRError::Signature));
     }
 
-    let mut decoder =
-        ImageDecode::with_reader(Cursor::new(bytes)).map_err(|source| codec_error(&source))?;
+    let mut decoder = ImageDecode::with_reader(JPEGXRReader::new(bytes))
+        .map_err(|source| codec_error(&source))?;
 
     let (width, height) = decoder.get_size().map_err(|source| codec_error(&source))?;
     let (width, height) = validate_dimensions(width, height)?;
@@ -389,6 +389,36 @@ pub fn decode_with_metadata_and_options(
         image: DecodedImage::new(width, height, normalized.rgba),
         metadata,
     })
+}
+
+/// Adapts memory input to the reference codec's file-stream behavior.
+///
+/// The codec requests an oversized final block, consumes its available prefix, and ignores the
+/// reported EOF. `Cursor` specializes `read_exact` to leave that prefix uncopied. This newtype only
+/// delegates `read`, so the default `Read::read_exact` copies the prefix before reporting EOF, as a
+/// file stream does.
+struct JPEGXRReader<'a> {
+    cursor: Cursor<&'a [u8]>,
+}
+
+impl<'a> JPEGXRReader<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self {
+            cursor: Cursor::new(bytes),
+        }
+    }
+}
+
+impl Read for JPEGXRReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.cursor.read(buf)
+    }
+}
+
+impl Seek for JPEGXRReader<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.cursor.seek(pos)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
