@@ -26,10 +26,11 @@ use ::jpegxr::{
 };
 use tonemapping::{
     AcesApproximate, AcesFitted, Clamp, ColorChannel as ToneColorChannel,
-    ExtendedLuminanceReinhard, ExtendedReinhard, LinearRgb, LuminanceReinhard, LuminanceWhitePoint,
-    MaxCllEstimator, MaxCllMode, Reinhard, ReinhardJodie, ScaledClamp, ToneMapper,
-    ToneMappingMethod, Hable, WhitePoint,
+    ExtendedLuminanceReinhard, ExtendedReinhard, Hable, LinearRgb, LuminanceReinhard,
+    LuminanceWhitePoint, MaxCllEstimator, MaxCllMode, Reinhard, ReinhardJodie, ScaledClamp,
+    ToneMapper, ToneMappingMethod, WhitePoint,
 };
+use zerocopy::FromBytes;
 
 use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
 use error::error;
@@ -402,7 +403,7 @@ enum SampleEncoding {
     Fixed32,
     Float16,
     Float32,
-    Rgbe,
+    RGBE,
     Unsigned8,
     Unsigned16,
 }
@@ -410,7 +411,7 @@ enum SampleEncoding {
 impl SampleEncoding {
     const fn bytes(self) -> usize {
         match self {
-            Self::Unsigned8 | Self::Rgbe => 1,
+            Self::Unsigned8 | Self::RGBE => 1,
             Self::Unsigned16 | Self::Fixed16 | Self::Float16 => 2,
             Self::Fixed32 | Self::Float32 => 4,
         }
@@ -419,13 +420,13 @@ impl SampleEncoding {
     const fn is_hdr(self) -> bool {
         matches!(
             self,
-            Self::Fixed16 | Self::Fixed32 | Self::Float16 | Self::Float32 | Self::Rgbe
+            Self::Fixed16 | Self::Fixed32 | Self::Float16 | Self::Float32 | Self::RGBE
         )
     }
 
     const fn bits_per_channel(self) -> u8 {
         match self {
-            Self::Unsigned8 | Self::Rgbe => 8,
+            Self::Unsigned8 | Self::RGBE => 8,
             Self::Unsigned16 | Self::Fixed16 | Self::Float16 => 16,
             Self::Fixed32 | Self::Float32 => 32,
         }
@@ -466,7 +467,7 @@ impl PixelLayout {
         let color_channels = match info.color_format() {
             ColorFormat::YOnly => 1,
             ColorFormat::RGB => 3,
-            ColorFormat::RGBE if encoding == SampleEncoding::Rgbe => 3,
+            ColorFormat::RGBE if encoding == SampleEncoding::RGBE => 3,
             other => {
                 return Err(unsupported(format, &format!("{other:?} color data")));
             }
@@ -476,14 +477,14 @@ impl PixelLayout {
         let source_channels = info.channels();
         let expected_channels = color_channels + usize::from(has_alpha);
 
-        if encoding != SampleEncoding::Rgbe && source_channels != expected_channels {
+        if encoding != SampleEncoding::RGBE && source_channels != expected_channels {
             return Err(unsupported(
                 format,
                 "channel metadata is inconsistent with the color format",
             ));
         }
 
-        if encoding == SampleEncoding::Rgbe && has_alpha {
+        if encoding == SampleEncoding::RGBE && has_alpha {
             return Err(unsupported(format, "RGBE with alpha is not supported"));
         }
 
@@ -524,7 +525,7 @@ impl PixelLayout {
 
     fn read_pixel(self, pixel: &[u8]) -> Result<([f32; 3], f32)> {
         invariant_eq!(pixel.len(), self.bytes_per_pixel);
-        if self.encoding == SampleEncoding::Rgbe {
+        if self.encoding == SampleEncoding::RGBE {
             return Ok((decode_rgbe(pixel)?, 1.0));
         }
 
@@ -567,7 +568,7 @@ impl PixelLayout {
 
 fn sample_encoding(format: CodecPixelFormat, info: &PixelInfo) -> Result<SampleEncoding> {
     if format == CodecPixelFormat::PixelFormat32bppRGBE {
-        return Ok(SampleEncoding::Rgbe);
+        return Ok(SampleEncoding::RGBE);
     }
     if matches!(
         format,
@@ -1243,20 +1244,24 @@ fn decode_sample(bytes: &[u8], encoding: SampleEncoding) -> f32 {
     invariant_eq!(bytes.len(), encoding.bytes());
 
     match encoding {
-        SampleEncoding::Unsigned8 => f32::from(bytes[0]) / f32::from(u8::MAX),
+        SampleEncoding::Unsigned8 => {
+            f32::from(read_sample::<u8>(bytes)) / f32::from(u8::MAX)
+        }
         SampleEncoding::Unsigned16 => {
-            f32::from(u16::from_ne_bytes([bytes[0], bytes[1]])) / f32::from(u16::MAX)
+            f32::from(read_sample::<u16>(bytes)) / f32::from(u16::MAX)
         }
-        SampleEncoding::Fixed16 => f32::from(i16::from_ne_bytes([bytes[0], bytes[1]])) / 8192.0,
-        SampleEncoding::Fixed32 => {
-            fixed32_to_f32(i32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
-        }
-        SampleEncoding::Float16 => half_to_f32(u16::from_ne_bytes([bytes[0], bytes[1]])),
-        SampleEncoding::Float32 => f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
-        SampleEncoding::Rgbe => {
+        SampleEncoding::Fixed16 => f32::from(read_sample::<i16>(bytes)) / 8192.0,
+        SampleEncoding::Fixed32 => fixed32_to_f32(read_sample::<i32>(bytes)),
+        SampleEncoding::Float16 => half_to_f32(read_sample::<u16>(bytes)),
+        SampleEncoding::Float32 => read_sample::<f32>(bytes),
+        SampleEncoding::RGBE => {
             unreachable!("RGBE pixels are decoded as a unit")
         }
     }
+}
+
+fn read_sample<T: FromBytes + Sized>(bytes: &[u8]) -> T {
+    T::read_from_bytes(bytes).expect("JPEG XR sample length must match its encoding")
 }
 
 #[allow(

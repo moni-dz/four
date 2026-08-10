@@ -19,20 +19,20 @@ const CONTEXT_MENU_ITEM_HEIGHT: f32 = 36.0;
 const CONTEXT_MENU_PADDING: f32 = 8.0;
 const CONTEXT_MENU_WIDTH: f32 = 180.0;
 const DRAG_REGION_HEIGHT: f32 = 40.0;
-const METADATA_FIELD_GAP: f32 = 12.0;
+const METADATA_FIELD_GAP: f32 = 6.0;
 const METADATA_LABEL_WIDTH: f32 = 140.0;
 const METADATA_OVERLAY_MARGIN: f32 = 12.0;
 const METADATA_OVERLAY_WIDTH: f32 = 480.0;
-const METADATA_WINDOW_MIN_HEIGHT: f32 = 500.0;
 const MAX_CLL_CHECKBOX_SIZE: f32 = 16.0;
 const MAX_CLL_SELECTOR_HEIGHT: f32 = 30.0;
 const TONE_MAPPING_MENU_ITEM_HEIGHT: f32 = 30.0;
 const TONE_MAPPING_MENU_MARGIN: f32 = 4.0;
 const TONE_MAPPING_MENU_WIDTH: f32 = 292.0;
+const TONE_MAPPING_TITLEBAR_WIDTH: f32 = 480.0;
 const TONE_MAPPING_SELECTOR_HEIGHT: f32 = 30.0;
 
-pub(super) const WINDOW_MIN_WIDTH: f32 = METADATA_OVERLAY_WIDTH + 2.0 * METADATA_OVERLAY_MARGIN;
-pub(super) const WINDOW_MIN_HEIGHT: f32 = METADATA_WINDOW_MIN_HEIGHT;
+pub(super) const WINDOW_MIN_WIDTH: f32 = 1280.0;
+pub(super) const WINDOW_MIN_HEIGHT: f32 = 720.0;
 
 pub(super) enum ViewerState {
     Empty {
@@ -521,7 +521,6 @@ impl Root {
     fn render_metadata_overlay(
         metadata: &ImageMetadata,
         hdr_options: Option<HdrOptions>,
-        tone_mapping_menu_open: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         invariant!(!metadata.fields.is_empty());
@@ -542,13 +541,7 @@ impl Root {
             .flex()
             .flex_col()
             .when_some(hdr_options, |overlay, options| {
-                overlay
-                    .child(Self::render_tone_mapping_selector(
-                        options.tone_mapping(),
-                        tone_mapping_menu_open,
-                        cx,
-                    ))
-                    .child(Self::render_max_cll_selector(options.max_cll_mode(), cx))
+                overlay.child(Self::render_max_cll_selector(options.max_cll_mode(), cx))
             })
             .children(metadata.fields.iter().map(metadata_field))
     }
@@ -593,10 +586,9 @@ impl Root {
             .flex()
             .items_center()
             .gap(px(METADATA_FIELD_GAP))
-            .pb_1()
             .child(
                 div()
-                    .w(px(METADATA_LABEL_WIDTH))
+                    .w(px(100.0))
                     .flex_none()
                     .text_color(rgb(0x009d_9d9d))
                     .child("Tone mapper"),
@@ -735,18 +727,48 @@ impl Root {
             })
     }
 
-    fn render_status_bar(status: SharedString) -> gpui::Div {
+    fn render_status_bar(
+        status: SharedString,
+        hdr_options: Option<HdrOptions>,
+        tone_mapping_menu_open: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         div()
             .w_full()
             .h(px(DRAG_REGION_HEIGHT))
             .flex_none()
             .flex()
             .items_center()
-            .px_3()
             .text_sm()
             .bg(rgb(0x0020_2020))
-            .window_control_area(WindowControlArea::Drag)
-            .child(status)
+            .child(
+                div()
+                    .h_full()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .overflow_hidden()
+                    .px_3()
+                    .window_control_area(WindowControlArea::Drag)
+                    .child(status),
+            )
+            .when_some(hdr_options, |titlebar, options| {
+                titlebar.child(
+                    div()
+                        .w(px(TONE_MAPPING_TITLEBAR_WIDTH))
+                        .h_full()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .px_3()
+                        .child(Self::render_tone_mapping_selector(
+                            options.tone_mapping(),
+                            tone_mapping_menu_open,
+                            cx,
+                        )),
+                )
+            })
     }
 }
 
@@ -797,15 +819,15 @@ impl Render for Root {
                     cx.notify();
                 }),
             )
-            .child(Self::render_status_bar(status))
+            .child(Self::render_status_bar(
+                status,
+                hdr_options,
+                tone_mapping_menu_open,
+                cx,
+            ))
             .child(Self::render_image_content(image))
             .when_some(metadata.filter(|_| metadata_visible), |root, metadata| {
-                root.child(Self::render_metadata_overlay(
-                    &metadata,
-                    hdr_options,
-                    tone_mapping_menu_open,
-                    cx,
-                ))
+                root.child(Self::render_metadata_overlay(&metadata, hdr_options, cx))
             })
             .when_some(context_menu_position, |root, position| {
                 root.child(Self::render_context_menu(

@@ -1818,7 +1818,6 @@ dependencies = [
 name = "four"
 version = "0.1.0"
 dependencies = [
- "crc32fast",
  "exn",
  "gif",
  "gpui",
@@ -1830,6 +1829,7 @@ dependencies = [
  "png 0.18.1",
  "tiff",
  "tonemapping",
+ "zerocopy",
  "zune-jpeg",
 ]
 

@@ -2,7 +2,7 @@
 name = "four"
 version = "0.1.0"
 edition = "2024"
-description = "A minimal GPUI image viewer with bounded image decoders"
+description = "four (iv) - image viewer"
 publish = false
 
 [workspace]
@@ -27,15 +27,18 @@ png = "0.18.1"
 tiff = "0.11.3"
 tonemapping = { path = "crates/tonemapping" }
 zune-jpeg = "0.5.15"
-
-[dev-dependencies]
-crc32fast = "1.5.0"
+zerocopy = { version = "0.8.56", features = ["simd", "simd-nightly", "float-nightly"] }
 
 [lints]
 workspace = true
 
 [profile.bench]
 debug = 1
+
+[profile.release]
+opt-level = 3
+debug = "full"
+strip = "none"
 
 [workspace.lints.rust]
 ambiguous_negative_literals = "warn"
