@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use mimalloc::MiMalloc;
 use tonemapping::{
     ACESApproximate, ACESFitted, BT2446A, Clamp, ExtendedLuminanceReinhard, ExtendedReinhard,
-    Hable, LinearRGB, LinearRGBPlanes, LuminanceReinhard, LuminanceWhitePoint, MaxCllEstimator,
+    Hable, LinearRGB, LinearRGBPlanes, LuminanceReinhard, LuminanceWhitePoint, MaxCLLEstimator,
     Reinhard, ReinhardJodie, ScaledClamp, ToneMapper, WhitePoint,
 };
 
@@ -122,7 +122,7 @@ fn benchmark_max_cll(colors: &[LinearRGB], iterations: NonZeroU32) {
         iterations,
         || {
             time_once(|| {
-                let mut estimator = MaxCllEstimator::new(pixel_count);
+                let mut estimator = MaxCLLEstimator::new(pixel_count);
                 for color in colors {
                     estimator.observe(*color);
                 }
@@ -135,7 +135,7 @@ fn benchmark_max_cll(colors: &[LinearRGB], iterations: NonZeroU32) {
         },
         || {
             time_once(|| {
-                let mut estimator = MaxCllEstimator::new(pixel_count);
+                let mut estimator = MaxCLLEstimator::new(pixel_count);
                 for batch in colors.chunks(BATCH_PIXELS) {
                     estimator.observe_many(batch);
                 }

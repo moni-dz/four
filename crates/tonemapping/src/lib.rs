@@ -13,8 +13,8 @@
 //! [`ACESApproximate`] provide filmic curves. [`ToneMappingMethod`] enumerates the built-in
 //! operator families.
 //!
-//! [`MaxCllEstimator`] selects either the nearest-rank 99.99th percentile of per-pixel
-//! `max(R, G, B)` or the true maximum through [`MaxCllMode`]. Inputs determine the unit: absolute-nit
+//! [`MaxCLLEstimator`] selects either the nearest-rank 99.99th percentile of per-pixel
+//! `max(R, G, B)` or the true maximum through [`MaxCLLMode`]. Inputs determine the unit: absolute-nit
 //! inputs produce `MaxCLL` in nits, while relative inputs produce a relative light level.
 //! The maximum-component definition follows [ITU-T H.274 section 8.10]. Percentile selection uses
 //! the per-frame outlier-rejection step proposed by [Smith and Zink]; their additional p99.5 step
@@ -520,7 +520,7 @@ impl ColorChannel {
 
 /// Selects how a still image's `MaxCLL` is estimated.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub enum MaxCllMode {
+pub enum MaxCLLMode {
     /// Uses Smith and Zink's per-frame p99.99 of per-pixel peak components.
     #[default]
     Percentile99_99,
@@ -531,7 +531,7 @@ pub enum MaxCllMode {
 /// Stores a selected maximum content light level.
 ///
 /// The level uses the same relative or absolute unit as the linear RGB input. It is selected from
-/// per-pixel `max(R, G, B)` values according to a [`MaxCllMode`].
+/// per-pixel `max(R, G, B)` values according to a [`MaxCLLMode`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MaxCll {
     level: f32,
@@ -600,26 +600,26 @@ impl std::error::Error for MaxCllPixelCountError {}
 ///
 /// [Smith and Zink's outlier-rejection method]: https://doi.org/10.5594/JMI.2021.3090176
 #[derive(Debug)]
-pub struct MaxCllEstimator {
+pub struct MaxCLLEstimator {
     expected: NonZeroUsize,
     retained: usize,
     observed: usize,
     peaks: BinaryHeap<Reverse<PeakSample>>,
 }
 
-impl MaxCllEstimator {
+impl MaxCLLEstimator {
     /// Creates a p99.99 estimator for exactly `pixel_count` active-image pixels.
     #[must_use]
     pub fn new(pixel_count: NonZeroUsize) -> Self {
-        Self::with_mode(pixel_count, MaxCllMode::Percentile99_99)
+        Self::with_mode(pixel_count, MaxCLLMode::Percentile99_99)
     }
 
     /// Creates a `mode` estimator for exactly `pixel_count` active-image pixels.
     #[must_use]
-    pub fn with_mode(pixel_count: NonZeroUsize, mode: MaxCllMode) -> Self {
+    pub fn with_mode(pixel_count: NonZeroUsize, mode: MaxCLLMode) -> Self {
         let retained = match mode {
-            MaxCllMode::Percentile99_99 => pixel_count.get() / 10_000 + 1,
-            MaxCllMode::TrueMaximum => 1,
+            MaxCLLMode::Percentile99_99 => pixel_count.get() / 10_000 + 1,
+            MaxCLLMode::TrueMaximum => 1,
         };
         Self {
             expected: pixel_count,
@@ -638,7 +638,7 @@ impl MaxCllEstimator {
 
     /// Includes active-image `colors` in the `MaxCLL` estimate.
     ///
-    /// This produces the same estimate as calling [`MaxCllEstimator::observe`] in slice order.
+    /// This produces the same estimate as calling [`MaxCLLEstimator::observe`] in slice order.
     pub fn observe_many(&mut self, colors: &[LinearRGB]) {
         self.observed = self.observed.saturating_add(colors.len());
 
@@ -755,7 +755,7 @@ impl Ord for PeakSample {
 // The heap threshold only rises once it is full. A lane that does not beat the threshold captured
 // at the start of its chunk therefore cannot become a candidate while earlier lanes are retained.
 #[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
-fn observe_max_cll_candidates(estimator: &mut MaxCllEstimator, colors: &[LinearRGB]) {
+fn observe_max_cll_candidates(estimator: &mut MaxCLLEstimator, colors: &[LinearRGB]) {
     debug_assert_eq!(
         estimator.peaks.len(),
         estimator.retained,
@@ -957,7 +957,7 @@ mod tests {
     }
 
     fn estimate_max_cll_scalarly(colors: &[LinearRGB]) -> MaxCll {
-        let mut estimator = MaxCllEstimator::new(
+        let mut estimator = MaxCLLEstimator::new(
             NonZeroUsize::new(colors.len()).expect("test MaxCLL input is nonempty"),
         );
         for color in colors {
@@ -1261,21 +1261,21 @@ mod tests {
 
         let pixel_count = NonZeroUsize::new(colors.len()).expect("test MaxCLL input is nonempty");
 
-        let mut percentile = MaxCllEstimator::with_mode(pixel_count, MaxCllMode::Percentile99_99);
+        let mut percentile = MaxCLLEstimator::with_mode(pixel_count, MaxCLLMode::Percentile99_99);
         percentile.observe_many(&colors);
 
         let percentile = percentile
             .finish()
             .expect("the percentile estimator observes every declared pixel");
 
-        let mut true_maximum = MaxCllEstimator::with_mode(pixel_count, MaxCllMode::TrueMaximum);
+        let mut true_maximum = MaxCLLEstimator::with_mode(pixel_count, MaxCLLMode::TrueMaximum);
         true_maximum.observe_many(&colors);
 
         let true_maximum = true_maximum
             .finish()
             .expect("the maximum estimator observes every declared pixel");
 
-        assert_eq!(MaxCllMode::default(), MaxCllMode::Percentile99_99);
+        assert_eq!(MaxCLLMode::default(), MaxCLLMode::Percentile99_99);
         assert_eq!(percentile.level(), 4.0);
         assert_eq!(percentile.channel(), ColorChannel::Red);
         assert_eq!(true_maximum.level(), 126.0);
@@ -1300,7 +1300,7 @@ mod tests {
 
     #[test]
     fn max_cll_reports_incomplete_pixel_streams() {
-        let mut estimator = MaxCllEstimator::new(NonZeroUsize::new(2).unwrap());
+        let mut estimator = MaxCLLEstimator::new(NonZeroUsize::new(2).unwrap());
         estimator.observe(LinearRGB::new([1.0; 3]));
 
         let error = estimator.finish().unwrap_err();
@@ -1330,7 +1330,7 @@ mod tests {
 
             let expected = estimate_max_cll_scalarly(&colors);
 
-            let mut estimator = MaxCllEstimator::new(
+            let mut estimator = MaxCLLEstimator::new(
                 NonZeroUsize::new(colors.len()).expect("test MaxCLL input is nonempty"),
             );
 
@@ -1362,7 +1362,7 @@ mod tests {
         ];
 
         let mut estimator =
-            MaxCllEstimator::new(NonZeroUsize::new(colors.len()).expect("test input is nonempty"));
+            MaxCLLEstimator::new(NonZeroUsize::new(colors.len()).expect("test input is nonempty"));
         estimator.observe_many(&colors);
 
         let max_cll = estimator
@@ -1379,7 +1379,7 @@ mod tests {
         colors.extend(std::iter::repeat_n(LinearRGB::new([1.0; 3]), 8));
 
         let mut estimator =
-            MaxCllEstimator::new(NonZeroUsize::new(colors.len()).expect("test input is nonempty"));
+            MaxCLLEstimator::new(NonZeroUsize::new(colors.len()).expect("test input is nonempty"));
         estimator.observe_many(&colors);
 
         let max_cll = estimator

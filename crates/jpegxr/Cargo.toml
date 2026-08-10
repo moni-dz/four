@@ -1,0 +1,16 @@
+[package]
+name = "jpegxr"
+version = "0.1.0"
+edition = "2024"
+description = "Pure Rust JPEG XR decoder"
+license = "MIT"
+publish = false
+
+[dependencies]
+rayon = { workspace = true }
+thiserror = { workspace = true }
+zerocopy = { workspace = true }
+multiversion = { workspace = true }
+
+[lints]
+workspace = true

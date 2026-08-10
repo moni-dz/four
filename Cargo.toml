@@ -6,14 +6,16 @@ description = "four (iv) - image viewer"
 publish = false
 
 [workspace]
-default-members = [".", "crates/tonemapping"]
-members = ["crates/tonemapping"]
+default-members = [".", "crates/jpegxr", "crates/tonemapping"]
+members = ["crates/jpegxr", "crates/tonemapping"]
 resolver = "3"
 
 [workspace.dependencies]
 mimalloc = "0.1.48"
 multiversion = "0.8.0"
 rayon = "1.12.0"
+thiserror = "2.0.20"
+zerocopy = "0.8.56"
 
 [dependencies]
 exn = "0.3.1"
@@ -21,7 +23,7 @@ gif = "0.14.2"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "38ca9106c5306ef93e52c35643df015a27f15b72" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "38ca9106c5306ef93e52c35643df015a27f15b72", features = ["font-kit", "wayland", "x11"] }
 jxl-oxide = { version = "0.12.6", default-features = false, features = ["moxcms", "rayon"] }
-jpegxr = "0.3.1"
+jpegxr = { path = "crates/jpegxr" }
 multiversion = { workspace = true }
 mimalloc = { workspace = true }
 png = "0.18.1"
@@ -29,7 +31,7 @@ rayon = { workspace = true }
 tiff = "0.11.3"
 tonemapping = { path = "crates/tonemapping" }
 zune-jpeg = "0.5.15"
-zerocopy = { version = "0.8.56", features = ["simd", "simd-nightly", "float-nightly"] }
+zerocopy = { workspace = true, features = ["simd", "simd-nightly", "float-nightly"] }
 
 [build-dependencies]
 embed-resource = "3.0.11"
@@ -47,9 +49,9 @@ strip = "debuginfo"
 lto = "fat"
 
 [profile.release-with-symbols]
-inherits = "release"
-debug = "full"
-strip = "none"
+inherits = "dev"
+opt-level = 3
+codegen-units = 32
 
 [workspace.lints.rust]
 ambiguous_negative_literals = "warn"

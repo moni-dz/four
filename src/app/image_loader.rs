@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use exn::{ErrorExt, ResultExt};
 use gpui::{Image as GPUIImage, ImageFormat, SharedString};
-use tonemapping::{MaxCllMode, ToneMappingMethod};
+use tonemapping::{MaxCLLMode, ToneMappingMethod};
 
 use four::{DecodedImage, encode_bmp, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
 
@@ -81,7 +81,7 @@ pub(super) struct DisplayedImage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct HDROptions {
     tone_mapping: ToneMappingMethod,
-    max_cll_mode: MaxCllMode,
+    max_cll_mode: MaxCLLMode,
 }
 
 impl HDROptions {
@@ -89,7 +89,7 @@ impl HDROptions {
         self.tone_mapping
     }
 
-    pub(super) const fn max_cll_mode(self) -> MaxCllMode {
+    pub(super) const fn max_cll_mode(self) -> MaxCLLMode {
         self.max_cll_mode
     }
 
@@ -100,7 +100,7 @@ impl HDROptions {
         }
     }
 
-    pub(super) const fn with_max_cll_mode(self, max_cll_mode: MaxCllMode) -> Self {
+    pub(super) const fn with_max_cll_mode(self, max_cll_mode: MaxCLLMode) -> Self {
         Self {
             max_cll_mode,
             ..self
@@ -112,7 +112,7 @@ impl Default for HDROptions {
     fn default() -> Self {
         Self {
             tone_mapping: ToneMappingMethod::default(),
-            max_cll_mode: MaxCllMode::Percentile99_99,
+            max_cll_mode: MaxCLLMode::Percentile99_99,
         }
     }
 }

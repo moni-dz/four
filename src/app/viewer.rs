@@ -8,7 +8,7 @@ use gpui::{
     PathPromptOptions, Pixels, Point, Role, SharedString, Toggled, Window, WindowControlArea,
     anchored, deferred, div, img, point, prelude::*, px, rgb, rgba,
 };
-use tonemapping::{MaxCllMode, ToneMappingMethod};
+use tonemapping::{MaxCLLMode, ToneMappingMethod};
 
 use super::image_loader::{
     DisplayedImage, HDROptions, ImageMetadata, LoadResult, LoadedImage, MetadataField,
@@ -436,7 +436,7 @@ impl Root {
 
     fn select_max_cll_mode(
         &mut self,
-        max_cll_mode: MaxCllMode,
+        max_cll_mode: MaxCLLMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -655,8 +655,8 @@ impl Root {
             .child(selector)
     }
 
-    fn render_max_cll_selector(selected_mode: MaxCllMode, cx: &mut Context<Self>) -> gpui::Div {
-        let checked = selected_mode == MaxCllMode::TrueMaximum;
+    fn render_max_cll_selector(selected_mode: MaxCLLMode, cx: &mut Context<Self>) -> gpui::Div {
+        let checked = selected_mode == MaxCLLMode::TrueMaximum;
         let next_mode = toggled_max_cll_mode(selected_mode);
         let description = if checked {
             "True maximum"
@@ -899,10 +899,10 @@ impl Render for Root {
     }
 }
 
-const fn toggled_max_cll_mode(mode: MaxCllMode) -> MaxCllMode {
+const fn toggled_max_cll_mode(mode: MaxCLLMode) -> MaxCLLMode {
     match mode {
-        MaxCllMode::Percentile99_99 => MaxCllMode::TrueMaximum,
-        MaxCllMode::TrueMaximum => MaxCllMode::Percentile99_99,
+        MaxCLLMode::Percentile99_99 => MaxCLLMode::TrueMaximum,
+        MaxCLLMode::TrueMaximum => MaxCLLMode::Percentile99_99,
     }
 }
 
@@ -1028,7 +1028,7 @@ mod tests {
         );
         assert_eq!(
             root.preferred_hdr_options.max_cll_mode(),
-            MaxCllMode::Percentile99_99
+            MaxCLLMode::Percentile99_99
         );
     }
 
@@ -1191,7 +1191,7 @@ mod tests {
     fn tone_mapping_and_max_cll_changes_compose_in_one_reload() {
         let mut root = Root::new(ViewerState::empty());
         let active = HDROptions::default();
-        let true_maximum = active.with_max_cll_mode(MaxCllMode::TrueMaximum);
+        let true_maximum = active.with_max_cll_mode(MaxCLLMode::TrueMaximum);
 
         let max_cll_request = root
             .begin_hdr_options_selection(true_maximum, active)
@@ -1209,14 +1209,14 @@ mod tests {
         assert!(root.accepts_load_request(combined_request));
         assert_eq!(root.pending_hdr_options, Some((combined_request, combined)));
         assert_eq!(combined.tone_mapping(), ToneMappingMethod::ACESFitted);
-        assert_eq!(combined.max_cll_mode(), MaxCllMode::TrueMaximum);
+        assert_eq!(combined.max_cll_mode(), MaxCLLMode::TrueMaximum);
     }
 
     #[test]
     fn max_cll_toggle_returns_to_the_percentile_mode() {
         assert_eq!(
-            toggled_max_cll_mode(toggled_max_cll_mode(MaxCllMode::Percentile99_99)),
-            MaxCllMode::Percentile99_99
+            toggled_max_cll_mode(toggled_max_cll_mode(MaxCLLMode::Percentile99_99)),
+            MaxCLLMode::Percentile99_99
         );
     }
 }

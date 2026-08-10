@@ -1,14 +1,5 @@
 //! Decodes bounded JPEG XR images and tone-maps HDR pixels to SDR RGBA8.
 //!
-//! The JPEG XR reference codec produces pixels in their native WIC representation. Unsigned RGB
-//! and grayscale samples are normalized as sRGB. As an HDR screenshot compatibility policy,
-//! `PixelFormat32bppRGB101010` is always interpreted as BT.2100 PQ and Rec. 2020, then converted to
-//! linear scRGB. The underlying WIC pixel format does not identify a color space, so SDR images
-//! using that packed format are unsupported. Fixed-point, half-float, floating-point, and RGBE
-//! samples are also interpreted as linear scRGB and encoded with the sRGB transfer function. By
-//! default, HDR values are mapped with ITU-R BT.2446 Method A, whose fixed mastering assumptions
-//! avoid an image-wide white-point estimation pass.
-//!
 //! When metadata or a selected white-point method requires it, `MaxCLL` is estimated from the
 //! 99.99th-percentile `max(R, G, B)` light level. This excludes isolated outliers from the
 //! white-point statistic; only white-point methods may clip values above that threshold.
@@ -35,20 +26,19 @@ mod error;
 
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
-use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::num::NonZeroUsize;
 use std::simd::{Select, Simd, StdFloat, cmp::SimdPartialOrd, num::SimdFloat};
 
 use ::jpegxr::{
-    BitDepthBits, ColorFormat, ImageDecode, JXRError, PixelFormat as CodecPixelFormat, PixelInfo,
+    Decoder as JXRDecoder, ErrorKind as CodecErrorKind, PixelFormat as CodecPixelFormat,
 };
 use multiversion::multiversion;
 use rayon::prelude::*;
 use tonemapping::{
     Clamp, ColorChannel as ToneColorChannel, LinearRGB, LinearRGBPlanes, LuminanceWhitePoint,
-    MaxCllEstimator, MaxCllMode, ToneMapper, ToneMappingMethod, WhitePoint,
+    MaxCLLMode, MaxCLLEstimator, ToneMapper, ToneMappingMethod, WhitePoint,
 };
-use zerocopy::FromBytes;
+use zerocopy::{FromBytes, IntoBytes};
 
 use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
 use error::error;
@@ -62,10 +52,12 @@ const SC_RGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 const SOURCE_BUFFER_MAX: usize = 512 * 1024 * 1024;
 // Three f32 channels plus staged alpha occupy roughly 13 KiB, leaving room in common L1 caches.
 const HDR_BATCH_PIXELS: usize = 1_024;
+const COLOR_LANES: usize = 4;
 const SRGB_LANES: usize = 8;
 const PARALLEL_PIXELS_MIN: usize = 256 * 1024;
 const PARALLEL_PIXELS_PER_JOB: usize = 64 * 1024;
 
+type F32x4 = Simd<f32, COLOR_LANES>;
 type F32x8 = Simd<f32, SRGB_LANES>;
 
 /// Identifies a color channel in decoded JPEG XR RGB data.
@@ -95,14 +87,14 @@ impl JPEGXRColorChannel {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DecodeOptions {
     tone_mapping: ToneMappingMethod,
-    max_cll_mode: MaxCllMode,
+    max_cll_mode: MaxCLLMode,
     include_hdr_metrics: bool,
 }
 
 impl DecodeOptions {
     /// Creates options using `tone_mapping` and `max_cll_mode`.
     #[must_use]
-    pub const fn new(tone_mapping: ToneMappingMethod, max_cll_mode: MaxCllMode) -> Self {
+    pub const fn new(tone_mapping: ToneMappingMethod, max_cll_mode: MaxCLLMode) -> Self {
         Self {
             tone_mapping,
             max_cll_mode,
@@ -118,7 +110,7 @@ impl DecodeOptions {
 
     /// Returns the selected `MaxCLL` estimator mode.
     #[must_use]
-    pub const fn max_cll_mode(self) -> MaxCllMode {
+    pub const fn max_cll_mode(self) -> MaxCLLMode {
         self.max_cll_mode
     }
 
@@ -141,7 +133,7 @@ impl DecodeOptions {
 
 impl Default for DecodeOptions {
     fn default() -> Self {
-        Self::new(ToneMappingMethod::default(), MaxCllMode::default())
+        Self::new(ToneMappingMethod::default(), MaxCLLMode::default())
     }
 }
 
@@ -216,7 +208,7 @@ impl JPEGXRMetadata {
 
     /// Returns the estimated maximum content light level in nits for HDR sources.
     ///
-    /// The estimate follows the [`MaxCllMode`] used for decoding. SDR sources and decodes that
+    /// The estimate follows the [`MaxCLLMode`] used for decoding. SDR sources and decodes that
     /// disable HDR metrics return `None`. A finite result above the `f32` range saturates at
     /// `f32::MAX`.
     #[must_use]
@@ -242,7 +234,7 @@ impl JPEGXRMetadata {
 
     /// Returns the mode used to estimate the reported `MaxCLL` metric.
     #[must_use]
-    pub const fn max_cll_mode(self) -> Option<MaxCllMode> {
+    pub const fn max_cll_mode(self) -> Option<MaxCLLMode> {
         match self.hdr_metrics {
             Some(metrics) => Some(metrics.max_cll_mode),
             None => None,
@@ -353,7 +345,7 @@ pub fn decode_with_metadata(bytes: impl AsRef<[u8]>) -> Result<DecodedJPEGXR> {
 /// Decodes JPEG XR pixels and metadata using the selected HDR normalization `options`.
 ///
 /// Image-dependent parameters are derived from the decoded source. Component-wise white-point
-/// methods use the selected [`MaxCllMode`], while extended luminance Reinhard always uses p99.99
+/// methods use the selected [`MaxCLLMode`], while extended luminance Reinhard always uses p99.99
 /// Rec. 709 luminance. SDR sources do not pass through tone mapping. Image-derived white points
 /// are floored at display white; methods without a white point apply their curves to every HDR
 /// source.
@@ -371,17 +363,32 @@ pub fn decode_with_metadata_and_options(
         return Err(error(JPEGXRError::Signature));
     }
 
-    let mut decoder = ImageDecode::with_reader(JPEGXRReader::new(bytes))
-        .map_err(|source| codec_error(&source))?;
+    let decoder = JXRDecoder::new(bytes).map_err(|source| codec_error(&source))?;
+    let width = decoder.info().width();
+    let height = decoder.info().height();
+    let (width, height) = validate_dimensions(
+        i32::try_from(width).map_err(|_error| {
+            error(JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions(
+                DIMENSION_MAX,
+            )))
+        })?,
+        i32::try_from(height).map_err(|_error| {
+            error(JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions(
+                DIMENSION_MAX,
+            )))
+        })?,
+    )?;
 
-    let (width, height) = decoder.get_size().map_err(|source| codec_error(&source))?;
-    let (width, height) = validate_dimensions(width, height)?;
-
-    let format = decoder
-        .get_pixel_format()
-        .map_err(|source| codec_error(&source))?;
-
-    let layout = PixelLayout::new(format)?;
+    let pixel_format = decoder.info().pixel_format();
+    let layout = match pixel_format {
+        CodecPixelFormat::BGR101010 => PixelLayout::bgr101010(),
+        CodecPixelFormat::RGBA128_FLOAT => PixelLayout::rgba128_float(),
+        _ => {
+            return Err(error(JPEGXRError::Unsupported(
+                pixel_format.name().to_owned(),
+            )));
+        }
+    };
 
     let row_stride = layout.row_stride(width)?;
 
@@ -400,12 +407,27 @@ pub fn decode_with_metadata_and_options(
         )));
     }
 
-    let mut source = vec![0_u8; source_len];
-    decoder
-        .copy_all(&mut source, row_stride)
-        .map_err(|source| codec_error(&source))?;
+    let normalized = match pixel_format {
+        CodecPixelFormat::BGR101010 => {
+            let native_image = decoder
+                .decode_bgr101010()
+                .map_err(|source| codec_error(&source))?;
+            let source = native_image.pixels().as_bytes();
 
-    let normalized = normalize(&source, width, height, row_stride, layout, options)?;
+            invariant_eq!(source.len(), source_len);
+            normalize(source, width, height, row_stride, layout, options)?
+        }
+        CodecPixelFormat::RGBA128_FLOAT => {
+            let native_image = decoder
+                .decode_rgba_f32()
+                .map_err(|source| codec_error(&source))?;
+            let source = native_image.pixels().as_bytes();
+
+            invariant_eq!(source.len(), source_len);
+            normalize(source, width, height, row_stride, layout, options)?
+        }
+        _ => unreachable!("pixel format validated when selecting its layout"),
+    };
     let metadata = JPEGXRMetadata::new(layout, normalized.hdr_metrics);
 
     Ok(DecodedJPEGXR {
@@ -414,38 +436,10 @@ pub fn decode_with_metadata_and_options(
     })
 }
 
-/// Adapts memory input to the reference codec's file-stream behavior.
-///
-/// The codec requests an oversized final block, consumes its available prefix, and ignores the
-/// reported EOF. `Cursor` specializes `read_exact` to leave that prefix uncopied. This newtype only
-/// delegates `read`, so the default `Read::read_exact` copies the prefix before reporting EOF, as a
-/// file stream does.
-///
-/// See: <https://github.com/bvibber/jpegxr/blob/75e0e5d547e1d64556299d36a3d95203d0658eac/src/lib.rs#L616>
-struct JPEGXRReader<'a> {
-    cursor: Cursor<&'a [u8]>,
-}
-
-impl<'a> JPEGXRReader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self {
-            cursor: Cursor::new(bytes),
-        }
-    }
-}
-
-impl Read for JPEGXRReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.cursor.read(buf)
-    }
-}
-
-impl Seek for JPEGXRReader<'_> {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        self.cursor.seek(pos)
-    }
-}
-
+#[allow(
+    dead_code,
+    reason = "normalization primitives remain available for future decoder profiles"
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SampleEncoding {
     Fixed16,
@@ -489,6 +483,10 @@ impl SampleEncoding {
     }
 }
 
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "the fields describe independent WIC pixel-layout properties"
+)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PixelLayout {
     encoding: SampleEncoding,
@@ -518,64 +516,30 @@ impl JPEGXRMetadata {
 }
 
 impl PixelLayout {
-    fn new(format: CodecPixelFormat) -> Result<Self> {
-        let info = PixelInfo::from_format(format);
-        let encoding = sample_encoding(format, &info)?;
-
-        let color_channels = match info.color_format() {
-            ColorFormat::YOnly => 1,
-            ColorFormat::RGB => 3,
-            ColorFormat::RGBE if encoding == SampleEncoding::RGBE => 3,
-            other => {
-                return Err(unsupported(format, &format!("{other:?} color data")));
-            }
-        };
-
-        let has_alpha = info.has_alpha();
-        let source_channels = info.channels();
-        let expected_channels = color_channels + usize::from(has_alpha);
-
-        if encoding != SampleEncoding::RGBE && source_channels != expected_channels {
-            return Err(unsupported(
-                format,
-                "channel metadata is inconsistent with the color format",
-            ));
+    const fn bgr101010() -> Self {
+        Self {
+            encoding: SampleEncoding::PackedBGR101010,
+            color_channels: 3,
+            source_channels: 3,
+            bytes_per_pixel: 4,
+            has_alpha: false,
+            premultiplied_alpha: false,
+            blue_first: false,
+            source_is_bgr: true,
         }
+    }
 
-        if encoding == SampleEncoding::RGBE && has_alpha {
-            return Err(unsupported(format, "RGBE with alpha is not supported"));
+    const fn rgba128_float() -> Self {
+        Self {
+            encoding: SampleEncoding::Float32,
+            color_channels: 3,
+            source_channels: 4,
+            bytes_per_pixel: 16,
+            has_alpha: true,
+            premultiplied_alpha: false,
+            blue_first: false,
+            source_is_bgr: false,
         }
-
-        let bits_per_pixel = info.bits_per_pixel();
-        if !bits_per_pixel.is_multiple_of(8) {
-            return Err(unsupported(format, "packed pixels are not supported"));
-        }
-
-        let bytes_per_pixel = bits_per_pixel / 8;
-        let sample_bytes = encoding.bytes();
-
-        let packed_bgr101010 = encoding == SampleEncoding::PackedBGR101010;
-        if (packed_bgr101010 && bytes_per_pixel != sample_bytes)
-            || (!packed_bgr101010
-                && (!bytes_per_pixel.is_multiple_of(sample_bytes)
-                    || bytes_per_pixel / sample_bytes < source_channels))
-        {
-            return Err(unsupported(
-                format,
-                "pixel stride is inconsistent with its samples",
-            ));
-        }
-
-        Ok(Self {
-            encoding,
-            color_channels,
-            source_channels,
-            bytes_per_pixel,
-            has_alpha,
-            premultiplied_alpha: info.premultiplied_alpha(),
-            blue_first: info.bgr(),
-            source_is_bgr: info.bgr() || encoding == SampleEncoding::PackedBGR101010,
-        })
     }
 
     fn row_stride(self, width: u32) -> Result<usize> {
@@ -636,42 +600,6 @@ impl PixelLayout {
         }
 
         Ok((color, alpha))
-    }
-}
-
-fn sample_encoding(format: CodecPixelFormat, info: &PixelInfo) -> Result<SampleEncoding> {
-    if format == CodecPixelFormat::PixelFormat32bppRGB101010 {
-        // `jpegxr` inherits the reference codec's RGB name for WIC GUID
-        // 6fddc324-4e03-4bfe-b185-3d77768dc914. WIC defines that GUID as
-        // 32bppBGR101010, and the decoded word stores blue in bits 0..=9.
-        return Ok(SampleEncoding::PackedBGR101010);
-    }
-
-    if format == CodecPixelFormat::PixelFormat32bppRGBE {
-        return Ok(SampleEncoding::RGBE);
-    }
-
-    if matches!(
-        format,
-        CodecPixelFormat::PixelFormat48bppRGBHalf
-            | CodecPixelFormat::PixelFormat64bppRGBHalf
-            | CodecPixelFormat::PixelFormat64bppRGBAHalf
-            | CodecPixelFormat::PixelFormat16bppGrayHalf
-    ) {
-        return Ok(SampleEncoding::Float16);
-    }
-
-    match info.bit_depth() {
-        BitDepthBits::Eight => Ok(SampleEncoding::Unsigned8),
-        BitDepthBits::Sixteen => Ok(SampleEncoding::Unsigned16),
-        BitDepthBits::SixteenS => Ok(SampleEncoding::Fixed16),
-        BitDepthBits::SixteenF => Ok(SampleEncoding::Float16),
-        BitDepthBits::ThirtyTwoS => Ok(SampleEncoding::Fixed32),
-        BitDepthBits::ThirtyTwoF => Ok(SampleEncoding::Float32),
-        other => Err(unsupported(
-            format,
-            &format!("{other:?} samples are not supported"),
-        )),
     }
 }
 
@@ -1015,7 +943,7 @@ struct MaxCll {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct HDRMetrics {
     max_cll: MaxCll,
-    max_cll_mode: MaxCllMode,
+    max_cll_mode: MaxCLLMode,
     luminance_white_point: Option<LuminanceWhitePoint>,
     max_luminance_nits: f32,
     average_luminance_nits: f32,
@@ -1073,7 +1001,7 @@ impl HDRMetrics {
         source: &[u8],
         row_stride: usize,
         layout: PixelLayout,
-        max_cll_mode: MaxCllMode,
+        max_cll_mode: MaxCLLMode,
         estimate_luminance_white_point: bool,
     ) -> Result<Self> {
         HDRAnalysis::estimate(
@@ -1098,7 +1026,7 @@ impl HDRAnalysis {
         source: &[u8],
         row_stride: usize,
         layout: PixelLayout,
-        max_cll_mode: MaxCllMode,
+        max_cll_mode: MaxCLLMode,
         estimate_max_cll: bool,
         estimate_luminance_white_point: bool,
         collect_hdr_metrics: bool,
@@ -1112,7 +1040,7 @@ impl HDRAnalysis {
 
         let mut accumulator = collect_hdr_metrics.then(HDRMetricAccumulator::new);
         let mut max_cll_estimator = estimate_max_cll.then(|| {
-            MaxCllEstimator::with_mode(
+            MaxCLLEstimator::with_mode(
                 NonZeroUsize::new(pixel_count).expect("HDR analysis includes at least one pixel"),
                 max_cll_mode,
             )
@@ -1178,7 +1106,7 @@ impl HDRAnalysis {
     }
 }
 
-fn finish_max_cll(estimator: MaxCllEstimator) -> MaxCll {
+fn finish_max_cll(estimator: MaxCLLEstimator) -> MaxCll {
     let estimate = estimator
         .finish()
         .expect("the HDR analysis pass visits the measured number of pixels");
@@ -1325,7 +1253,7 @@ impl HDRMetricAccumulator {
     fn finish(
         self,
         max_cll: MaxCll,
-        max_cll_mode: MaxCllMode,
+        max_cll_mode: MaxCLLMode,
         luminance_white_point: Option<LuminanceWhitePoint>,
     ) -> HDRMetrics {
         invariant!(self.pixel_count > 0);
@@ -1550,7 +1478,8 @@ fn rec2100_pq_to_scrgb(encoded: [f32; 3]) -> [f32; 3] {
     const REC2100_MAX_NITS: f32 = 10_000.0;
     const SCALE: f32 = REC2100_MAX_NITS / SC_RGB_REFERENCE_WHITE_NITS;
 
-    let [red, green, blue] = encoded.map(pq_to_linear);
+    let [red, green, blue, _padding] =
+        pq_to_linear_simd(F32x4::from_array([encoded[0], encoded[1], encoded[2], 0.0])).to_array();
 
     [
         (1.660_491 * red - 0.587_641 * green - 0.072_850 * blue) * SCALE,
@@ -1559,6 +1488,7 @@ fn rec2100_pq_to_scrgb(encoded: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+#[cfg(test)]
 fn pq_to_linear(encoded: f32) -> f32 {
     const INVERSE_M1: f32 = 16_384.0 / 2_610.0;
     const INVERSE_M2: f32 = 32.0 / 2_523.0;
@@ -1568,6 +1498,19 @@ fn pq_to_linear(encoded: f32) -> f32 {
 
     let powered = encoded.powf(INVERSE_M2);
     ((powered - C1).max(0.0) / (C2 - C3 * powered)).powf(INVERSE_M1)
+}
+
+fn pq_to_linear_simd(encoded: F32x4) -> F32x4 {
+    const INVERSE_M1: f32 = 16_384.0 / 2_610.0;
+    const INVERSE_M2: f32 = 32.0 / 2_523.0;
+    const C1: f32 = 3_424.0 / 4_096.0;
+    const C2: f32 = 2_413.0 / 128.0;
+    const C3: f32 = 2_392.0 / 128.0;
+
+    let powered = (encoded.log2() * F32x4::splat(INVERSE_M2)).exp2();
+    let ratio = (powered - F32x4::splat(C1)).simd_max(F32x4::splat(0.0))
+        / (F32x4::splat(C2) - F32x4::splat(C3) * powered);
+    (ratio.log2() * F32x4::splat(INVERSE_M1)).exp2()
 }
 
 fn read_sample<T: FromBytes + Sized>(bytes: &[u8]) -> T {
@@ -1664,18 +1607,21 @@ fn normalized_to_u8(value: f32) -> u8 {
     (value.clamp(0.0, 1.0) * f32::from(u8::MAX)).round() as u8
 }
 
-fn unsupported(format: CodecPixelFormat, detail: &str) -> Error {
-    invariant!(!detail.is_empty());
-    error(JPEGXRError::Unsupported(format!("{format:?}: {detail}")))
-}
-
-fn codec_error(source: &JXRError) -> Error {
-    if matches!(source, JXRError::OutOfMemory | JXRError::BufferOverflow) {
-        error(JPEGXRError::LimitExceeded(JPEGXRLimit::SourceBufferBytes(
-            SOURCE_BUFFER_MAX,
-        )))
-    } else {
-        error(JPEGXRError::Codec(source.to_string()))
+fn codec_error(source: &jpegxr::Error) -> Error {
+    match source.kind() {
+        CodecErrorKind::Unsupported(_) | CodecErrorKind::UnsupportedPixelFormat(_) => {
+            error(JPEGXRError::Unsupported(source.to_string()))
+        }
+        CodecErrorKind::LimitExceeded("image dimension" | "image width" | "image height") => error(
+            JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions(DIMENSION_MAX)),
+        ),
+        CodecErrorKind::LimitExceeded("pixel count") => {
+            error(JPEGXRError::LimitExceeded(JPEGXRLimit::Pixels(PIXELS_MAX)))
+        }
+        CodecErrorKind::LimitExceeded(_) => error(JPEGXRError::LimitExceeded(
+            JPEGXRLimit::SourceBufferBytes(SOURCE_BUFFER_MAX),
+        )),
+        _ => error(JPEGXRError::Codec(source.to_string())),
     }
 }
 
@@ -1683,6 +1629,32 @@ fn codec_error(source: &JXRError) -> Error {
 mod tests {
     use super::*;
     use tonemapping::{ACESFitted, BT2446A, ExtendedLuminanceReinhard, ExtendedReinhard};
+
+    #[test]
+    #[ignore = "requires JPEGXR_SAMPLE to name a local HDR image"]
+    fn decodes_real_hdr_sample_with_pure_rust_codec() {
+        let path = std::env::var("JPEGXR_SAMPLE").expect("set JPEGXR_SAMPLE");
+        let bytes = std::fs::read(path).expect("read sample");
+        let decoded = decode_with_metadata(bytes).expect("decode HDR sample");
+
+        assert_eq!(decoded.image().dimensions(), (3440, 1440));
+        assert_eq!(decoded.image().rgba8().len(), 3440 * 1440 * 4);
+        assert!(decoded.metadata().has_alpha());
+        assert!(decoded.metadata().is_hdr());
+    }
+
+    #[test]
+    #[ignore = "requires JPEGXR_BGR101010_SAMPLE to name a local HDR image"]
+    fn decodes_real_bgr101010_sample_with_pure_rust_codec() {
+        let path = std::env::var("JPEGXR_BGR101010_SAMPLE").expect("set JPEGXR_BGR101010_SAMPLE");
+        let bytes = std::fs::read(path).expect("read sample");
+        let decoded = decode_with_metadata(bytes).expect("decode BGR101010 HDR sample");
+
+        assert_eq!(decoded.image().dimensions(), (3840, 2160));
+        assert_eq!(decoded.image().rgba8().len(), 3840 * 2160 * 4);
+        assert!(!decoded.metadata().has_alpha());
+        assert!(decoded.metadata().is_hdr());
+    }
 
     fn float_rgb_layout() -> PixelLayout {
         PixelLayout {
@@ -1738,7 +1710,7 @@ mod tests {
         normalize_float_rgb_with_options(
             colors,
             width,
-            DecodeOptions::new(method, MaxCllMode::Percentile99_99),
+            DecodeOptions::new(method, MaxCLLMode::Percentile99_99),
         )
     }
 
@@ -1810,7 +1782,16 @@ mod tests {
 
     #[test]
     fn decodes_packed_bgr101010_as_rec2100_hdr() {
-        let layout = PixelLayout::new(CodecPixelFormat::PixelFormat32bppRGB101010).unwrap();
+        let layout = PixelLayout {
+            encoding: SampleEncoding::PackedBGR101010,
+            color_channels: 3,
+            source_channels: 3,
+            bytes_per_pixel: 4,
+            has_alpha: false,
+            premultiplied_alpha: false,
+            blue_first: false,
+            source_is_bgr: true,
+        };
         let packed = (0b11_u32 << 30) | 1023_u32;
         let encoded = unpack_bgr101010(&packed.to_ne_bytes());
         let (color, alpha) = layout.read_pixel(&packed.to_ne_bytes()).unwrap();
@@ -1830,6 +1811,12 @@ mod tests {
     #[test]
     fn pq_eotf_maps_a_hundred_nits_to_one_percent_of_peak() {
         assert_approximately_equal(pq_to_linear(0.508_078_4), 0.01, 0.000_001);
+
+        let encoded = [0.0, 0.1, 0.508_078_4, 1.0];
+        let actual = pq_to_linear_simd(F32x4::from_array(encoded)).to_array();
+        for (actual, encoded) in actual.into_iter().zip(encoded) {
+            assert_approximately_equal(actual, pq_to_linear(encoded), 0.000_001);
+        }
     }
 
     #[test]
@@ -1858,7 +1845,7 @@ mod tests {
             ToneMappingMethod::ExtendedReinhard,
             ToneMappingMethod::ExtendedLuminanceReinhard,
         ] {
-            let options = DecodeOptions::new(method, MaxCllMode::Percentile99_99);
+            let options = DecodeOptions::new(method, MaxCLLMode::Percentile99_99);
 
             let with_metrics = normalize(&source, 2, 1, row_stride, layout, options)
                 .expect("synthetic HDR pixels normalize with metrics");
@@ -1920,7 +1907,7 @@ mod tests {
         let options = DecodeOptions::default();
 
         assert_eq!(options.tone_mapping(), ToneMappingMethod::BT2446);
-        assert_eq!(options.max_cll_mode(), MaxCllMode::Percentile99_99);
+        assert_eq!(options.max_cll_mode(), MaxCLLMode::Percentile99_99);
     }
 
     #[test]
@@ -1932,7 +1919,7 @@ mod tests {
             &source,
             source.len(),
             float_rgb_layout(),
-            MaxCllMode::Percentile99_99,
+            MaxCLLMode::Percentile99_99,
             true,
         )
         .unwrap();
@@ -1997,7 +1984,7 @@ mod tests {
             &source,
             source.len(),
             layout,
-            MaxCllMode::Percentile99_99,
+            MaxCLLMode::Percentile99_99,
             false,
         )
         .unwrap();
@@ -2012,7 +1999,7 @@ mod tests {
         assert_eq!(metadata.max_cll_scrgb(), Some(4.0));
         assert_eq!(metadata.max_cll_nits(), Some(320.0));
         assert_eq!(metadata.max_cll_channel(), Some(JPEGXRColorChannel::Red));
-        assert_eq!(metadata.max_cll_mode(), Some(MaxCllMode::Percentile99_99));
+        assert_eq!(metadata.max_cll_mode(), Some(MaxCLLMode::Percentile99_99));
     }
 
     #[test]
@@ -2038,7 +2025,7 @@ mod tests {
             1,
             source.len(),
             layout,
-            DecodeOptions::new(ToneMappingMethod::ExtendedReinhard, MaxCllMode::TrueMaximum),
+            DecodeOptions::new(ToneMappingMethod::ExtendedReinhard, MaxCLLMode::TrueMaximum),
         )
         .unwrap();
         let percentile_metadata = JPEGXRMetadata::new(layout, percentile.hdr_metrics);
@@ -2057,7 +2044,7 @@ mod tests {
         );
         assert_eq!(
             true_maximum_metadata.max_cll_mode(),
-            Some(MaxCllMode::TrueMaximum)
+            Some(MaxCLLMode::TrueMaximum)
         );
         assert_ne!(percentile.rgba, true_maximum.rgba);
     }
@@ -2074,7 +2061,7 @@ mod tests {
             &source,
             source.len(),
             float_rgb_layout(),
-            MaxCllMode::Percentile99_99,
+            MaxCLLMode::Percentile99_99,
             true,
         )
         .unwrap();
@@ -2102,7 +2089,7 @@ mod tests {
             &source,
             source.len(),
             float_rgb_layout(),
-            MaxCllMode::Percentile99_99,
+            MaxCLLMode::Percentile99_99,
             false,
         )
         .unwrap();
@@ -2122,7 +2109,7 @@ mod tests {
             &source,
             source.len(),
             float_rgb_layout(),
-            MaxCllMode::Percentile99_99,
+            MaxCLLMode::Percentile99_99,
             false,
         )
         .unwrap();
@@ -2145,7 +2132,7 @@ mod tests {
             &source,
             source.len(),
             float_rgb_layout(),
-            MaxCllMode::Percentile99_99,
+            MaxCLLMode::Percentile99_99,
             false,
         )
         .unwrap();
@@ -2279,13 +2266,13 @@ mod tests {
             &source,
             source.len(),
             layout,
-            MaxCllMode::TrueMaximum,
+            MaxCLLMode::TrueMaximum,
             false,
         )
         .unwrap();
 
         assert_eq!(metrics.max_cll.nits(), SC_RGB_REFERENCE_WHITE_NITS);
-        assert_eq!(metrics.max_cll_mode, MaxCllMode::TrueMaximum);
+        assert_eq!(metrics.max_cll_mode, MaxCLLMode::TrueMaximum);
         assert_eq!(metrics.max_luminance_nits, SC_RGB_REFERENCE_WHITE_NITS);
         assert_eq!(metrics.average_luminance_nits, SC_RGB_REFERENCE_WHITE_NITS);
         assert_eq!(metrics.min_luminance_nits, SC_RGB_REFERENCE_WHITE_NITS);
@@ -2302,7 +2289,7 @@ mod tests {
             &source,
             source.len(),
             layout,
-            MaxCllMode::Percentile99_99,
+            MaxCLLMode::Percentile99_99,
             false,
         )
         .unwrap();
