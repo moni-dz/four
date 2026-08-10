@@ -39,7 +39,10 @@ fn reinhard_batch(colors: &mut LinearRGBPlanes) {
 /// Applies the white-point Reinhard curve independently to each component.
 ///
 /// Components at the white point map to one, while brighter components clip at the display
-/// boundary. For a still image, [`MaxCll`] supplies a `max(R, G, B)` white point.
+/// boundary. For a still image, [`MaxCll`] supplies a `max(R, G, B)` white point. This is a
+/// component-wise adaptation of the global operator in [Reinhard et al.].
+///
+/// [Reinhard et al.]: https://www.cs.utah.edu/docs/techreports/2002/pdf/UUCS-02-001.pdf
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExtendedReinhard {
     white_point: WhitePoint,
@@ -169,8 +172,10 @@ impl LuminanceWhitePoint {
 
 /// Estimates a p99.99 luminance white point for a complete still image.
 ///
-/// This applies the paper's spatial outlier-rejection percentile to Rec. 709 luminance. It is an
-/// analogous statistic for luminance-based curves, not `MaxCLL`.
+/// This adapts [Smith and Zink's] per-frame MaxCLL outlier percentile to Rec. 709 luminance. It is
+/// an analogous statistic for luminance-based curves, not `MaxCLL`.
+///
+/// [Smith and Zink's]: https://doi.org/10.5594/JMI.2021.3090176
 #[must_use]
 pub fn estimate_luminance_white_point(colors: &[LinearRGB]) -> Option<LuminanceWhitePoint> {
     let pixel_count = colors.len();
@@ -198,6 +203,10 @@ pub fn estimate_luminance_white_point(colors: &[LinearRGB]) -> Option<LuminanceW
 }
 
 /// Applies extended Reinhard to luminance while retaining color ratios.
+///
+/// This follows the global white-point operator described by [Reinhard et al.].
+///
+/// [Reinhard et al.]: https://www.cs.utah.edu/docs/techreports/2002/pdf/UUCS-02-001.pdf
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExtendedLuminanceReinhard {
     white_point: LuminanceWhitePoint,

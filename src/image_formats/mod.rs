@@ -76,11 +76,15 @@ impl DecodedImage {
 ///
 /// A V4 header declares explicit BGRA channel masks. Without those masks, BMP readers commonly
 /// interpret the fourth byte of a 32-bit `BI_RGB` pixel as padding and discard image transparency.
-/// The source format has already been fully decoded before this adapter runs.
+/// The source format has already been fully decoded before this adapter runs. See Microsoft's
+/// [`BITMAPV4HEADER`](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapv4header)
+/// reference for the header and mask fields.
 ///
 /// # Panics
 ///
-/// Panics when the dimensions exceed BMP's signed 32-bit fields.
+/// Panics only if `image` violates internal [`DecodedImage`] invariants: its dimensions or encoded
+/// size do not fit the BMP fields and address space, or its RGBA length does not match its
+/// dimensions.
 #[must_use]
 pub fn encode_bmp(image: &DecodedImage) -> Vec<u8> {
     let (width, height) = image.dimensions();

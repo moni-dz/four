@@ -1,4 +1,4 @@
-//! Classifies decoder failures without allocating on ordinary error paths.
+//! Classifies failures from maintained and handwritten JPEG decoding paths.
 
 use std::fmt;
 
@@ -13,8 +13,8 @@ pub type Result<T> = exn::Result<T, JPEGError>;
 /// A decoder failure classified by the JPEG grammar section that rejected the input.
 ///
 /// Keeping the classification in the type lets callers choose a recovery policy without parsing
-/// display text. Static detail strings retain precise diagnostics without allocating on an error
-/// path, while values that callers may need are stored in dedicated variants.
+/// display text. Handwritten-parser failures use static details or dedicated values, while
+/// maintained-codec failures retain the codec's owned diagnostic text.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JPEGError {
     /// An integer calculation exceeded its representable range.

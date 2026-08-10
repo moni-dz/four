@@ -28,6 +28,8 @@ const RHO_SDR: f64 = 5.696_957_656_390_622;
 /// function, maps BT.2020 luma through the three-stage perceptual knee, corrects chroma for the Hunt
 /// effect, reconstructs BT.2020 RGB, and returns display-linear components.
 ///
+/// See [Report ITU-R BT.2446-1], Tables 2 and 3.
+///
 /// # Examples
 ///
 /// ```
@@ -36,6 +38,8 @@ const RHO_SDR: f64 = 5.696_957_656_390_622;
 /// let display_linear = BT2446A.map(LinearRGB::new([10.0; 3]));
 /// assert_eq!(display_linear.components(), [1.0; 3]);
 /// ```
+///
+/// [Report ITU-R BT.2446-1]: https://www.itu.int/pub/R-REP-BT.2446-1-2021
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct BT2446A;
 

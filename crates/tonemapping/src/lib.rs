@@ -16,7 +16,10 @@
 //! [`MaxCllEstimator`] selects either the nearest-rank 99.99th percentile of per-pixel
 //! `max(R, G, B)` or the true maximum through [`MaxCllMode`]. Inputs determine the unit: absolute-nit
 //! inputs produce `MaxCLL` in nits, while relative inputs produce a relative light level.
-//! Luminance-based Reinhard uses the distinct [`estimate_luminance_white_point`] statistic.
+//! The maximum-component definition follows [ITU-T H.274 section 8.10]. Percentile selection uses
+//! the per-frame outlier-rejection step proposed by [Smith and Zink]; their additional p99.5 step
+//! across frames does not apply to a still image. Luminance-based Reinhard uses the distinct
+//! [`estimate_luminance_white_point`] statistic.
 //!
 //! # Example
 //!
@@ -32,6 +35,9 @@
 //!
 //! assert!(display_linear.components().into_iter().all(|value| (0.0..=1.0).contains(&value)));
 //! ```
+//!
+//! [ITU-T H.274 section 8.10]: https://www.itu.int/epublications/publication/itu-t-h-274-v3-2023-09-versatile-supplemental-enhancement-information-messages-for-coded-video-bitstreams
+//! [Smith and Zink]: https://doi.org/10.5594/JMI.2021.3090176
 
 use multiversion::multiversion;
 use std::cmp::{Ordering, Reverse};
@@ -515,7 +521,7 @@ impl ColorChannel {
 /// Selects how a still image's `MaxCLL` is estimated.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum MaxCllMode {
-    /// Uses the nearest-rank 99.99th percentile of per-pixel peak components.
+    /// Uses Smith and Zink's per-frame p99.99 of per-pixel peak components.
     #[default]
     Percentile99_99,
     /// Uses the greatest per-pixel peak component without outlier rejection.
@@ -589,7 +595,10 @@ impl std::error::Error for MaxCllPixelCountError {}
 ///
 /// Percentile mode retains the brightest `floor(pixel_count / 10_000) + 1` samples. True-maximum
 /// mode retains one sample. Declaring the count up front therefore bounds memory while producing
-/// the same result as sorting all per-pixel `max(R, G, B)` values.
+/// the same result as sorting all per-pixel `max(R, G, B)` values. The percentile follows the
+/// per-frame step in [Smith and Zink's outlier-rejection method].
+///
+/// [Smith and Zink's outlier-rejection method]: https://doi.org/10.5594/JMI.2021.3090176
 #[derive(Debug)]
 pub struct MaxCllEstimator {
     expected: NonZeroUsize,

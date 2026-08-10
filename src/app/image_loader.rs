@@ -352,11 +352,17 @@ fn display_parent(path: &Path) -> SharedString {
 }
 
 fn format_jpeg_xr_channels(metadata: jpeg_xr::JPEGXRMetadata) -> &'static str {
-    match (metadata.color_channels(), metadata.has_alpha()) {
-        (1, false) => "Gray",
-        (1, true) => "GrayA",
-        (3, false) => "RGB",
-        (3, true) => "RGBA",
+    match (
+        metadata.color_channels(),
+        metadata.has_alpha(),
+        metadata.is_bgr(),
+    ) {
+        (1, false, _) => "Gray",
+        (1, true, _) => "GrayA",
+        (3, false, false) => "RGB",
+        (3, true, false) => "RGBA",
+        (3, false, true) => "BGR",
+        (3, true, true) => "BGRA",
         _ => "Color",
     }
 }

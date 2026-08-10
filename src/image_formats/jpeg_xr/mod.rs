@@ -1,19 +1,35 @@
 //! Decodes bounded JPEG XR images and tone-maps HDR pixels to SDR RGBA8.
 //!
 //! The JPEG XR reference codec produces pixels in their native WIC representation. Unsigned RGB
-//! and grayscale samples are normalized as sRGB, except packed 10-bit RGB screenshot data, which
-//! is converted from BT.2100 PQ and Rec. 2020 to linear scRGB. Fixed-point, half-float,
-//! floating-point, and RGBE samples are also interpreted as linear scRGB and encoded with the sRGB
-//! transfer function. By default, HDR values are mapped with ITU-R BT.2446 Method A, whose fixed
-//! mastering assumptions avoid an image-wide white-point estimation pass.
+//! and grayscale samples are normalized as sRGB. As an HDR screenshot compatibility policy,
+//! `PixelFormat32bppRGB101010` is always interpreted as BT.2100 PQ and Rec. 2020, then converted to
+//! linear scRGB. The underlying WIC pixel format does not identify a color space, so SDR images
+//! using that packed format are unsupported. Fixed-point, half-float, floating-point, and RGBE
+//! samples are also interpreted as linear scRGB and encoded with the sRGB transfer function. By
+//! default, HDR values are mapped with ITU-R BT.2446 Method A, whose fixed mastering assumptions
+//! avoid an image-wide white-point estimation pass.
 //!
-//! When requested for metadata or tone mapping, `MaxCLL` is estimated from the 99.99th-percentile
-//! `max(R, G, B)` light level. This rejects isolated outliers at the cost of clipping the brightest
-//! 0.01% of a sufficiently large image. [`DecodeOptions`] can instead select the true maximum.
-//! Callers can also select any built-in [`ToneMappingMethod`]; white-point methods use matching
-//! statistics estimated from the decoded image.
+//! When metadata or a selected white-point method requires it, `MaxCLL` is estimated from the
+//! 99.99th-percentile `max(R, G, B)` light level. This excludes isolated outliers from the
+//! white-point statistic; only white-point methods may clip values above that threshold.
+//! [`DecodeOptions`] can instead select the true maximum. Callers can also select any built-in
+//! [`ToneMappingMethod`]; white-point methods use matching statistics estimated from the decoded
+//! image.
 //! A wholly empty, non-premultiplied HDR alpha plane is treated as unspecified and made opaque,
 //! matching JPEG XR screenshots that store zero in an otherwise unused alpha channel.
+//!
+//! # References
+//!
+//! - [WIC native pixel formats](https://learn.microsoft.com/en-us/windows/win32/wic/-wic-codec-native-pixel-formats)
+//!   defines packed-channel layout, numerical encoding, and color-space inference.
+//! - [Windows GDK Screen Capture](https://learn.microsoft.com/en-us/gaming/gdk/docs/tools/tools-pc/commandlinetools/gr-wdcapture)
+//!   documents `.jxr` as the Windows HDR screenshot format.
+//! - [ITU-R BT.2100-3](https://www.itu.int/rec/R-REC-BT.2100-3-202502-I/en) defines the PQ transfer
+//!   function and HDR wide-color-gamut system used by the screenshot compatibility policy.
+//! - [ITU-R BT.2446-1](https://www.itu.int/pub/R-REP-BT.2446-1-2021) defines the default HDR-to-SDR
+//!   conversion.
+//! - [Smith and Zink](https://doi.org/10.5594/JMI.2021.3090176) propose the per-frame p99.99
+//!   `max(R, G, B)` outlier-rejection step used for still-image `MaxCLL` estimation.
 
 mod error;
 
@@ -162,6 +178,7 @@ pub struct JPEGXRMetadata {
     bits_per_channel: u8,
     color_channels: u8,
     has_alpha: bool,
+    is_bgr: bool,
     is_hdr: bool,
     hdr_metrics: Option<HDRMetrics>,
 }
@@ -185,7 +202,13 @@ impl JPEGXRMetadata {
         self.has_alpha
     }
 
-    /// Returns whether the source samples were interpreted as linear HDR light levels.
+    /// Returns whether source pixels use a BGR-family WIC format.
+    #[must_use]
+    pub const fn is_bgr(self) -> bool {
+        self.is_bgr
+    }
+
+    /// Returns whether the source uses the HDR processing path.
     #[must_use]
     pub const fn is_hdr(self) -> bool {
         self.is_hdr
@@ -217,7 +240,7 @@ impl JPEGXRMetadata {
         }
     }
 
-    /// Returns the `MaxCLL` mode used for HDR normalization.
+    /// Returns the mode used to estimate the reported `MaxCLL` metric.
     #[must_use]
     pub const fn max_cll_mode(self) -> Option<MaxCllMode> {
         match self.hdr_metrics {
@@ -283,12 +306,11 @@ pub fn has_signature(bytes: impl AsRef<[u8]>) -> bool {
 
 /// Decodes a JPEG XR image and normalizes it to SDR RGBA8.
 ///
-/// Unsigned integer RGB and grayscale inputs retain their sRGB encoding, except packed 10-bit
-/// screenshot data, which is converted from BT.2100 PQ to linear scRGB. Linear-light HDR inputs use
-/// extended Reinhard with a `MaxCLL` white point before conversion to sRGB. `MaxCLL` is estimated
-/// from the 99.99th-percentile brightest pixel to prevent isolated outliers from dimming the image.
-/// The white point is floored at display white so in-range content is unchanged. Premultiplied
-/// inputs are returned with straight alpha.
+/// Unsigned integer RGB and grayscale inputs retain their sRGB encoding.
+/// `PixelFormat32bppRGB101010` is unconditionally treated as BT.2100 PQ and Rec. 2020 HDR screenshot
+/// data and converted to linear scRGB. Other HDR inputs are interpreted as linear scRGB. HDR values
+/// are mapped with ITU-R BT.2446 Method A before conversion to sRGB; this default path does not
+/// estimate an image white point. Premultiplied inputs are returned with straight alpha.
 ///
 /// # Errors
 ///
@@ -317,7 +339,8 @@ pub fn decode_with_options(
 /// Decodes JPEG XR pixels together with their source representation metadata.
 ///
 /// This performs the same bounded decode and HDR-to-SDR normalization as [`decode`]. For HDR
-/// sources, the returned metadata includes the percentile `MaxCLL` used by tone mapping.
+/// sources, the returned metadata includes percentile `MaxCLL`; the default BT.2446 mapper does not
+/// use that image-derived metric.
 ///
 /// # Errors
 ///
@@ -397,6 +420,8 @@ pub fn decode_with_metadata_and_options(
 /// reported EOF. `Cursor` specializes `read_exact` to leave that prefix uncopied. This newtype only
 /// delegates `read`, so the default `Read::read_exact` copies the prefix before reporting EOF, as a
 /// file stream does.
+///
+/// See: <https://github.com/bvibber/jpegxr/blob/75e0e5d547e1d64556299d36a3d95203d0658eac/src/lib.rs#L616>
 struct JPEGXRReader<'a> {
     cursor: Cursor<&'a [u8]>,
 }
@@ -427,7 +452,7 @@ enum SampleEncoding {
     Fixed32,
     Float16,
     Float32,
-    PackedRGB101010,
+    PackedBGR101010,
     RGBE,
     Unsigned8,
     Unsigned16,
@@ -438,7 +463,7 @@ impl SampleEncoding {
         match self {
             Self::Unsigned8 | Self::RGBE => 1,
             Self::Unsigned16 | Self::Fixed16 | Self::Float16 => 2,
-            Self::Fixed32 | Self::Float32 | Self::PackedRGB101010 => 4,
+            Self::Fixed32 | Self::Float32 | Self::PackedBGR101010 => 4,
         }
     }
 
@@ -449,7 +474,7 @@ impl SampleEncoding {
                 | Self::Fixed32
                 | Self::Float16
                 | Self::Float32
-                | Self::PackedRGB101010
+                | Self::PackedBGR101010
                 | Self::RGBE
         )
     }
@@ -457,7 +482,7 @@ impl SampleEncoding {
     const fn bits_per_channel(self) -> u8 {
         match self {
             Self::Unsigned8 | Self::RGBE => 8,
-            Self::PackedRGB101010 => 10,
+            Self::PackedBGR101010 => 10,
             Self::Unsigned16 | Self::Fixed16 | Self::Float16 => 16,
             Self::Fixed32 | Self::Float32 => 32,
         }
@@ -473,6 +498,7 @@ struct PixelLayout {
     has_alpha: bool,
     premultiplied_alpha: bool,
     blue_first: bool,
+    source_is_bgr: bool,
 }
 
 impl JPEGXRMetadata {
@@ -484,6 +510,7 @@ impl JPEGXRMetadata {
             color_channels: u8::try_from(layout.color_channels)
                 .expect("a JPEG XR color-channel count fits u8"),
             has_alpha: layout.has_alpha,
+            is_bgr: layout.source_is_bgr,
             is_hdr: layout.encoding.is_hdr(),
             hdr_metrics,
         }
@@ -527,9 +554,9 @@ impl PixelLayout {
         let bytes_per_pixel = bits_per_pixel / 8;
         let sample_bytes = encoding.bytes();
 
-        let packed_rgb101010 = encoding == SampleEncoding::PackedRGB101010;
-        if (packed_rgb101010 && bytes_per_pixel != sample_bytes)
-            || (!packed_rgb101010
+        let packed_bgr101010 = encoding == SampleEncoding::PackedBGR101010;
+        if (packed_bgr101010 && bytes_per_pixel != sample_bytes)
+            || (!packed_bgr101010
                 && (!bytes_per_pixel.is_multiple_of(sample_bytes)
                     || bytes_per_pixel / sample_bytes < source_channels))
         {
@@ -547,6 +574,7 @@ impl PixelLayout {
             has_alpha,
             premultiplied_alpha: info.premultiplied_alpha(),
             blue_first: info.bgr(),
+            source_is_bgr: info.bgr() || encoding == SampleEncoding::PackedBGR101010,
         })
     }
 
@@ -564,8 +592,8 @@ impl PixelLayout {
             return Ok((decode_rgbe(pixel)?, 1.0));
         }
 
-        if self.encoding == SampleEncoding::PackedRGB101010 {
-            return Ok((decode_rgb101010(pixel), 1.0));
+        if self.encoding == SampleEncoding::PackedBGR101010 {
+            return Ok((decode_bgr101010(pixel), 1.0));
         }
 
         let sample = |channel: usize| -> Result<f32> {
@@ -613,7 +641,10 @@ impl PixelLayout {
 
 fn sample_encoding(format: CodecPixelFormat, info: &PixelInfo) -> Result<SampleEncoding> {
     if format == CodecPixelFormat::PixelFormat32bppRGB101010 {
-        return Ok(SampleEncoding::PackedRGB101010);
+        // `jpegxr` inherits the reference codec's RGB name for WIC GUID
+        // 6fddc324-4e03-4bfe-b185-3d77768dc914. WIC defines that GUID as
+        // 32bppBGR101010, and the decoded word stores blue in bits 0..=9.
+        return Ok(SampleEncoding::PackedBGR101010);
     }
 
     if format == CodecPixelFormat::PixelFormat32bppRGBE {
@@ -1486,8 +1517,8 @@ fn decode_sample(bytes: &[u8], encoding: SampleEncoding) -> f32 {
         SampleEncoding::Fixed32 => fixed32_to_f32(read_sample::<i32>(bytes)),
         SampleEncoding::Float16 => half_to_f32(read_sample::<u16>(bytes)),
         SampleEncoding::Float32 => read_sample::<f32>(bytes),
-        SampleEncoding::PackedRGB101010 => {
-            unreachable!("packed RGB101010 pixels are decoded as a unit")
+        SampleEncoding::PackedBGR101010 => {
+            unreachable!("packed BGR101010 pixels are decoded as a unit")
         }
         SampleEncoding::RGBE => {
             unreachable!("RGBE pixels are decoded as a unit")
@@ -1495,15 +1526,15 @@ fn decode_sample(bytes: &[u8], encoding: SampleEncoding) -> f32 {
     }
 }
 
-fn decode_rgb101010(pixel: &[u8]) -> [f32; 3] {
-    rec2100_pq_to_scrgb(unpack_rgb101010(pixel))
+fn decode_bgr101010(pixel: &[u8]) -> [f32; 3] {
+    rec2100_pq_to_scrgb(unpack_bgr101010(pixel))
 }
 
-fn unpack_rgb101010(pixel: &[u8]) -> [f32; 3] {
+fn unpack_bgr101010(pixel: &[u8]) -> [f32; 3] {
     const MASK: u32 = 0x03ff;
     const SCALE: f32 = 1.0 / 1023.0;
 
-    invariant_eq!(pixel.len(), SampleEncoding::PackedRGB101010.bytes());
+    invariant_eq!(pixel.len(), SampleEncoding::PackedBGR101010.bytes());
 
     let packed = read_sample::<u32>(pixel);
     let channel = |shift| {
@@ -1662,6 +1693,7 @@ mod tests {
             has_alpha: false,
             premultiplied_alpha: false,
             blue_first: false,
+            source_is_bgr: false,
         }
     }
 
@@ -1682,6 +1714,7 @@ mod tests {
             has_alpha: true,
             premultiplied_alpha: false,
             blue_first: false,
+            source_is_bgr: false,
         }
     }
 
@@ -1776,20 +1809,21 @@ mod tests {
     }
 
     #[test]
-    fn decodes_packed_rgb101010_as_rec2100_hdr() {
+    fn decodes_packed_bgr101010_as_rec2100_hdr() {
         let layout = PixelLayout::new(CodecPixelFormat::PixelFormat32bppRGB101010).unwrap();
-        let packed = (0b11_u32 << 30) | (1023_u32 << 20);
-        let encoded = unpack_rgb101010(&packed.to_ne_bytes());
+        let packed = (0b11_u32 << 30) | 1023_u32;
+        let encoded = unpack_bgr101010(&packed.to_ne_bytes());
         let (color, alpha) = layout.read_pixel(&packed.to_ne_bytes()).unwrap();
         let metadata = JPEGXRMetadata::new(layout, None);
 
         assert_eq!(layout.bytes_per_pixel, 4);
-        assert_eq!(encoded, [1.0, 0.0, 0.0]);
-        assert_approximately_equal(color[0], 207.561_37, 0.000_1);
-        assert_approximately_equal(color[1], -15.568_75, 0.000_1);
-        assert_approximately_equal(color[2], -2.268_875, 0.000_1);
+        assert_eq!(encoded, [0.0, 0.0, 1.0]);
+        assert_approximately_equal(color[0], -9.106_25, 0.000_1);
+        assert_approximately_equal(color[1], -1.043_625, 0.000_1);
+        assert_approximately_equal(color[2], 139.841_25, 0.000_1);
         assert_eq!(alpha, 1.0);
         assert_eq!(metadata.bits_per_channel(), 10);
+        assert!(metadata.is_bgr());
         assert!(metadata.is_hdr());
     }
 

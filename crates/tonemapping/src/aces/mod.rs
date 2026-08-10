@@ -18,10 +18,12 @@ const ACES_OUTPUT_MATRIX: [[f64; 3]; 3] = [
     [-0.003_27, -0.072_76, 1.076_02],
 ];
 
-/// Applies Stephen Hill's fitted ACES reference and display transform.
+/// Applies [Stephen Hill's fitted ACES reference and display transform].
 ///
 /// This compact fit uses the article's linear sRGB input and output matrices. It is a practical
 /// filmic curve rather than a complete Academy Color Encoding System pipeline.
+///
+/// [Stephen Hill's fitted ACES reference and display transform]: https://64.github.io/tonemapping/
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ACESFitted;
 
@@ -144,9 +146,11 @@ fn multiply_rgb(matrix: [[f64; 3]; 3], color: [f64; 3]) -> [f64; 3] {
     matrix.map(|row| row[0] * color[0] + row[1] * color[1] + row[2] * color[2])
 }
 
-/// Applies Krzysztof Narkowicz's scalar ACES approximation component-wise.
+/// Applies [Krzysztof Narkowicz's scalar ACES approximation] component-wise.
 ///
 /// The input is pre-exposed by `0.6`, matching the article's comparison with the fitted transform.
+///
+/// [Krzysztof Narkowicz's scalar ACES approximation]: https://knarkowicz.wordpress.com/2016/01/06/aces-filmic-tone-mapping-curve/
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ACESApproximate;
 
