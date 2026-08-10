@@ -20,10 +20,12 @@ use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::io::Cursor;
 use std::num::NonZeroUsize;
+use std::simd::{Select, Simd, StdFloat, cmp::SimdPartialOrd, num::SimdFloat};
 
 use ::jpegxr::{
     BitDepthBits, ColorFormat, ImageDecode, JXRError, PixelFormat as CodecPixelFormat, PixelInfo,
 };
+use multiversion::multiversion;
 use rayon::prelude::*;
 use tonemapping::{
     Clamp, ColorChannel as ToneColorChannel, LinearRGB, LuminanceWhitePoint, MaxCllEstimator,
@@ -43,8 +45,11 @@ const SC_RGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 const SOURCE_BUFFER_MAX: usize = 512 * 1024 * 1024;
 // Three f32 channels plus staged alpha occupy roughly 13 KiB, leaving room in common L1 caches.
 const HDR_BATCH_PIXELS: usize = 1_024;
+const SRGB_LANES: usize = 8;
 const PARALLEL_PIXELS_MIN: usize = 256 * 1024;
 const PARALLEL_PIXELS_PER_JOB: usize = 64 * 1024;
+
+type F32x8 = Simd<f32, SRGB_LANES>;
 
 /// Identifies a color channel in decoded JPEG XR RGB data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -826,18 +831,42 @@ fn write_tone_mapped_batch(
     let target = &mut rgba[*rgba_offset..*rgba_offset + byte_count];
     let (targets, remainder) = target.as_chunks_mut::<4>();
     invariant!(remainder.is_empty());
-    for ((color, alpha), target) in colors
-        .iter()
-        .copied()
-        .zip(alphas.iter().copied())
-        .zip(targets.iter_mut())
-    {
-        let color = display_linear_to_srgb8(color);
-        target.copy_from_slice(&[color[0], color[1], color[2], alpha]);
-    }
+    write_display_pixels(colors, alphas, targets);
     *rgba_offset += byte_count;
     colors.clear();
     alphas.clear();
+}
+
+#[multiversion(targets("x86_64+avx2", "aarch64+neon"))]
+fn write_display_pixels(colors: &[LinearRGB], alphas: &[u8], targets: &mut [[u8; 4]]) {
+    invariant_eq!(colors.len(), alphas.len());
+    invariant_eq!(colors.len(), targets.len());
+
+    let (color_chunks, color_tail) = colors.as_chunks::<SRGB_LANES>();
+    let (alpha_chunks, alpha_tail) = alphas.as_chunks::<SRGB_LANES>();
+    let (target_chunks, target_tail) = targets.as_chunks_mut::<SRGB_LANES>();
+
+    for ((colors, alphas), targets) in color_chunks.iter().zip(alpha_chunks).zip(target_chunks) {
+        let components = colors.map(LinearRGB::components);
+        let encoded = [0, 1, 2].map(|channel| {
+            linear_to_srgb_simd(F32x8::from_array(components.map(|color| color[channel])))
+                .to_array()
+        });
+
+        for lane in 0..SRGB_LANES {
+            targets[lane] = [
+                normalized_to_u8(encoded[0][lane]),
+                normalized_to_u8(encoded[1][lane]),
+                normalized_to_u8(encoded[2][lane]),
+                alphas[lane],
+            ];
+        }
+    }
+
+    for ((color, alpha), target) in color_tail.iter().copied().zip(alpha_tail).zip(target_tail) {
+        let [red, green, blue] = display_linear_to_srgb8(color);
+        *target = [red, green, blue, *alpha];
+    }
 }
 
 #[cfg(test)]
@@ -1467,6 +1496,16 @@ fn linear_to_srgb(value: f32) -> f32 {
     } else {
         1.055 * value.powf(1.0 / 2.4) - 0.055
     }
+}
+
+fn linear_to_srgb_simd(value: F32x8) -> F32x8 {
+    let value = value.simd_clamp(F32x8::splat(0.0), F32x8::splat(1.0));
+    let linear = value * F32x8::splat(12.92);
+    let nonlinear =
+        (value.log2() * F32x8::splat(1.0 / 2.4)).exp2() * F32x8::splat(1.055) - F32x8::splat(0.055);
+    value
+        .simd_le(F32x8::splat(0.003_130_8))
+        .select(linear, nonlinear)
 }
 
 #[allow(
