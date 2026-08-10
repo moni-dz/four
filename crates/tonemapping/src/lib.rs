@@ -222,6 +222,12 @@ macro_rules! define_tone_mapping_methods {
                 }
             }
 
+            /// Reports whether this method uses an image component white point.
+            #[must_use]
+            pub const fn uses_white_point(self) -> bool {
+                matches!(self, Self::ScaledClamp | Self::ExtendedReinhard)
+            }
+
             /// Resolves this method with image-specific white points.
             ///
             /// Methods that do not use one or both white points ignore those arguments.
@@ -868,7 +874,7 @@ mod tests {
     }
 
     #[test]
-    fn selectable_method_labels_are_unique_and_default_to_extended_reinhard() {
+    fn selectable_method_labels_are_unique_and_default_to_bt2446() {
         let labels: HashSet<_> = ToneMappingMethod::ALL
             .into_iter()
             .map(ToneMappingMethod::label)
@@ -876,14 +882,8 @@ mod tests {
 
         assert_eq!(labels.len(), ToneMappingMethod::ALL.len());
         assert!(labels.iter().all(|label| !label.is_empty()));
-        assert_eq!(
-            ToneMappingMethod::default(),
-            ToneMappingMethod::ExtendedReinhard
-        );
-        assert_eq!(
-            ToneMappingMethod::default().to_string(),
-            "Extended Reinhard"
-        );
+        assert_eq!(ToneMappingMethod::default(), ToneMappingMethod::BT2446);
+        assert_eq!(ToneMappingMethod::default().to_string(), "ITU-R BT2446-2 A");
     }
 
     #[test]

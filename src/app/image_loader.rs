@@ -75,16 +75,16 @@ pub(super) struct DisplayedImage {
     pub(super) image: Arc<GPUIImage>,
     pub(super) metadata: Arc<ImageMetadata>,
     pub(super) source_path: Arc<Path>,
-    pub(super) hdr_options: Option<HdrOptions>,
+    pub(super) hdr_options: Option<HDROptions>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct HdrOptions {
+pub(super) struct HDROptions {
     tone_mapping: ToneMappingMethod,
     max_cll_mode: MaxCllMode,
 }
 
-impl HdrOptions {
+impl HDROptions {
     pub(super) const fn tone_mapping(self) -> ToneMappingMethod {
         self.tone_mapping
     }
@@ -108,7 +108,7 @@ impl HdrOptions {
     }
 }
 
-impl Default for HdrOptions {
+impl Default for HDROptions {
     fn default() -> Self {
         Self {
             tone_mapping: ToneMappingMethod::default(),
@@ -125,6 +125,7 @@ pub(super) struct LoadedImage {
 #[derive(Debug)]
 pub(super) struct ImageMetadata {
     pub(super) fields: Vec<MetadataField>,
+    pub(super) has_hdr_metrics: bool,
 }
 
 impl ImageMetadata {
@@ -153,6 +154,10 @@ impl ImageMetadata {
             MetadataField::new("Pixels", format_pixel_count(pixel_count)),
         ];
 
+        let has_hdr_metrics = decoded
+            .jpeg_xr_metadata
+            .is_some_and(|metadata| metadata.max_cll_scrgb().is_some());
+
         if let Some(metadata) = decoded.jpeg_xr_metadata {
             fields.extend(jpeg_xr_metadata_fields(metadata));
         }
@@ -164,7 +169,10 @@ impl ImageMetadata {
         ));
 
         invariant!(fields.iter().all(|field| !field.value.is_empty()));
-        Self { fields }
+        Self {
+            fields,
+            has_hdr_metrics,
+        }
     }
 }
 
@@ -257,7 +265,8 @@ impl SourceFormat {
         self,
         bytes: &[u8],
         path: &Path,
-        hdr_options: HdrOptions,
+        hdr_options: HDROptions,
+        include_hdr_metrics: bool,
     ) -> LoadResult<DecodedSource> {
         match self {
             Self::GIF => gif::decode(bytes)
@@ -274,7 +283,8 @@ impl SourceFormat {
 
             Self::JPEGXR => jpeg_xr::decode_with_metadata_and_options(
                 bytes,
-                jpeg_xr::DecodeOptions::new(hdr_options.tone_mapping(), hdr_options.max_cll_mode()),
+                jpeg_xr::DecodeOptions::new(hdr_options.tone_mapping(), hdr_options.max_cll_mode())
+                    .with_hdr_metrics(include_hdr_metrics),
             )
             .or_raise(|| image_decode_error(path))
             .map(|decoded| {
@@ -369,7 +379,11 @@ impl ImageLoad<SelectedImage> {
 }
 
 impl ImageLoad<EncodedImage> {
-    fn decode(self, hdr_options: HdrOptions) -> LoadResult<ImageLoad<DecodedImageState>> {
+    fn decode(
+        self,
+        hdr_options: HDROptions,
+        include_hdr_metrics: bool,
+    ) -> LoadResult<ImageLoad<DecodedImageState>> {
         invariant!(self.state.bytes.len() as u64 <= IMAGE_FILE_BYTES_MAX);
         invariant!(isize::try_from(self.state.bytes.len()).is_ok());
 
@@ -378,7 +392,12 @@ impl ImageLoad<EncodedImage> {
 
         let extension = self.path.extension().map(|value| value.to_string_lossy());
         let source_format = SourceFormat::detect(&self.state.bytes, extension.as_deref());
-        let decoded = source_format.decode(&self.state.bytes, &self.path, hdr_options)?;
+        let decoded = source_format.decode(
+            &self.state.bytes,
+            &self.path,
+            hdr_options,
+            include_hdr_metrics,
+        )?;
         let image = decoded.image;
 
         invariant!(image.width() > 0);
@@ -397,7 +416,7 @@ impl ImageLoad<EncodedImage> {
 }
 
 impl ImageLoad<DecodedImageState> {
-    fn present(self, hdr_options: HdrOptions) -> LoadedImage {
+    fn present(self, hdr_options: HDROptions) -> LoadedImage {
         let (width, height) = self.state.image.dimensions();
 
         invariant!(width > 0);
@@ -476,7 +495,7 @@ fn jpeg_xr_metadata_fields(metadata: jpeg_xr::JPEGXRMetadata) -> Vec<MetadataFie
         format_jpeg_xr_dynamic_range(metadata),
     )];
 
-    if metadata.is_hdr() {
+    if metadata.max_cll_scrgb().is_some() {
         fields.extend(jpeg_xr_hdr_fields(metadata));
     }
 
@@ -583,16 +602,24 @@ fn validate_image_file_size(path: &Path, byte_count: u64) -> LoadResult<()> {
 }
 
 pub(super) fn load_image(path: &Path) -> LoadResult<LoadedImage> {
-    load_image_with_options(path, HdrOptions::default())
+    load_image_with_options(path, HDROptions::default())
 }
 
 pub(super) fn load_image_with_options(
     path: &Path,
-    hdr_options: HdrOptions,
+    hdr_options: HDROptions,
+) -> LoadResult<LoadedImage> {
+    load_image_with_options_and_hdr_metrics(path, hdr_options, false)
+}
+
+pub(super) fn load_image_with_options_and_hdr_metrics(
+    path: &Path,
+    hdr_options: HDROptions,
+    include_hdr_metrics: bool,
 ) -> LoadResult<LoadedImage> {
     let loaded = ImageLoad::select(path)
         .read()?
-        .decode(hdr_options)?
+        .decode(hdr_options, include_hdr_metrics)?
         .present(hdr_options);
     invariant!(!loaded.status.is_empty());
     Ok(loaded)

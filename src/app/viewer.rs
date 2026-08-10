@@ -11,8 +11,8 @@ use gpui::{
 use tonemapping::{MaxCllMode, ToneMappingMethod};
 
 use super::image_loader::{
-    DisplayedImage, HdrOptions, ImageMetadata, LoadResult, LoadedImage, MetadataField,
-    format_load_error, load_image, load_image_with_options,
+    DisplayedImage, HDROptions, ImageMetadata, LoadResult, LoadedImage, MetadataField,
+    format_load_error, load_image, load_image_with_options_and_hdr_metrics,
 };
 
 const CONTEXT_MENU_ITEM_HEIGHT: f32 = 36.0;
@@ -115,6 +115,7 @@ struct LoadRequest(u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LoadPurpose {
     Image,
+    HdrMetrics,
     HdrOptions,
 }
 
@@ -126,7 +127,8 @@ struct DecodeJob<T> {
 
 #[derive(Debug)]
 struct DecodePayload {
-    hdr_options: HdrOptions,
+    hdr_options: HDROptions,
+    include_hdr_metrics: bool,
     path: Arc<Path>,
     purpose: LoadPurpose,
 }
@@ -181,10 +183,11 @@ impl<T> LatestLoadCoordinator<T> {
 pub(super) struct Root {
     context_menu_position: Option<Point<Pixels>>,
     decode_coordinator: LatestLoadCoordinator<DecodePayload>,
+    hdr_metrics_request: Option<LoadRequest>,
     load_generation: u64,
     metadata_visible: bool,
-    pending_hdr_options: Option<(LoadRequest, HdrOptions)>,
-    preferred_hdr_options: HdrOptions,
+    pending_hdr_options: Option<(LoadRequest, HDROptions)>,
+    preferred_hdr_options: HDROptions,
     tone_mapping_menu_open: bool,
     viewer: ViewerState,
 }
@@ -199,6 +202,7 @@ impl Root {
         Self {
             context_menu_position: None,
             decode_coordinator: LatestLoadCoordinator::new(),
+            hdr_metrics_request: None,
             load_generation: 0,
             metadata_visible: false,
             pending_hdr_options: None,
@@ -240,8 +244,8 @@ impl Root {
 
     fn begin_hdr_options_selection(
         &mut self,
-        options: HdrOptions,
-        active_options: HdrOptions,
+        options: HDROptions,
+        active_options: HDROptions,
     ) -> Option<LoadRequest> {
         self.preferred_hdr_options = options;
         
@@ -290,12 +294,14 @@ impl Root {
                 root.context_menu_position = None;
                 root.tone_mapping_menu_open = false;
                 let request = root.begin_load_request();
+                root.hdr_metrics_request = None;
                 root.pending_hdr_options = None;
                 root.schedule_decode(
                     DecodeJob {
                         request,
                         payload: DecodePayload {
                             hdr_options: root.preferred_hdr_options,
+                            include_hdr_metrics: false,
                             path: Arc::from(path),
                             purpose: LoadPurpose::Image,
                         },
@@ -324,22 +330,32 @@ impl Root {
         let DecodeJob { request, payload } = job;
         let DecodePayload {
             hdr_options,
+            include_hdr_metrics,
             path,
             purpose,
         } = payload;
 
         cx.spawn_in(window, async move |root, cx| {
             let result = cx
-                .background_spawn(
-                    async move { load_image_with_options(path.as_ref(), hdr_options) },
-                )
+                .background_spawn(async move {
+                    load_image_with_options_and_hdr_metrics(
+                        path.as_ref(),
+                        hdr_options,
+                        include_hdr_metrics,
+                    )
+                })
                 .await;
             
             let _ = root.update_in(cx, move |root, window, cx| {
                 let next = root.decode_coordinator.complete(request);
+                if root.hdr_metrics_request == Some(request) {
+                    root.hdr_metrics_request = None;
+                }
                 let applied = match purpose {
                     LoadPurpose::Image => root.apply_load_result(request, result),
-                    LoadPurpose::HdrOptions => root.apply_hdr_options_result(request, result),
+                    LoadPurpose::HdrMetrics | LoadPurpose::HdrOptions => {
+                        root.apply_hdr_options_result(request, result)
+                    }
                 };
 
                 if let Some(next) = next {
@@ -430,7 +446,7 @@ impl Root {
 
     fn select_hdr_options(
         &mut self,
-        options: HdrOptions,
+        options: HDROptions,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -451,13 +467,61 @@ impl Root {
             return;
         };
 
+        self.hdr_metrics_request = self.metadata_visible.then_some(request);
+
         self.schedule_decode(
             DecodeJob {
                 request,
                 payload: DecodePayload {
                     hdr_options: options,
+                    include_hdr_metrics: self.metadata_visible,
                     path: source_path,
                     purpose: LoadPurpose::HdrOptions,
+                },
+            },
+            window,
+            cx,
+        );
+        cx.notify();
+    }
+
+    fn toggle_metadata(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.context_menu_position = None;
+        self.tone_mapping_menu_open = false;
+        self.metadata_visible = !self.metadata_visible;
+
+        if !self.metadata_visible {
+            cx.notify();
+            return;
+        }
+
+        let Some(displayed) = self.viewer.displayed() else {
+            cx.notify();
+            return;
+        };
+        let Some(active_options) = displayed.hdr_options else {
+            cx.notify();
+            return;
+        };
+        if displayed.metadata.has_hdr_metrics || self.hdr_metrics_request.is_some() {
+            cx.notify();
+            return;
+        }
+
+        let path = Arc::clone(&displayed.source_path);
+        let options = self
+            .pending_hdr_options
+            .map_or(active_options, |(_, options)| options);
+        let request = self.begin_load_request();
+        self.hdr_metrics_request = Some(request);
+        self.schedule_decode(
+            DecodeJob {
+                request,
+                payload: DecodePayload {
+                    hdr_options: options,
+                    include_hdr_metrics: true,
+                    path,
+                    purpose: LoadPurpose::HdrMetrics,
                 },
             },
             window,
@@ -504,14 +568,9 @@ impl Root {
                     } else {
                         "Show image info"
                     };
-                    menu.child(menu_item("toggle-image-info", label).on_click(cx.listener(
-                        |root, _, _, cx| {
-                            root.context_menu_position = None;
-                            root.metadata_visible = !root.metadata_visible;
-                            root.tone_mapping_menu_open = false;
-                            cx.notify();
-                        },
-                    )))
+                    menu.child(menu_item("toggle-image-info", label).on_click(
+                        cx.listener(|root, _, window, cx| root.toggle_metadata(window, cx)),
+                    ))
                 })
                 .child(menu_item("quit", "Quit").on_click(|_, _, cx| cx.quit())),
         )
@@ -520,7 +579,7 @@ impl Root {
 
     fn render_metadata_overlay(
         metadata: &ImageMetadata,
-        hdr_options: Option<HdrOptions>,
+        hdr_options: Option<HDROptions>,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
         invariant!(!metadata.fields.is_empty());
@@ -729,7 +788,7 @@ impl Root {
 
     fn render_status_bar(
         status: SharedString,
-        hdr_options: Option<HdrOptions>,
+        hdr_options: Option<HDROptions>,
         tone_mapping_menu_open: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
@@ -941,11 +1000,14 @@ mod tests {
     use super::*;
     use crate::app::image_loader::LoadError;
 
-    fn loaded_hdr_viewer(options: HdrOptions) -> ViewerState {
+    fn loaded_hdr_viewer(options: HDROptions) -> ViewerState {
         ViewerState::Loaded(LoadedImage {
             displayed: DisplayedImage {
                 image: Arc::new(GPUIImage::empty()),
-                metadata: Arc::new(ImageMetadata { fields: Vec::new() }),
+                metadata: Arc::new(ImageMetadata {
+                    fields: Vec::new(),
+                    has_hdr_metrics: false,
+                }),
                 source_path: Arc::from(Path::new("test.jxr")),
                 hdr_options: Some(options),
             },
@@ -958,10 +1020,11 @@ mod tests {
         let root = Root::new(ViewerState::empty());
 
         assert!(!root.metadata_visible);
+        assert!(root.hdr_metrics_request.is_none());
         assert!(!root.tone_mapping_menu_open);
         assert_eq!(
             root.preferred_hdr_options.tone_mapping(),
-            ToneMappingMethod::ExtendedReinhard
+            ToneMappingMethod::BT2446
         );
         assert_eq!(
             root.preferred_hdr_options.max_cll_mode(),
@@ -1061,7 +1124,7 @@ mod tests {
     #[test]
     fn reselecting_the_displayed_options_cancels_a_pending_change() {
         let mut root = Root::new(ViewerState::empty());
-        let active = HdrOptions::default();
+        let active = HDROptions::default();
         let selected = active.with_tone_mapping(ToneMappingMethod::ACESFitted);
         let pending = root
             .begin_hdr_options_selection(selected, active)
@@ -1079,7 +1142,7 @@ mod tests {
     fn reselecting_the_displayed_options_preserves_an_image_load() {
         let mut root = Root::new(ViewerState::empty());
         let image_load = root.begin_load_request();
-        let active = HdrOptions::default();
+        let active = HDROptions::default();
 
         assert!(root.begin_hdr_options_selection(active, active).is_none());
         assert!(root.accepts_load_request(image_load));
@@ -1091,7 +1154,7 @@ mod tests {
         let request = root.begin_load_request();
         root.pending_hdr_options = Some((
             request,
-            HdrOptions::default().with_tone_mapping(ToneMappingMethod::ACESFitted),
+            HDROptions::default().with_tone_mapping(ToneMappingMethod::ACESFitted),
         ));
         root.context_menu_position = Some(point(px(5.0), px(DRAG_REGION_HEIGHT)));
         let error = LoadError::new("HDR options reload failed").raise();
@@ -1103,7 +1166,7 @@ mod tests {
 
     #[test]
     fn failed_hdr_reload_restores_the_displayed_options() {
-        let active = HdrOptions::default();
+        let active = HDROptions::default();
         let selected = active.with_tone_mapping(ToneMappingMethod::ACESFitted);
         let mut root = Root::new(loaded_hdr_viewer(active));
         
@@ -1127,7 +1190,7 @@ mod tests {
     #[test]
     fn tone_mapping_and_max_cll_changes_compose_in_one_reload() {
         let mut root = Root::new(ViewerState::empty());
-        let active = HdrOptions::default();
+        let active = HDROptions::default();
         let true_maximum = active.with_max_cll_mode(MaxCllMode::TrueMaximum);
         
         let max_cll_request = root
