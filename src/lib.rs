@@ -60,4 +60,4 @@ macro_rules! invariant_ne {
 mod image_formats;
 
 #[doc(inline)]
-pub use image_formats::{DecodedImage, Image, encode_bmp, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
+pub use image_formats::{DecodedImage, encode_bmp, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};

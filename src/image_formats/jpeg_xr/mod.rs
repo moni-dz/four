@@ -304,25 +304,6 @@ pub fn decode_with_options(
     Ok(decode_with_metadata_and_options(bytes, options.with_hdr_metrics(false))?.into_image())
 }
 
-/// Decodes JPEG XR pixels using the selected HDR tone-mapping `method`.
-///
-/// SDR sources do not pass through tone mapping. Image-derived white points are floored at display
-/// white; methods without a white point apply their curves to every HDR source.
-///
-/// # Errors
-///
-/// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
-/// representation that cannot be normalized to RGB.
-pub fn decode_with_tone_mapping(
-    bytes: impl AsRef<[u8]>,
-    method: ToneMappingMethod,
-) -> Result<DecodedImage> {
-    decode_with_options(
-        bytes,
-        DecodeOptions::new(method, MaxCllMode::Percentile99_99),
-    )
-}
-
 /// Decodes JPEG XR pixels together with their source representation metadata.
 ///
 /// This performs the same bounded decode and HDR-to-SDR normalization as [`decode`]. For HDR
@@ -334,27 +315,6 @@ pub fn decode_with_tone_mapping(
 /// representation that cannot be normalized to RGB.
 pub fn decode_with_metadata(bytes: impl AsRef<[u8]>) -> Result<DecodedJPEGXR> {
     decode_with_metadata_and_options(bytes, DecodeOptions::default())
-}
-
-/// Decodes JPEG XR pixels and metadata using the selected HDR tone-mapping `method`.
-///
-/// Image-dependent parameters are derived from the decoded source. Component-wise white-point
-/// methods use p99.99 `MaxCLL`, while extended luminance Reinhard uses p99.99 Rec. 709 luminance.
-/// SDR sources do not pass through tone mapping. Image-derived white points are floored at display
-/// white; methods without a white point apply their curves to every HDR source.
-///
-/// # Errors
-///
-/// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
-/// representation that cannot be normalized to RGB.
-pub fn decode_with_metadata_and_tone_mapping(
-    bytes: impl AsRef<[u8]>,
-    method: ToneMappingMethod,
-) -> Result<DecodedJPEGXR> {
-    decode_with_metadata_and_options(
-        bytes,
-        DecodeOptions::new(method, MaxCllMode::Percentile99_99),
-    )
 }
 
 /// Decodes JPEG XR pixels and metadata using the selected HDR normalization `options`.

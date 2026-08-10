@@ -20,36 +20,6 @@ const DIMENSION_MAX: u32 = 16_384;
 const PIXELS_MAX: u64 = 64 * 1024 * 1024;
 const RGBA_BYTES_PER_PIXEL: u32 = 4;
 
-/// The format-independent result consumed by the viewer.
-///
-/// Decoders normalize their native color representation to row-major RGBA8. That deliberately
-/// gives every future parser one small contract and prevents format-specific details from leaking
-/// into the UI. Implementations must return exactly `width * height * 4` bytes.
-pub trait Image: std::fmt::Debug + Send + Sync {
-    /// Returns the image width in pixels.
-    fn width(&self) -> u32;
-
-    /// Returns the image height in pixels.
-    fn height(&self) -> u32;
-
-    /// Returns row-major pixels with four bytes per pixel in RGBA order.
-    fn rgba8(&self) -> &[u8];
-
-    /// Returns the image dimensions as `(width, height)`.
-    ///
-    /// # Panics
-    ///
-    /// Panics when an implementation reports a zero width or height, which violates this trait's
-    /// image contract.
-    fn dimensions(&self) -> (u32, u32) {
-        let width = self.width();
-        let height = self.height();
-        assert!(width > 0, "image width must be nonzero");
-        assert!(height > 0, "image height must be nonzero");
-        (width, height)
-    }
-}
-
 /// Owned RGBA8 pixels produced by one of our format parsers.
 ///
 /// Keeping this type independent of GPUI makes the parsers usable in tests and keeps the boundary
@@ -102,24 +72,6 @@ impl DecodedImage {
     }
 }
 
-impl Image for DecodedImage {
-    fn width(&self) -> u32 {
-        Self::width(self)
-    }
-
-    fn height(&self) -> u32 {
-        Self::height(self)
-    }
-
-    fn rgba8(&self) -> &[u8] {
-        Self::rgba8(self)
-    }
-
-    fn dimensions(&self) -> (u32, u32) {
-        Self::dimensions(self)
-    }
-}
-
 /// GPUI accepts encoded images, so an uncompressed BMP is used only as a pixel carrier.
 ///
 /// A V4 header declares explicit BGRA channel masks. Without those masks, BMP readers commonly
@@ -128,10 +80,9 @@ impl Image for DecodedImage {
 ///
 /// # Panics
 ///
-/// Panics when `image` violates the [`Image`] contract or its dimensions exceed BMP's signed
-/// 32-bit dimension fields.
+/// Panics when the dimensions exceed BMP's signed 32-bit fields.
 #[must_use]
-pub fn encode_bmp(image: &impl Image) -> Vec<u8> {
+pub fn encode_bmp(image: &DecodedImage) -> Vec<u8> {
     let (width, height) = image.dimensions();
     let width_i32 = i32::try_from(width).expect("BMP width must fit its signed 32-bit field");
     let height_i32 = i32::try_from(height).expect("BMP height must fit its signed 32-bit field");
@@ -192,60 +143,11 @@ pub fn encode_bmp(image: &impl Image) -> Vec<u8> {
 mod tests {
     use std::sync::Arc;
 
-    use super::{BMP_DIB_HEADER_BYTES, BMP_HEADER_BYTES, Image, encode_bmp};
-
-    #[derive(Debug)]
-    struct ContractTestImage {
-        width: u32,
-        height: u32,
-        rgba: Vec<u8>,
-    }
-
-    impl Image for ContractTestImage {
-        fn width(&self) -> u32 {
-            self.width
-        }
-
-        fn height(&self) -> u32 {
-            self.height
-        }
-
-        fn rgba8(&self) -> &[u8] {
-            &self.rgba
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "image width must be nonzero")]
-    fn dimensions_reject_zero_width_implementations() {
-        let image = ContractTestImage {
-            width: 0,
-            height: 1,
-            rgba: Vec::new(),
-        };
-
-        let _dimensions = image.dimensions();
-    }
-
-    #[test]
-    #[should_panic(expected = "image RGBA byte count does not match its dimensions")]
-    fn bmp_encoding_rejects_inconsistent_image_implementations() {
-        let image = ContractTestImage {
-            width: 1,
-            height: 1,
-            rgba: vec![0; 3],
-        };
-
-        let _bmp = encode_bmp(&image);
-    }
+    use super::{BMP_DIB_HEADER_BYTES, BMP_HEADER_BYTES, DecodedImage, encode_bmp};
 
     #[test]
     fn bmp_encoding_writes_top_down_bgra_pixels() {
-        let image = ContractTestImage {
-            width: 2,
-            height: 1,
-            rgba: vec![1, 2, 3, 4, 5, 6, 7, 8],
-        };
+        let image = DecodedImage::new(2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]);
 
         let bmp = encode_bmp(&image);
 
@@ -259,11 +161,7 @@ mod tests {
 
     #[test]
     fn bmp_encoding_preserves_alpha_through_gpui() {
-        let image = ContractTestImage {
-            width: 1,
-            height: 1,
-            rgba: vec![1, 2, 3, 4],
-        };
+        let image = DecodedImage::new(1, 1, vec![1, 2, 3, 4]);
         let carrier = gpui::Image::from_bytes(gpui::ImageFormat::Bmp, encode_bmp(&image));
         let decoded = carrier
             .to_image_data(gpui::SvgRenderer::new(Arc::new(())))

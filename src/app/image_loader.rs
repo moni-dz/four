@@ -5,7 +5,7 @@ use std::fmt;
 use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use exn::{ErrorExt, ResultExt};
@@ -320,131 +320,11 @@ impl DecodedSource {
     }
 }
 
-// Loading is a linear pipeline: only read bytes can be decoded, and only decoded pixels can be
-// presented. Consuming transitions prevent callers from skipping or repeating a phase.
-struct ImageLoad<State> {
-    path: PathBuf,
-    state: State,
-}
-
-struct SelectedImage;
-
-struct EncodedImage {
-    bytes: Vec<u8>,
-}
-
 struct DecodedImageState {
     image: DecodedImage,
     byte_count: u64,
     source_format: SourceFormat,
     jpeg_xr_metadata: Option<jpeg_xr::JPEGXRMetadata>,
-}
-
-impl ImageLoad<SelectedImage> {
-    fn select(path: &Path) -> Self {
-        Self {
-            path: path.to_path_buf(),
-            state: SelectedImage,
-        }
-    }
-
-    fn read(self) -> LoadResult<ImageLoad<EncodedImage>> {
-        let file = File::open(&self.path)
-            .or_raise(|| LoadError::new(format!("Could not open {}", self.path.display())))?;
-
-        let metadata = file
-            .metadata()
-            .or_raise(|| LoadError::new(format!("Could not inspect {}", self.path.display())))?;
-        validate_image_file_size(&self.path, metadata.len())?;
-
-        invariant!(metadata.len() <= IMAGE_FILE_BYTES_MAX);
-
-        let capacity = usize::try_from(metadata.len())
-            .expect("the validated image input limit fits every supported pointer width");
-
-        let mut bytes = Vec::with_capacity(capacity);
-
-        file.take(IMAGE_FILE_BYTES_MAX + 1)
-            .read_to_end(&mut bytes)
-            .or_raise(|| LoadError::new(format!("Could not read {}", self.path.display())))?;
-
-        // The bounded read catches files that grow after metadata without allocating unboundedly.
-        validate_image_file_size(&self.path, bytes.len() as u64)?;
-
-        Ok(ImageLoad {
-            path: self.path,
-            state: EncodedImage { bytes },
-        })
-    }
-}
-
-impl ImageLoad<EncodedImage> {
-    fn decode(
-        self,
-        hdr_options: HDROptions,
-        include_hdr_metrics: bool,
-    ) -> LoadResult<ImageLoad<DecodedImageState>> {
-        invariant!(self.state.bytes.len() as u64 <= IMAGE_FILE_BYTES_MAX);
-        invariant!(isize::try_from(self.state.bytes.len()).is_ok());
-
-        let byte_count = u64::try_from(self.state.bytes.len())
-            .expect("the validated image input length fits u64");
-
-        let extension = self.path.extension().map(|value| value.to_string_lossy());
-        let source_format = SourceFormat::detect(&self.state.bytes, extension.as_deref());
-        let decoded = source_format.decode(
-            &self.state.bytes,
-            &self.path,
-            hdr_options,
-            include_hdr_metrics,
-        )?;
-        let image = decoded.image;
-
-        invariant!(image.width() > 0);
-        invariant!(image.height() > 0);
-
-        Ok(ImageLoad {
-            path: self.path,
-            state: DecodedImageState {
-                image,
-                byte_count,
-                source_format,
-                jpeg_xr_metadata: decoded.jpeg_xr_metadata,
-            },
-        })
-    }
-}
-
-impl ImageLoad<DecodedImageState> {
-    fn present(self, hdr_options: HDROptions) -> LoadedImage {
-        let (width, height) = self.state.image.dimensions();
-
-        invariant!(width > 0);
-        invariant!(height > 0);
-
-        let metadata = Arc::new(ImageMetadata::new(&self.path, &self.state));
-        let image = Arc::new(GPUIImage::from_bytes(
-            ImageFormat::Bmp,
-            encode_bmp(&self.state.image),
-        ));
-        let file_name = display_file_name(&self.path).into_owned();
-        let active_hdr_options = self
-            .state
-            .jpeg_xr_metadata
-            .filter(|metadata| metadata.is_hdr())
-            .map(|_| hdr_options);
-        let source_path = Arc::<Path>::from(self.path);
-
-        LoadedImage {
-            displayed: DisplayedImage {
-                image,
-                metadata,
-                source_path,
-                hdr_options: active_hdr_options,
-            },
-            status: format!("{file_name} — {width} × {height}").into(),
-        }
-    }
 }
 
 fn image_decode_error(path: &Path) -> LoadError {
@@ -602,14 +482,7 @@ fn validate_image_file_size(path: &Path, byte_count: u64) -> LoadResult<()> {
 }
 
 pub(super) fn load_image(path: &Path) -> LoadResult<LoadedImage> {
-    load_image_with_options(path, HDROptions::default())
-}
-
-pub(super) fn load_image_with_options(
-    path: &Path,
-    hdr_options: HDROptions,
-) -> LoadResult<LoadedImage> {
-    load_image_with_options_and_hdr_metrics(path, hdr_options, false)
+    load_image_with_options_and_hdr_metrics(path, HDROptions::default(), false)
 }
 
 pub(super) fn load_image_with_options_and_hdr_metrics(
@@ -617,10 +490,60 @@ pub(super) fn load_image_with_options_and_hdr_metrics(
     hdr_options: HDROptions,
     include_hdr_metrics: bool,
 ) -> LoadResult<LoadedImage> {
-    let loaded = ImageLoad::select(path)
-        .read()?
-        .decode(hdr_options, include_hdr_metrics)?
-        .present(hdr_options);
+    let file = File::open(path)
+        .or_raise(|| LoadError::new(format!("Could not open {}", path.display())))?;
+
+    let file_metadata = file
+        .metadata()
+        .or_raise(|| LoadError::new(format!("Could not inspect {}", path.display())))?;
+    validate_image_file_size(path, file_metadata.len())?;
+
+    let capacity = usize::try_from(file_metadata.len())
+        .expect("the validated image input limit fits every supported pointer width");
+
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(IMAGE_FILE_BYTES_MAX + 1)
+        .read_to_end(&mut bytes)
+        .or_raise(|| LoadError::new(format!("Could not read {}", path.display())))?;
+
+    let byte_count = u64::try_from(bytes.len()).expect("the validated image input length fits u64");
+
+    validate_image_file_size(path, byte_count)?;
+
+    let extension = path.extension().map(|value| value.to_string_lossy());
+    let source_format = SourceFormat::detect(&bytes, extension.as_deref());
+
+    let decoded = source_format.decode(&bytes, path, hdr_options, include_hdr_metrics)?;
+    let decoded = DecodedImageState {
+        image: decoded.image,
+        byte_count,
+        source_format,
+        jpeg_xr_metadata: decoded.jpeg_xr_metadata,
+    };
+
+    let (width, height) = decoded.image.dimensions();
+    let metadata = Arc::new(ImageMetadata::new(path, &decoded));
+
+    let image = Arc::new(GPUIImage::from_bytes(
+        ImageFormat::Bmp,
+        encode_bmp(&decoded.image),
+    ));
+
+    let active_hdr_options = decoded
+        .jpeg_xr_metadata
+        .filter(|metadata| metadata.is_hdr())
+        .map(|_| hdr_options);
+
+    let loaded = LoadedImage {
+        displayed: DisplayedImage {
+            image,
+            metadata,
+            source_path: Arc::from(path),
+            hdr_options: active_hdr_options,
+        },
+        status: format!("{} — {width} × {height}", display_file_name(path)).into(),
+    };
+
     invariant!(!loaded.status.is_empty());
     Ok(loaded)
 }

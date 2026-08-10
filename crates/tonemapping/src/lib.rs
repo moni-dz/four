@@ -10,27 +10,24 @@
 //! [`Clamp`] and [`ScaledClamp`] provide clipping baselines. The Reinhard family includes
 //! component-wise, luminance-preserving, white-point, and Reinhard-Jodie variants. [`BT2446A`]
 //! applies the standardized HDR-to-SDR conversion Method A. [`Hable`], [`AcesFitted`], and
-//! [`AcesApproximate`] provide filmic curves, while [`CameraResponse`] applies a caller-supplied
-//! normalized camera-response lookup table.
-//! [`ToneMappingMethod`] enumerates the built-in operator families that need no custom response.
+//! [`AcesApproximate`] provide filmic curves. [`ToneMappingMethod`] enumerates the built-in
+//! operator families.
 //!
-//! [`estimate_max_cll`] selects the nearest-rank 99.99th percentile of per-pixel `max(R, G, B)`.
-//! [`MaxCllEstimator`] can select either that percentile or the true maximum through
-//! [`MaxCllMode`]. Inputs determine the unit: absolute-nit inputs produce `MaxCLL` in nits, while
-//! relative inputs produce a relative light level. Luminance-based Reinhard uses the distinct
-//! [`estimate_luminance_white_point`] statistic.
+//! [`MaxCllEstimator`] selects either the nearest-rank 99.99th percentile of per-pixel
+//! `max(R, G, B)` or the true maximum through [`MaxCllMode`]. Inputs determine the unit: absolute-nit
+//! inputs produce `MaxCLL` in nits, while relative inputs produce a relative light level.
+//! Luminance-based Reinhard uses the distinct [`estimate_luminance_white_point`] statistic.
 //!
 //! # Example
 //!
 //! ```
-//! use tonemapping::{ExtendedReinhard, LinearRGB, ToneMapper, estimate_max_cll};
+//! use tonemapping::{ExtendedReinhard, LinearRGB, ToneMapper, WhitePoint};
 //!
 //! let pixels = [
 //!     LinearRGB::new([0.5, 1.0, 2.0]),
 //!     LinearRGB::new([1.0, 2.0, 4.0]),
 //! ];
-//! let max_cll = estimate_max_cll(&pixels).expect("the image is not empty");
-//! let mapper = ExtendedReinhard::from_max_cll(max_cll).expect("the image is not black");
+//! let mapper = ExtendedReinhard::new(WhitePoint::new(4.0).expect("white is positive"));
 //! let display_linear = mapper.map(pixels[0]);
 //!
 //! assert!(display_linear.components().into_iter().all(|value| (0.0..=1.0).contains(&value)));
@@ -190,8 +187,7 @@ macro_rules! define_tone_mapping_methods {
         /// Identifies a built-in tone-mapping operator family.
         ///
         /// White-point methods require image-specific white points when resolved. [`BT2446A`]
-        /// uses its standardized fixed mastering and display assumptions. [`CameraToneMapper`]
-        /// requires a caller-supplied [`CameraResponse`].
+        /// uses its standardized fixed mastering and display assumptions.
         #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
         pub enum ToneMappingMethod {
             $(
@@ -593,26 +589,6 @@ impl MaxCllEstimator {
     }
 }
 
-/// Estimates p99.99 `MaxCLL` for a complete still-image color slice.
-///
-/// Returns `None` when `colors` is empty.
-///
-/// # Examples
-///
-/// ```
-/// use tonemapping::{LinearRGB, estimate_max_cll};
-///
-/// let colors = [LinearRGB::new([1.0, 2.0, 4.0])];
-/// assert_eq!(estimate_max_cll(&colors).map(|value| value.level()), Some(4.0));
-/// ```
-#[must_use]
-pub fn estimate_max_cll(colors: &[LinearRGB]) -> Option<MaxCll> {
-    let pixel_count = NonZeroUsize::new(colors.len())?;
-    let mut estimator = MaxCllEstimator::new(pixel_count);
-    estimator.observe_many(colors);
-    estimator.finish().ok()
-}
-
 #[derive(Clone, Copy, Debug)]
 struct PeakSample {
     level: f32,
@@ -717,7 +693,6 @@ fn observe_max_cll_candidates(estimator: &mut MaxCllEstimator, colors: &[LinearR
 
 mod aces;
 mod bt2446;
-mod camera_response;
 mod clamp;
 mod hable;
 mod reinhard;
@@ -726,9 +701,6 @@ mod reinhard;
 pub use aces::{AcesApproximate, AcesFitted};
 #[doc(inline)]
 pub use bt2446::BT2446A;
-#[doc(inline)]
-pub use camera_response::{CameraResponse, CameraResponseError, CameraToneMapper};
-#[doc(inline)]
 pub use clamp::{Clamp, ScaledClamp};
 #[doc(inline)]
 pub use hable::Hable;
@@ -943,7 +915,7 @@ mod tests {
     #[test]
     fn extended_reinhard_maps_the_percentile_white_point_to_one() {
         let colors = [LinearRGB::new([4.0, 2.0, 1.0])];
-        let max_cll = estimate_max_cll(&colors).unwrap();
+        let max_cll = estimate_max_cll_scalarly(&colors);
         let mapper = ExtendedReinhard::from_max_cll(max_cll).unwrap();
         let [white, middle, low] = mapper.map(colors[0]).components();
 
@@ -955,7 +927,7 @@ mod tests {
 
     #[test]
     fn extended_reinhard_rejects_a_zero_white_point() {
-        let black = estimate_max_cll(&[LinearRGB::default()]).unwrap();
+        let black = estimate_max_cll_scalarly(&[LinearRGB::default()]);
 
         assert!(ExtendedReinhard::from_max_cll(black).is_none());
     }
@@ -967,9 +939,7 @@ mod tests {
         let tiny_luminance = LuminanceWhitePoint::new(smallest_positive).unwrap();
         let extended = ExtendedReinhard::new(tiny);
         let extended_luminance = ExtendedLuminanceReinhard::new(tiny_luminance);
-        let camera_response = CameraResponse::new(vec![0.0, 1.0], vec![0.0, 1.0]).unwrap();
-        let camera = camera_response.tone_mapper(tiny);
-        let mappers: [&dyn ToneMapper; 12] = [
+        let mappers: [&dyn ToneMapper; 11] = [
             &Clamp,
             &ScaledClamp::new(tiny),
             &Reinhard,
@@ -981,7 +951,6 @@ mod tests {
             &Hable,
             &AcesFitted,
             &AcesApproximate,
-            &camera,
         ];
 
         for mapper in mappers {
@@ -1108,58 +1077,11 @@ mod tests {
     }
 
     #[test]
-    fn camera_response_interpolates_knots_and_clamps_endpoints() {
-        let response = CameraResponse::new(vec![0.0, 0.5, 1.0], vec![0.0, 0.25, 1.0]).unwrap();
-        let mapper = response.tone_mapper(WhitePoint::new(6.0).unwrap());
-
-        assert_components_close(
-            mapper.map(LinearRGB::new([0.0, 1.5, 3.0])),
-            [0.0, 0.125, 0.25],
-        );
-        assert_components_close(
-            mapper.map(LinearRGB::new([3.0, 6.0, 9.0])),
-            [0.25, 1.0, 1.0],
-        );
-        assert_eq!(response.sample_count(), 3);
-        assert_eq!(mapper.white_point().level(), 6.0);
-    }
-
-    #[test]
-    fn camera_response_rejects_malformed_curves() {
-        assert_eq!(
-            CameraResponse::new(vec![0.0, 1.0], vec![0.0]).unwrap_err(),
-            CameraResponseError::LengthMismatch {
-                irradiance: 2,
-                intensity: 1
-            }
-        );
-        assert_eq!(
-            CameraResponse::new(vec![0.0, 0.5, 0.5], vec![0.0, 0.5, 1.0]).unwrap_err(),
-            CameraResponseError::IrradianceNotIncreasing(2)
-        );
-
-        assert_eq!(
-            CameraResponse::new(vec![0.0, 0.5, 1.0], vec![0.0, 0.75, 0.5]).unwrap_err(),
-            CameraResponseError::IntensityDecreases(2)
-        );
-
-        assert_eq!(
-            CameraResponse::new(vec![0.1, 1.0], vec![0.0, 1.0]).unwrap_err(),
-            CameraResponseError::IrradianceEndpoints
-        );
-
-        assert_eq!(
-            CameraResponse::new(vec![0.0, 1.0], vec![0.1, 1.0]).unwrap_err(),
-            CameraResponseError::IntensityEndpoints
-        );
-    }
-
-    #[test]
     fn max_cll_rejects_the_brightest_point_zero_one_percent() {
         let mut colors = vec![LinearRGB::new([1.0; 3]); 9_998];
         colors.extend([LinearRGB::new([4.0; 3]), LinearRGB::new([126.0; 3])]);
 
-        let max_cll = estimate_max_cll(&colors).unwrap();
+        let max_cll = estimate_max_cll_scalarly(&colors);
 
         assert_eq!(max_cll.level(), 4.0);
         assert_eq!(max_cll.channel(), ColorChannel::Red);
@@ -1199,7 +1121,7 @@ mod tests {
 
     #[test]
     fn max_cll_uses_max_rgb_instead_of_luminance() {
-        let max_cll = estimate_max_cll(&[LinearRGB::new([0.0, 0.0, 5.0])]).unwrap();
+        let max_cll = estimate_max_cll_scalarly(&[LinearRGB::new([0.0, 0.0, 5.0])]);
 
         assert_eq!(max_cll.level(), 5.0);
         assert_eq!(max_cll.channel(), ColorChannel::Blue);
@@ -1207,7 +1129,7 @@ mod tests {
 
     #[test]
     fn max_cll_preserves_float32_levels_above_binary16_range() {
-        let max_cll = estimate_max_cll(&[LinearRGB::new([70_000.0, 0.0, 100_000.0])]).unwrap();
+        let max_cll = estimate_max_cll_scalarly(&[LinearRGB::new([70_000.0, 0.0, 100_000.0])]);
 
         assert_eq!(max_cll.level(), 100_000.0);
         assert_eq!(max_cll.channel(), ColorChannel::Blue);
