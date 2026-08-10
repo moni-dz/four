@@ -5,14 +5,14 @@ use std::sync::Arc;
 
 use gpui::{
     Anchor, AnchoredPositionMode, Image as GPUIImage, MouseButton, MouseDownEvent,
-    PathPromptOptions, Pixels, Point, SharedString, Window, WindowControlArea, anchored, deferred,
-    div, img, point, prelude::*, px, rgb, rgba,
+    PathPromptOptions, Pixels, Point, Role, SharedString, Toggled, Window, WindowControlArea,
+    anchored, deferred, div, img, point, prelude::*, px, rgb, rgba,
 };
-use tonemapping::ToneMappingMethod;
+use tonemapping::{MaxCllMode, ToneMappingMethod};
 
 use super::image_loader::{
-    DisplayedImage, ImageMetadata, LoadResult, LoadedImage, MetadataField, format_load_error,
-    load_image, load_image_with_tone_mapping,
+    DisplayedImage, HdrOptions, ImageMetadata, LoadResult, LoadedImage, MetadataField,
+    format_load_error, load_image, load_image_with_options,
 };
 
 const CONTEXT_MENU_ITEM_HEIGHT: f32 = 36.0;
@@ -24,6 +24,8 @@ const METADATA_LABEL_WIDTH: f32 = 140.0;
 const METADATA_OVERLAY_MARGIN: f32 = 12.0;
 const METADATA_OVERLAY_WIDTH: f32 = 480.0;
 const METADATA_WINDOW_MIN_HEIGHT: f32 = 500.0;
+const MAX_CLL_CHECKBOX_SIZE: f32 = 16.0;
+const MAX_CLL_SELECTOR_HEIGHT: f32 = 30.0;
 const TONE_MAPPING_MENU_ITEM_HEIGHT: f32 = 30.0;
 const TONE_MAPPING_MENU_MARGIN: f32 = 4.0;
 const TONE_MAPPING_MENU_WIDTH: f32 = 292.0;
@@ -114,25 +116,25 @@ pub(super) struct Root {
     context_menu_position: Option<Point<Pixels>>,
     load_generation: u64,
     metadata_visible: bool,
-    pending_tone_mapping: Option<(LoadRequest, ToneMappingMethod)>,
-    preferred_tone_mapping: ToneMappingMethod,
+    pending_hdr_options: Option<(LoadRequest, HdrOptions)>,
+    preferred_hdr_options: HdrOptions,
     tone_mapping_menu_open: bool,
     viewer: ViewerState,
 }
 
 impl Root {
     pub(super) fn new(viewer: ViewerState) -> Self {
-        let preferred_tone_mapping = viewer
+        let preferred_hdr_options = viewer
             .displayed()
-            .and_then(|displayed| displayed.tone_mapping)
+            .and_then(|displayed| displayed.hdr_options)
             .unwrap_or_default();
 
         Self {
             context_menu_position: None,
             load_generation: 0,
             metadata_visible: false,
-            pending_tone_mapping: None,
-            preferred_tone_mapping,
+            pending_hdr_options: None,
+            preferred_hdr_options,
             tone_mapping_menu_open: false,
             viewer,
         }
@@ -167,27 +169,27 @@ impl Root {
         request.0 == self.load_generation
     }
 
-    fn begin_tone_mapping_selection(
+    fn begin_hdr_options_selection(
         &mut self,
-        method: ToneMappingMethod,
-        active_method: ToneMappingMethod,
+        options: HdrOptions,
+        active_options: HdrOptions,
     ) -> Option<LoadRequest> {
-        self.preferred_tone_mapping = method;
-        if method == active_method {
-            if self.pending_tone_mapping.take().is_some() {
+        self.preferred_hdr_options = options;
+        if options == active_options {
+            if self.pending_hdr_options.take().is_some() {
                 let _cancelled_request = self.begin_load_request();
             }
             return None;
         }
         if self
-            .pending_tone_mapping
-            .is_some_and(|(_, pending_method)| pending_method == method)
+            .pending_hdr_options
+            .is_some_and(|(_, pending_options)| pending_options == options)
         {
             return None;
         }
 
         let request = self.begin_load_request();
-        self.pending_tone_mapping = Some((request, method));
+        self.pending_hdr_options = Some((request, options));
         Some(request)
     }
 
@@ -212,19 +214,19 @@ impl Root {
                 return;
             };
 
-            let Ok((request, tone_mapping)) = root.update_in(cx, |root, _window, cx| {
+            let Ok((request, hdr_options)) = root.update_in(cx, |root, _window, cx| {
                 root.context_menu_position = None;
                 root.tone_mapping_menu_open = false;
                 let request = root.begin_load_request();
-                root.pending_tone_mapping = None;
+                root.pending_hdr_options = None;
                 cx.notify();
-                (request, root.preferred_tone_mapping)
+                (request, root.preferred_hdr_options)
             }) else {
                 return;
             };
 
             let result = cx
-                .background_spawn(async move { load_image_with_tone_mapping(&path, tone_mapping) })
+                .background_spawn(async move { load_image_with_options(&path, hdr_options) })
                 .await;
             let _ = root.update_in(cx, |root, _window, cx| {
                 if root.apply_load_result(request, result) {
@@ -254,7 +256,7 @@ impl Root {
         true
     }
 
-    fn apply_tone_mapping_result(
+    fn apply_hdr_options_result(
         &mut self,
         request: LoadRequest,
         result: LoadResult<LoadedImage>,
@@ -266,14 +268,14 @@ impl Root {
         invariant!(!self.viewer.status().is_empty());
         self.context_menu_position = None;
 
-        let applied_method = result
+        let applied_options = result
             .as_ref()
             .ok()
-            .and_then(|loaded| loaded.displayed.tone_mapping);
+            .and_then(|loaded| loaded.displayed.hdr_options);
         self.viewer.apply_result(result);
-        self.pending_tone_mapping = None;
-        if let Some(method) = applied_method {
-            self.preferred_tone_mapping = method;
+        self.pending_hdr_options = None;
+        if let Some(options) = applied_options {
+            self.preferred_hdr_options = options;
         }
         self.tone_mapping_menu_open = false;
 
@@ -287,19 +289,39 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let options = self.preferred_hdr_options.with_tone_mapping(method);
+        self.select_hdr_options(options, window, cx);
+    }
+
+    fn select_max_cll_mode(
+        &mut self,
+        max_cll_mode: MaxCllMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let options = self.preferred_hdr_options.with_max_cll_mode(max_cll_mode);
+        self.select_hdr_options(options, window, cx);
+    }
+
+    fn select_hdr_options(
+        &mut self,
+        options: HdrOptions,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.context_menu_position = None;
         self.tone_mapping_menu_open = false;
 
-        let Some((active_method, source_path)) = self.viewer.displayed().and_then(|displayed| {
+        let Some((active_options, source_path)) = self.viewer.displayed().and_then(|displayed| {
             displayed
-                .tone_mapping
+                .hdr_options
                 .map(|active| (active, Arc::clone(&displayed.source_path)))
         }) else {
             cx.notify();
             return;
         };
 
-        let Some(request) = self.begin_tone_mapping_selection(method, active_method) else {
+        let Some(request) = self.begin_hdr_options_selection(options, active_options) else {
             cx.notify();
             return;
         };
@@ -308,12 +330,12 @@ impl Root {
 
         cx.spawn_in(window, async move |root, cx| {
             let result = cx
-                .background_spawn(async move {
-                    load_image_with_tone_mapping(source_path.as_ref(), method)
-                })
+                .background_spawn(
+                    async move { load_image_with_options(source_path.as_ref(), options) },
+                )
                 .await;
             let _ = root.update_in(cx, |root, _window, cx| {
-                if root.apply_tone_mapping_result(request, result) {
+                if root.apply_hdr_options_result(request, result) {
                     cx.notify();
                 }
             });
@@ -375,7 +397,7 @@ impl Root {
 
     fn render_metadata_overlay(
         metadata: &ImageMetadata,
-        tone_mapping: Option<ToneMappingMethod>,
+        hdr_options: Option<HdrOptions>,
         tone_mapping_menu_open: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
@@ -396,12 +418,14 @@ impl Root {
             .text_sm()
             .flex()
             .flex_col()
-            .when_some(tone_mapping, |overlay, method| {
-                overlay.child(Self::render_tone_mapping_selector(
-                    method,
-                    tone_mapping_menu_open,
-                    cx,
-                ))
+            .when_some(hdr_options, |overlay, options| {
+                overlay
+                    .child(Self::render_tone_mapping_selector(
+                        options.tone_mapping(),
+                        tone_mapping_menu_open,
+                        cx,
+                    ))
+                    .child(Self::render_max_cll_selector(options.max_cll_mode(), cx))
             })
             .children(metadata.fields.iter().map(metadata_field))
     }
@@ -453,6 +477,72 @@ impl Root {
                     .flex_none()
                     .text_color(rgb(0x009d_9d9d))
                     .child("Tone mapper"),
+            )
+            .child(selector)
+    }
+
+    fn render_max_cll_selector(selected_mode: MaxCllMode, cx: &mut Context<Self>) -> gpui::Div {
+        let checked = selected_mode == MaxCllMode::TrueMaximum;
+        let next_mode = toggled_max_cll_mode(selected_mode);
+        let description = if checked {
+            "True maximum"
+        } else {
+            "99.99th percentile"
+        };
+
+        let selector = div()
+            .id("max-cll-selector")
+            .role(Role::CheckBox)
+            .aria_label("Use true maximum MaxCLL")
+            .aria_toggled(if checked {
+                Toggled::True
+            } else {
+                Toggled::False
+            })
+            .h(px(MAX_CLL_SELECTOR_HEIGHT))
+            .min_w_0()
+            .flex_1()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_2()
+            .rounded_sm()
+            .border_1()
+            .border_color(rgba(0xff_ff_ff_2e))
+            .bg(rgb(0x0024_2424))
+            .cursor_pointer()
+            .hover(|style| style.bg(rgb(0x0032_3232)))
+            .child(
+                div()
+                    .size(px(MAX_CLL_CHECKBOX_SIZE))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_xs()
+                    .border_1()
+                    .border_color(rgba(0xff_ff_ff_55))
+                    .when(checked, |checkbox| checkbox.bg(rgb(0x0038_3838)))
+                    .text_color(rgb(0x00a9_d18e))
+                    .child(if checked { "✓" } else { "" }),
+            )
+            .child(description)
+            .on_click(cx.listener(move |root, _, window, cx| {
+                root.select_max_cll_mode(next_mode, window, cx);
+            }));
+
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap(px(METADATA_FIELD_GAP))
+            .pb_1()
+            .child(
+                div()
+                    .w(px(METADATA_LABEL_WIDTH))
+                    .flex_none()
+                    .text_color(rgb(0x009d_9d9d))
+                    .child("MaxCLL"),
             )
             .child(selector)
     }
@@ -554,9 +644,13 @@ impl Render for Root {
         let metadata = displayed
             .as_ref()
             .map(|displayed| Arc::clone(&displayed.metadata));
-        let tone_mapping = displayed
+        let active_hdr_options = displayed
             .as_ref()
-            .and_then(|displayed| displayed.tone_mapping);
+            .and_then(|displayed| displayed.hdr_options);
+        let hdr_options = active_hdr_options.map(|active_options| {
+            self.pending_hdr_options
+                .map_or(active_options, |(_, pending_options)| pending_options)
+        });
         let metadata_visible = self.metadata_visible;
         let tone_mapping_menu_open = self.tone_mapping_menu_open;
         let status = self.viewer.status().clone();
@@ -580,7 +674,7 @@ impl Render for Root {
             .when_some(metadata.filter(|_| metadata_visible), |root, metadata| {
                 root.child(Self::render_metadata_overlay(
                     &metadata,
-                    tone_mapping,
+                    hdr_options,
                     tone_mapping_menu_open,
                     cx,
                 ))
@@ -593,6 +687,13 @@ impl Render for Root {
                     cx,
                 ))
             })
+    }
+}
+
+const fn toggled_max_cll_mode(mode: MaxCllMode) -> MaxCllMode {
+    match mode {
+        MaxCllMode::Percentile99_99 => MaxCllMode::TrueMaximum,
+        MaxCllMode::TrueMaximum => MaxCllMode::Percentile99_99,
     }
 }
 
@@ -697,8 +798,12 @@ mod tests {
         assert!(!root.metadata_visible);
         assert!(!root.tone_mapping_menu_open);
         assert_eq!(
-            root.preferred_tone_mapping,
+            root.preferred_hdr_options.tone_mapping(),
             ToneMappingMethod::ExtendedReinhard
+        );
+        assert_eq!(
+            root.preferred_hdr_options.max_cll_mode(),
+            MaxCllMode::Percentile99_99
         );
     }
 
@@ -725,63 +830,76 @@ mod tests {
     }
 
     #[test]
-    fn reselecting_the_displayed_method_cancels_a_pending_change() {
+    fn reselecting_the_displayed_options_cancels_a_pending_change() {
         let mut root = Root::new(ViewerState::empty());
+        let active = HdrOptions::default();
+        let selected = active.with_tone_mapping(ToneMappingMethod::AcesFitted);
         let pending = root
-            .begin_tone_mapping_selection(
-                ToneMappingMethod::AcesFitted,
-                ToneMappingMethod::ExtendedReinhard,
-            )
-            .expect("a different method starts a request");
+            .begin_hdr_options_selection(selected, active)
+            .expect("different HDR options start a request");
 
-        assert_eq!(root.preferred_tone_mapping, ToneMappingMethod::AcesFitted);
-        assert!(
-            root.begin_tone_mapping_selection(
-                ToneMappingMethod::AcesFitted,
-                ToneMappingMethod::ExtendedReinhard,
-            )
-            .is_none()
-        );
+        assert_eq!(root.preferred_hdr_options, selected);
+        assert!(root.begin_hdr_options_selection(selected, active).is_none());
         assert!(root.accepts_load_request(pending));
-        assert!(
-            root.begin_tone_mapping_selection(
-                ToneMappingMethod::ExtendedReinhard,
-                ToneMappingMethod::ExtendedReinhard,
-            )
-            .is_none()
-        );
-        assert_eq!(
-            root.preferred_tone_mapping,
-            ToneMappingMethod::ExtendedReinhard
-        );
+        assert!(root.begin_hdr_options_selection(active, active).is_none());
+        assert_eq!(root.preferred_hdr_options, active);
         assert!(!root.accepts_load_request(pending));
     }
 
     #[test]
-    fn reselecting_the_displayed_method_preserves_an_image_load() {
+    fn reselecting_the_displayed_options_preserves_an_image_load() {
         let mut root = Root::new(ViewerState::empty());
         let image_load = root.begin_load_request();
+        let active = HdrOptions::default();
 
-        assert!(
-            root.begin_tone_mapping_selection(
-                ToneMappingMethod::ExtendedReinhard,
-                ToneMappingMethod::ExtendedReinhard,
-            )
-            .is_none()
-        );
+        assert!(root.begin_hdr_options_selection(active, active).is_none());
         assert!(root.accepts_load_request(image_load));
     }
 
     #[test]
-    fn tone_mapping_result_closes_an_open_context_menu() {
+    fn hdr_options_result_closes_an_open_context_menu() {
         let mut root = Root::new(ViewerState::empty());
         let request = root.begin_load_request();
-        root.pending_tone_mapping = Some((request, ToneMappingMethod::AcesFitted));
+        root.pending_hdr_options = Some((
+            request,
+            HdrOptions::default().with_tone_mapping(ToneMappingMethod::AcesFitted),
+        ));
         root.context_menu_position = Some(point(px(5.0), px(DRAG_REGION_HEIGHT)));
-        let error = LoadError::new("tone mapping failed").raise();
+        let error = LoadError::new("HDR options reload failed").raise();
 
-        assert!(root.apply_tone_mapping_result(request, Err(error)));
+        assert!(root.apply_hdr_options_result(request, Err(error)));
         assert!(root.context_menu_position.is_none());
-        assert!(root.pending_tone_mapping.is_none());
+        assert!(root.pending_hdr_options.is_none());
+    }
+
+    #[test]
+    fn tone_mapping_and_max_cll_changes_compose_in_one_reload() {
+        let mut root = Root::new(ViewerState::empty());
+        let active = HdrOptions::default();
+        let true_maximum = active.with_max_cll_mode(MaxCllMode::TrueMaximum);
+        let max_cll_request = root
+            .begin_hdr_options_selection(true_maximum, active)
+            .expect("a MaxCLL change starts a request");
+
+        let combined = root
+            .preferred_hdr_options
+            .with_tone_mapping(ToneMappingMethod::AcesFitted);
+        let combined_request = root
+            .begin_hdr_options_selection(combined, active)
+            .expect("a composed HDR option change starts a new request");
+
+        assert!(!root.accepts_load_request(max_cll_request));
+        assert!(root.accepts_load_request(combined_request));
+        assert_eq!(root.pending_hdr_options, Some((combined_request, combined)));
+        assert_eq!(combined.tone_mapping(), ToneMappingMethod::AcesFitted);
+        assert_eq!(combined.max_cll_mode(), MaxCllMode::TrueMaximum);
+    }
+
+    #[test]
+    fn max_cll_toggle_returns_to_the_percentile_mode() {
+        assert_eq!(
+            toggled_max_cll_mode(toggled_max_cll_mode(MaxCllMode::Percentile99_99)),
+            MaxCllMode::Percentile99_99
+        );
     }
 }

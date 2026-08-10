@@ -6,10 +6,11 @@
 //! HDR values are mapped component-wise with extended Reinhard using a `MaxCLL` white point. Its
 //! white point is floored at display white so content already inside the SDR range is unchanged.
 //!
-//! `MaxCLL` is estimated from the 99.99th-percentile `max(R, G, B)` light level, rejecting isolated
-//! outliers at the cost of clipping the brightest 0.01% of a sufficiently large image.
-//! Callers can select any built-in [`ToneMappingMethod`]; white-point methods use matching
-//! percentile statistics estimated from the decoded image.
+//! By default, `MaxCLL` is estimated from the 99.99th-percentile `max(R, G, B)` light level,
+//! rejecting isolated outliers at the cost of clipping the brightest 0.01% of a sufficiently large
+//! image. [`DecodeOptions`] can instead select the true maximum. Callers can also select any
+//! built-in [`ToneMappingMethod`]; white-point methods use matching statistics estimated from the
+//! decoded image.
 //! A wholly empty, non-premultiplied HDR alpha plane is treated as unspecified and made opaque,
 //! matching JPEG XR screenshots that store zero in an otherwise unused alpha channel.
 
@@ -26,8 +27,8 @@ use ::jpegxr::{
 use tonemapping::{
     AcesApproximate, AcesFitted, Clamp, ColorChannel as ToneColorChannel,
     ExtendedLuminanceReinhard, ExtendedReinhard, LinearRgb, LuminanceReinhard, LuminanceWhitePoint,
-    MaxCllEstimator, Reinhard, ReinhardJodie, ScaledClamp, ToneMapper, ToneMappingMethod,
-    Uncharted2, WhitePoint,
+    MaxCllEstimator, MaxCllMode, Reinhard, ReinhardJodie, ScaledClamp, ToneMapper,
+    ToneMappingMethod, Uncharted2, WhitePoint,
 };
 
 use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
@@ -63,6 +64,36 @@ impl JPEGXRColorChannel {
             Self::Green => 'G',
             Self::Blue => 'B',
         }
+    }
+}
+
+/// Configures HDR normalization during JPEG XR decoding.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct DecodeOptions {
+    tone_mapping: ToneMappingMethod,
+    max_cll_mode: MaxCllMode,
+}
+
+impl DecodeOptions {
+    /// Creates options using `tone_mapping` and `max_cll_mode`.
+    #[must_use]
+    pub const fn new(tone_mapping: ToneMappingMethod, max_cll_mode: MaxCllMode) -> Self {
+        Self {
+            tone_mapping,
+            max_cll_mode,
+        }
+    }
+
+    /// Returns the selected HDR tone-mapping operator.
+    #[must_use]
+    pub const fn tone_mapping(self) -> ToneMappingMethod {
+        self.tone_mapping
+    }
+
+    /// Returns the selected `MaxCLL` estimator mode.
+    #[must_use]
+    pub const fn max_cll_mode(self) -> MaxCllMode {
+        self.max_cll_mode
     }
 }
 
@@ -130,9 +161,9 @@ impl JPEGXRMetadata {
 
     /// Returns the estimated maximum content light level in nits for HDR sources.
     ///
-    /// The estimate is the 99.99th-percentile `max(R, G, B)` light level. SDR sources return
-    /// `None` because they do not pass through the HDR tone-mapping pipeline. A finite result above
-    /// the `f32` range saturates at `f32::MAX`.
+    /// The estimate follows the [`MaxCllMode`] used for decoding. SDR sources return `None` because
+    /// they do not pass through the HDR tone-mapping pipeline. A finite result above the `f32`
+    /// range saturates at `f32::MAX`.
     #[must_use]
     pub fn max_cll_nits(self) -> Option<f32> {
         self.hdr_metrics.map(|metrics| metrics.max_cll.nits())
@@ -145,11 +176,20 @@ impl JPEGXRMetadata {
             .map(|metrics| metrics.max_cll.relative_light_level())
     }
 
-    /// Returns the color channel that determines the percentile `MaxCLL` value.
+    /// Returns the color channel that determines the selected `MaxCLL` value.
     #[must_use]
     pub const fn max_cll_channel(self) -> Option<JPEGXRColorChannel> {
         match self.hdr_metrics {
             Some(metrics) => Some(metrics.max_cll.channel),
+            None => None,
+        }
+    }
+
+    /// Returns the `MaxCLL` mode used for HDR normalization.
+    #[must_use]
+    pub const fn max_cll_mode(self) -> Option<MaxCllMode> {
+        match self.hdr_metrics {
+            Some(metrics) => Some(metrics.max_cll_mode),
             None => None,
         }
     }
@@ -222,7 +262,23 @@ pub fn has_signature(bytes: impl AsRef<[u8]>) -> bool {
 /// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
 /// representation that cannot be normalized to RGB.
 pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
-    decode_with_tone_mapping(bytes, ToneMappingMethod::default())
+    decode_with_options(bytes, DecodeOptions::default())
+}
+
+/// Decodes JPEG XR pixels using the selected HDR normalization `options`.
+///
+/// SDR sources do not pass through tone mapping. Image-derived white points are floored at display
+/// white; methods without a white point apply their curves to every HDR source.
+///
+/// # Errors
+///
+/// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
+/// representation that cannot be normalized to RGB.
+pub fn decode_with_options(
+    bytes: impl AsRef<[u8]>,
+    options: DecodeOptions,
+) -> Result<DecodedImage> {
+    Ok(decode_with_metadata_and_options(bytes, options)?.into_image())
 }
 
 /// Decodes JPEG XR pixels using the selected HDR tone-mapping `method`.
@@ -238,7 +294,10 @@ pub fn decode_with_tone_mapping(
     bytes: impl AsRef<[u8]>,
     method: ToneMappingMethod,
 ) -> Result<DecodedImage> {
-    Ok(decode_with_metadata_and_tone_mapping(bytes, method)?.into_image())
+    decode_with_options(
+        bytes,
+        DecodeOptions::new(method, MaxCllMode::Percentile99_99),
+    )
 }
 
 /// Decodes JPEG XR pixels together with their source representation metadata.
@@ -251,7 +310,7 @@ pub fn decode_with_tone_mapping(
 /// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
 /// representation that cannot be normalized to RGB.
 pub fn decode_with_metadata(bytes: impl AsRef<[u8]>) -> Result<DecodedJPEGXR> {
-    decode_with_metadata_and_tone_mapping(bytes, ToneMappingMethod::default())
+    decode_with_metadata_and_options(bytes, DecodeOptions::default())
 }
 
 /// Decodes JPEG XR pixels and metadata using the selected HDR tone-mapping `method`.
@@ -268,6 +327,28 @@ pub fn decode_with_metadata(bytes: impl AsRef<[u8]>) -> Result<DecodedJPEGXR> {
 pub fn decode_with_metadata_and_tone_mapping(
     bytes: impl AsRef<[u8]>,
     method: ToneMappingMethod,
+) -> Result<DecodedJPEGXR> {
+    decode_with_metadata_and_options(
+        bytes,
+        DecodeOptions::new(method, MaxCllMode::Percentile99_99),
+    )
+}
+
+/// Decodes JPEG XR pixels and metadata using the selected HDR normalization `options`.
+///
+/// Image-dependent parameters are derived from the decoded source. Component-wise white-point
+/// methods use the selected [`MaxCllMode`], while extended luminance Reinhard always uses p99.99
+/// Rec. 709 luminance. SDR sources do not pass through tone mapping. Image-derived white points
+/// are floored at display white; methods without a white point apply their curves to every HDR
+/// source.
+///
+/// # Errors
+///
+/// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
+/// representation that cannot be normalized to RGB.
+pub fn decode_with_metadata_and_options(
+    bytes: impl AsRef<[u8]>,
+    options: DecodeOptions,
 ) -> Result<DecodedJPEGXR> {
     let bytes = bytes.as_ref();
     if !has_signature(bytes) {
@@ -307,7 +388,7 @@ pub fn decode_with_metadata_and_tone_mapping(
     decoder
         .copy_all(&mut source, row_stride)
         .map_err(|source| codec_error(&source))?;
-    let normalized = normalize(&source, width, height, row_stride, layout, method)?;
+    let normalized = normalize(&source, width, height, row_stride, layout, options)?;
     let metadata = JPEGXRMetadata::new(layout, normalized.hdr_metrics);
     Ok(DecodedJPEGXR {
         image: DecodedImage::new(width, height, normalized.rgba),
@@ -518,7 +599,7 @@ fn normalize(
     height: u32,
     row_stride: usize,
     layout: PixelLayout,
-    method: ToneMappingMethod,
+    options: DecodeOptions,
 ) -> Result<NormalizedImage> {
     let width = usize::try_from(width).expect("validated JPEG XR width fits usize");
     let height = usize::try_from(height).expect("validated JPEG XR height fits usize");
@@ -541,14 +622,15 @@ fn normalize(
             source,
             row_stride,
             layout,
-            method == ToneMappingMethod::ExtendedLuminanceReinhard,
+            options.max_cll_mode(),
+            options.tone_mapping() == ToneMappingMethod::ExtendedLuminanceReinhard,
         )?)
     } else {
         None
     };
     let mut rgba = Vec::with_capacity(output_len);
     let has_nonzero_alpha = if let Some(metrics) = hdr_metrics {
-        let mapper = ResolvedToneMapper::new(method, metrics);
+        let mapper = ResolvedToneMapper::new(options.tone_mapping(), metrics);
         if matches!(mapper, ResolvedToneMapper::Clamp) {
             append_hdr_pixels_scalar(source, width, row_stride, layout, &Clamp, &mut rgba)?
         } else {
@@ -690,6 +772,7 @@ struct MaxCll {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct HDRMetrics {
     max_cll: MaxCll,
+    max_cll_mode: MaxCllMode,
     luminance_white_point: Option<LuminanceWhitePoint>,
     max_luminance_nits: f32,
     average_luminance_nits: f32,
@@ -703,6 +786,7 @@ impl HDRMetrics {
         source: &[u8],
         row_stride: usize,
         layout: PixelLayout,
+        max_cll_mode: MaxCllMode,
         estimate_luminance_white_point: bool,
     ) -> Result<Self> {
         invariant!(layout.encoding.is_hdr());
@@ -733,8 +817,9 @@ impl HDRMetrics {
         invariant!(pixel_count <= source_pixel_count);
 
         let mut accumulator = HDRMetricAccumulator::new();
-        let mut max_cll_estimator = MaxCllEstimator::new(
+        let mut max_cll_estimator = MaxCllEstimator::with_mode(
             NonZeroUsize::new(pixel_count).expect("HDR metrics include at least one pixel"),
+            max_cll_mode,
         );
         let mut luminance_white_point_estimator =
             estimate_luminance_white_point.then(|| LuminanceWhitePointEstimator::new(pixel_count));
@@ -778,7 +863,7 @@ impl HDRMetrics {
         let luminance_white_point =
             luminance_white_point_estimator.and_then(LuminanceWhitePointEstimator::finish);
 
-        Ok(accumulator.finish(max_cll, luminance_white_point))
+        Ok(accumulator.finish(max_cll, max_cll_mode, luminance_white_point))
     }
 }
 
@@ -975,6 +1060,7 @@ impl HDRMetricAccumulator {
     fn finish(
         self,
         max_cll: MaxCll,
+        max_cll_mode: MaxCllMode,
         luminance_white_point: Option<LuminanceWhitePoint>,
     ) -> HDRMetrics {
         invariant!(self.pixel_count > 0);
@@ -988,6 +1074,7 @@ impl HDRMetricAccumulator {
 
         HDRMetrics {
             max_cll,
+            max_cll_mode,
             luminance_white_point,
             max_luminance_nits: nonnegative_f64_to_f32(self.max_luminance_nits),
             average_luminance_nits: nonnegative_f64_to_f32(self.luminance_sum_nits / pixel_count),
@@ -1320,6 +1407,18 @@ mod tests {
         width: usize,
         method: ToneMappingMethod,
     ) -> Vec<u8> {
+        normalize_float_rgb_with_options(
+            colors,
+            width,
+            DecodeOptions::new(method, MaxCllMode::Percentile99_99),
+        )
+    }
+
+    fn normalize_float_rgb_with_options(
+        colors: &[[f32; 3]],
+        width: usize,
+        options: DecodeOptions,
+    ) -> Vec<u8> {
         assert_eq!(
             colors.len() % width,
             0,
@@ -1336,7 +1435,7 @@ mod tests {
             u32::try_from(height).expect("test height fits u32"),
             row_stride,
             layout,
-            method,
+            options,
         )
         .expect("synthetic HDR pixels normalize")
         .rgba
@@ -1411,11 +1510,25 @@ mod tests {
     }
 
     #[test]
+    fn decode_options_default_to_percentile_extended_reinhard() {
+        let options = DecodeOptions::default();
+
+        assert_eq!(options.tone_mapping(), ToneMappingMethod::ExtendedReinhard);
+        assert_eq!(options.max_cll_mode(), MaxCllMode::Percentile99_99);
+    }
+
+    #[test]
     fn extended_luminance_method_uses_the_luminance_white_point() {
         let color = [4.0, 2.0, 1.0];
         let source = float_rgb_source(&[color]);
-        let metrics =
-            HDRMetrics::estimate(&source, source.len(), float_rgb_layout(), true).unwrap();
+        let metrics = HDRMetrics::estimate(
+            &source,
+            source.len(),
+            float_rgb_layout(),
+            MaxCllMode::Percentile99_99,
+            true,
+        )
+        .unwrap();
         let white_point = metrics
             .luminance_white_point
             .expect("a nonblack HDR pixel has a luminance white point");
@@ -1467,7 +1580,14 @@ mod tests {
                 .flat_map(f32::to_ne_bytes),
         );
 
-        let metrics = HDRMetrics::estimate(&source, source.len(), layout, false).unwrap();
+        let metrics = HDRMetrics::estimate(
+            &source,
+            source.len(),
+            layout,
+            MaxCllMode::Percentile99_99,
+            false,
+        )
+        .unwrap();
         let metadata = JPEGXRMetadata::new(layout, Some(metrics));
 
         assert_eq!(metrics.max_cll.nits(), 320.0);
@@ -1478,6 +1598,54 @@ mod tests {
         assert_eq!(metadata.max_cll_scrgb(), Some(4.0));
         assert_eq!(metadata.max_cll_nits(), Some(320.0));
         assert_eq!(metadata.max_cll_channel(), Some(JPEGXRColorChannel::Red));
+        assert_eq!(metadata.max_cll_mode(), Some(MaxCllMode::Percentile99_99));
+    }
+
+    #[test]
+    fn true_max_cll_mode_drives_metadata_and_normalization() {
+        let mut colors = vec![[1.0_f32; 3]; 9_998];
+        colors.extend([[4.0, 0.0, 0.0], [0.0, 0.0, 126.0]]);
+        let layout = float_rgb_layout();
+        let source = float_rgb_source(&colors);
+        let width = u32::try_from(colors.len()).expect("test width fits u32");
+
+        let percentile = normalize(
+            &source,
+            width,
+            1,
+            source.len(),
+            layout,
+            DecodeOptions::default(),
+        )
+        .unwrap();
+        let true_maximum = normalize(
+            &source,
+            width,
+            1,
+            source.len(),
+            layout,
+            DecodeOptions::new(ToneMappingMethod::ExtendedReinhard, MaxCllMode::TrueMaximum),
+        )
+        .unwrap();
+        let percentile_metadata = JPEGXRMetadata::new(layout, percentile.hdr_metrics);
+        let true_maximum_metadata = JPEGXRMetadata::new(layout, true_maximum.hdr_metrics);
+
+        assert_eq!(percentile_metadata.max_cll_scrgb(), Some(4.0));
+        assert_eq!(
+            percentile_metadata.max_cll_channel(),
+            Some(JPEGXRColorChannel::Red)
+        );
+        assert_eq!(true_maximum_metadata.max_cll_scrgb(), Some(126.0));
+        assert_eq!(true_maximum_metadata.max_cll_nits(), Some(10_080.0));
+        assert_eq!(
+            true_maximum_metadata.max_cll_channel(),
+            Some(JPEGXRColorChannel::Blue)
+        );
+        assert_eq!(
+            true_maximum_metadata.max_cll_mode(),
+            Some(MaxCllMode::TrueMaximum)
+        );
+        assert_ne!(percentile.rgba, true_maximum.rgba);
     }
 
     #[test]
@@ -1486,8 +1654,14 @@ mod tests {
             .chain([[4.0; 3], [126.0; 3]])
             .collect();
         let source = float_rgb_source(&colors);
-        let metrics =
-            HDRMetrics::estimate(&source, source.len(), float_rgb_layout(), true).unwrap();
+        let metrics = HDRMetrics::estimate(
+            &source,
+            source.len(),
+            float_rgb_layout(),
+            MaxCllMode::Percentile99_99,
+            true,
+        )
+        .unwrap();
 
         assert_eq!(
             metrics
@@ -1506,8 +1680,14 @@ mod tests {
             [-0.000_000_5, 0.0, 0.0],
         ];
         let source = float_rgb_source(&colors);
-        let metrics =
-            HDRMetrics::estimate(&source, source.len(), float_rgb_layout(), false).unwrap();
+        let metrics = HDRMetrics::estimate(
+            &source,
+            source.len(),
+            float_rgb_layout(),
+            MaxCllMode::Percentile99_99,
+            false,
+        )
+        .unwrap();
 
         assert_approximately_equal(metrics.max_luminance_nits, 80.0, 0.000_1);
         assert_approximately_equal(metrics.average_luminance_nits, 33.878_8, 0.000_1);
@@ -1519,8 +1699,14 @@ mod tests {
     #[test]
     fn max_cll_reports_the_winning_color_channel() {
         let source = float_rgb_source(&[[1.0, 2.0, 5.0]]);
-        let metrics =
-            HDRMetrics::estimate(&source, source.len(), float_rgb_layout(), false).unwrap();
+        let metrics = HDRMetrics::estimate(
+            &source,
+            source.len(),
+            float_rgb_layout(),
+            MaxCllMode::Percentile99_99,
+            false,
+        )
+        .unwrap();
         let metadata = JPEGXRMetadata::new(float_rgb_layout(), Some(metrics));
 
         assert_eq!(metadata.max_cll_scrgb(), Some(5.0));
@@ -1534,8 +1720,14 @@ mod tests {
     #[test]
     fn max_cll_preserves_float32_levels_above_binary16_range() {
         let source = float_rgb_source(&[[70_000.0, 0.0, 100_000.0]]);
-        let metrics =
-            HDRMetrics::estimate(&source, source.len(), float_rgb_layout(), false).unwrap();
+        let metrics = HDRMetrics::estimate(
+            &source,
+            source.len(),
+            float_rgb_layout(),
+            MaxCllMode::Percentile99_99,
+            false,
+        )
+        .unwrap();
         let metadata = JPEGXRMetadata::new(float_rgb_layout(), Some(metrics));
 
         assert_eq!(metadata.max_cll_scrgb(), Some(100_000.0));
@@ -1551,7 +1743,7 @@ mod tests {
             .flat_map(f32::to_ne_bytes)
             .collect();
 
-        let rgba = normalize(&source, 4, 4, 64, layout, ToneMappingMethod::default())
+        let rgba = normalize(&source, 4, 4, 64, layout, DecodeOptions::default())
             .unwrap()
             .rgba;
 
@@ -1632,7 +1824,7 @@ mod tests {
         let source =
             float_rgba_source(&[[0.5, 0.5, 0.5, f32::from_bits(1)], [0.25, 0.25, 0.25, 0.0]]);
 
-        let rgba = normalize(&source, 2, 1, 32, layout, ToneMappingMethod::default())
+        let rgba = normalize(&source, 2, 1, 32, layout, DecodeOptions::default())
             .unwrap()
             .rgba;
 
@@ -1644,9 +1836,17 @@ mod tests {
         let layout = float_rgba_layout();
         let source = float_rgba_source(&[[1.0, 1.0, 1.0, 1.0], [100.0, -100.0, 0.0, 0.0]]);
 
-        let metrics = HDRMetrics::estimate(&source, source.len(), layout, false).unwrap();
+        let metrics = HDRMetrics::estimate(
+            &source,
+            source.len(),
+            layout,
+            MaxCllMode::TrueMaximum,
+            false,
+        )
+        .unwrap();
 
         assert_eq!(metrics.max_cll.nits(), SC_RGB_REFERENCE_WHITE_NITS);
+        assert_eq!(metrics.max_cll_mode, MaxCllMode::TrueMaximum);
         assert_eq!(metrics.max_luminance_nits, SC_RGB_REFERENCE_WHITE_NITS);
         assert_eq!(metrics.average_luminance_nits, SC_RGB_REFERENCE_WHITE_NITS);
         assert_eq!(metrics.min_luminance_nits, SC_RGB_REFERENCE_WHITE_NITS);
@@ -1659,8 +1859,15 @@ mod tests {
         let layout = float_rgba_layout();
         let source = float_rgba_source(&[[1.0, 1.0, 1.0, 0.0], [0.0, 0.0, 4.0, 0.0]]);
 
-        let metrics = HDRMetrics::estimate(&source, source.len(), layout, false).unwrap();
-        let rgba = normalize(&source, 2, 1, 32, layout, ToneMappingMethod::default())
+        let metrics = HDRMetrics::estimate(
+            &source,
+            source.len(),
+            layout,
+            MaxCllMode::Percentile99_99,
+            false,
+        )
+        .unwrap();
+        let rgba = normalize(&source, 2, 1, 32, layout, DecodeOptions::default())
             .unwrap()
             .rgba;
 

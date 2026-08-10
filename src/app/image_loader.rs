@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use exn::{ErrorExt, ResultExt};
 use gpui::{Image as GPUIImage, ImageFormat, SharedString};
-use tonemapping::ToneMappingMethod;
+use tonemapping::{MaxCllMode, ToneMappingMethod};
 
 use four::{DecodedImage, encode_bmp, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
 
@@ -75,7 +75,46 @@ pub(super) struct DisplayedImage {
     pub(super) image: Arc<GPUIImage>,
     pub(super) metadata: Arc<ImageMetadata>,
     pub(super) source_path: Arc<Path>,
-    pub(super) tone_mapping: Option<ToneMappingMethod>,
+    pub(super) hdr_options: Option<HdrOptions>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct HdrOptions {
+    tone_mapping: ToneMappingMethod,
+    max_cll_mode: MaxCllMode,
+}
+
+impl HdrOptions {
+    pub(super) const fn tone_mapping(self) -> ToneMappingMethod {
+        self.tone_mapping
+    }
+
+    pub(super) const fn max_cll_mode(self) -> MaxCllMode {
+        self.max_cll_mode
+    }
+
+    pub(super) const fn with_tone_mapping(self, tone_mapping: ToneMappingMethod) -> Self {
+        Self {
+            tone_mapping,
+            ..self
+        }
+    }
+
+    pub(super) const fn with_max_cll_mode(self, max_cll_mode: MaxCllMode) -> Self {
+        Self {
+            max_cll_mode,
+            ..self
+        }
+    }
+}
+
+impl Default for HdrOptions {
+    fn default() -> Self {
+        Self {
+            tone_mapping: ToneMappingMethod::default(),
+            max_cll_mode: MaxCllMode::Percentile99_99,
+        }
+    }
 }
 
 pub(super) struct LoadedImage {
@@ -218,7 +257,7 @@ impl SourceFormat {
         self,
         bytes: &[u8],
         path: &Path,
-        tone_mapping: ToneMappingMethod,
+        hdr_options: HdrOptions,
     ) -> LoadResult<DecodedSource> {
         match self {
             Self::GIF => gif::decode(bytes)
@@ -233,15 +272,18 @@ impl SourceFormat {
                 .or_raise(|| image_decode_error(path))
                 .map(DecodedSource::standard),
 
-            Self::JPEGXR => jpeg_xr::decode_with_metadata_and_tone_mapping(bytes, tone_mapping)
-                .or_raise(|| image_decode_error(path))
-                .map(|decoded| {
-                    let metadata = decoded.metadata();
-                    DecodedSource {
-                        image: decoded.into_image(),
-                        jpeg_xr_metadata: Some(metadata),
-                    }
-                }),
+            Self::JPEGXR => jpeg_xr::decode_with_metadata_and_options(
+                bytes,
+                jpeg_xr::DecodeOptions::new(hdr_options.tone_mapping(), hdr_options.max_cll_mode()),
+            )
+            .or_raise(|| image_decode_error(path))
+            .map(|decoded| {
+                let metadata = decoded.metadata();
+                DecodedSource {
+                    image: decoded.into_image(),
+                    jpeg_xr_metadata: Some(metadata),
+                }
+            }),
 
             Self::PNG => png::decode(bytes)
                 .or_raise(|| image_decode_error(path))
@@ -327,7 +369,7 @@ impl ImageLoad<SelectedImage> {
 }
 
 impl ImageLoad<EncodedImage> {
-    fn decode(self, tone_mapping: ToneMappingMethod) -> LoadResult<ImageLoad<DecodedImageState>> {
+    fn decode(self, hdr_options: HdrOptions) -> LoadResult<ImageLoad<DecodedImageState>> {
         invariant!(self.state.bytes.len() as u64 <= IMAGE_FILE_BYTES_MAX);
         invariant!(isize::try_from(self.state.bytes.len()).is_ok());
 
@@ -336,7 +378,7 @@ impl ImageLoad<EncodedImage> {
 
         let extension = self.path.extension().map(|value| value.to_string_lossy());
         let source_format = SourceFormat::detect(&self.state.bytes, extension.as_deref());
-        let decoded = source_format.decode(&self.state.bytes, &self.path, tone_mapping)?;
+        let decoded = source_format.decode(&self.state.bytes, &self.path, hdr_options)?;
         let image = decoded.image;
 
         invariant!(image.width() > 0);
@@ -355,7 +397,7 @@ impl ImageLoad<EncodedImage> {
 }
 
 impl ImageLoad<DecodedImageState> {
-    fn present(self, tone_mapping: ToneMappingMethod) -> LoadedImage {
+    fn present(self, hdr_options: HdrOptions) -> LoadedImage {
         let (width, height) = self.state.image.dimensions();
 
         invariant!(width > 0);
@@ -367,11 +409,11 @@ impl ImageLoad<DecodedImageState> {
             encode_bmp(&self.state.image),
         ));
         let file_name = display_file_name(&self.path).into_owned();
-        let active_tone_mapping = self
+        let active_hdr_options = self
             .state
             .jpeg_xr_metadata
             .filter(|metadata| metadata.is_hdr())
-            .map(|_| tone_mapping);
+            .map(|_| hdr_options);
         let source_path = Arc::<Path>::from(self.path);
 
         LoadedImage {
@@ -379,7 +421,7 @@ impl ImageLoad<DecodedImageState> {
                 image,
                 metadata,
                 source_path,
-                tone_mapping: active_tone_mapping,
+                hdr_options: active_hdr_options,
             },
             status: format!("{file_name} — {width} × {height}").into(),
         }
@@ -541,17 +583,17 @@ fn validate_image_file_size(path: &Path, byte_count: u64) -> LoadResult<()> {
 }
 
 pub(super) fn load_image(path: &Path) -> LoadResult<LoadedImage> {
-    load_image_with_tone_mapping(path, ToneMappingMethod::default())
+    load_image_with_options(path, HdrOptions::default())
 }
 
-pub(super) fn load_image_with_tone_mapping(
+pub(super) fn load_image_with_options(
     path: &Path,
-    tone_mapping: ToneMappingMethod,
+    hdr_options: HdrOptions,
 ) -> LoadResult<LoadedImage> {
     let loaded = ImageLoad::select(path)
         .read()?
-        .decode(tone_mapping)?
-        .present(tone_mapping);
+        .decode(hdr_options)?
+        .present(hdr_options);
     invariant!(!loaded.status.is_empty());
     Ok(loaded)
 }

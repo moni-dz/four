@@ -12,10 +12,11 @@
 //! a caller-supplied normalized camera-response lookup table.
 //! [`ToneMappingMethod`] enumerates the built-in operator families that need no custom response.
 //!
-//! [`estimate_max_cll`] and [`MaxCllEstimator`] select the nearest-rank 99.99th percentile of
-//! per-pixel `max(R, G, B)`. Inputs determine the unit: absolute-nit inputs produce `MaxCLL` in nits,
-//! while relative inputs produce a relative light level. Luminance-based Reinhard uses the
-//! distinct [`estimate_luminance_white_point`] statistic.
+//! [`estimate_max_cll`] selects the nearest-rank 99.99th percentile of per-pixel `max(R, G, B)`.
+//! [`MaxCllEstimator`] can select either that percentile or the true maximum through
+//! [`MaxCllMode`]. Inputs determine the unit: absolute-nit inputs produce `MaxCLL` in nits, while
+//! relative inputs produce a relative light level. Luminance-based Reinhard uses the distinct
+//! [`estimate_luminance_white_point`] statistic.
 //!
 //! # Example
 //!
@@ -314,10 +315,20 @@ impl ColorChannel {
     }
 }
 
-/// Stores a still image's 99.99th-percentile maximum content light level.
+/// Selects how a still image's `MaxCLL` is estimated.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum MaxCllMode {
+    /// Uses the nearest-rank 99.99th percentile of per-pixel peak components.
+    #[default]
+    Percentile99_99,
+    /// Uses the greatest per-pixel peak component without outlier rejection.
+    TrueMaximum,
+}
+
+/// Stores a selected maximum content light level.
 ///
 /// The level uses the same relative or absolute unit as the linear RGB input. It is selected from
-/// per-pixel `max(R, G, B)` values using the nearest-rank convention.
+/// per-pixel `max(R, G, B)` values according to a [`MaxCllMode`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MaxCll {
     level: f32,
@@ -325,7 +336,7 @@ pub struct MaxCll {
 }
 
 impl MaxCll {
-    /// Returns the 99.99th-percentile content level.
+    /// Returns the selected content level.
     #[must_use]
     pub const fn level(self) -> f32 {
         self.level
@@ -377,11 +388,11 @@ impl fmt::Display for MaxCllPixelCountError {
 
 impl std::error::Error for MaxCllPixelCountError {}
 
-/// Computes nearest-rank p99.99 `MaxCLL` from a stream of linear RGB colors.
+/// Computes a selected `MaxCLL` from a stream of linear RGB colors.
 ///
-/// The estimator retains only the brightest `floor(pixel_count / 10_000) + 1` samples. Declaring
-/// the count up front therefore bounds memory while producing the same result as sorting all
-/// per-pixel `max(R, G, B)` values.
+/// Percentile mode retains the brightest `floor(pixel_count / 10_000) + 1` samples. True-maximum
+/// mode retains one sample. Declaring the count up front therefore bounds memory while producing
+/// the same result as sorting all per-pixel `max(R, G, B)` values.
 #[derive(Debug)]
 pub struct MaxCllEstimator {
     expected: NonZeroUsize,
@@ -391,10 +402,19 @@ pub struct MaxCllEstimator {
 }
 
 impl MaxCllEstimator {
-    /// Creates an estimator for exactly `pixel_count` active-image pixels.
+    /// Creates a p99.99 estimator for exactly `pixel_count` active-image pixels.
     #[must_use]
     pub fn new(pixel_count: NonZeroUsize) -> Self {
-        let retained = pixel_count.get() / 10_000 + 1;
+        Self::with_mode(pixel_count, MaxCllMode::Percentile99_99)
+    }
+
+    /// Creates a `mode` estimator for exactly `pixel_count` active-image pixels.
+    #[must_use]
+    pub fn with_mode(pixel_count: NonZeroUsize, mode: MaxCllMode) -> Self {
+        let retained = match mode {
+            MaxCllMode::Percentile99_99 => pixel_count.get() / 10_000 + 1,
+            MaxCllMode::TrueMaximum => 1,
+        };
         Self {
             expected: pixel_count,
             retained,
@@ -452,7 +472,7 @@ impl MaxCllEstimator {
     /// # Errors
     ///
     /// Returns [`MaxCllPixelCountError`] when the observed pixel count differs from the count passed
-    /// to [`MaxCllEstimator::new`].
+    /// when constructing the estimator.
     pub fn finish(self) -> Result<MaxCll, MaxCllPixelCountError> {
         if self.observed != self.expected.get() {
             return Err(MaxCllPixelCountError {
@@ -666,8 +686,8 @@ impl ToneMapper for Reinhard {
 /// Applies the white-point Reinhard curve independently to each component.
 ///
 /// Components at the white point map to one, while brighter components clip at the display
-/// boundary. For a still image, [`MaxCll`] supplies the p99.99 `max(R, G, B)` white point described
-/// by Smith and Zink's outlier-rejection method.
+/// boundary. For a still image, [`MaxCll`] supplies a `max(R, G, B)` white point selected through
+/// [`MaxCllMode`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ExtendedReinhard {
     white_point: WhitePoint,
@@ -680,7 +700,7 @@ impl ExtendedReinhard {
         Self { white_point }
     }
 
-    /// Creates an operator from a nonzero p99.99 `MaxCLL` estimate.
+    /// Creates an operator from a selected nonzero `MaxCLL` statistic.
     ///
     /// Returns `None` for an entirely black image, whose `MaxCLL` is zero.
     #[must_use]
@@ -1580,6 +1600,34 @@ mod tests {
         assert_eq!(max_cll.level(), 4.0);
         assert_eq!(max_cll.channel(), ColorChannel::Red);
         assert_eq!(max_cll.white_point().map(WhitePoint::level), Some(4.0));
+    }
+
+    #[test]
+    fn max_cll_mode_selects_percentile_or_true_maximum() {
+        let mut colors = vec![LinearRgb::new([1.0; 3]); 9_998];
+        colors.extend([
+            LinearRgb::new([4.0, 0.0, 0.0]),
+            LinearRgb::new([0.0, 0.0, 126.0]),
+        ]);
+        let pixel_count = NonZeroUsize::new(colors.len()).expect("test MaxCLL input is nonempty");
+
+        let mut percentile = MaxCllEstimator::with_mode(pixel_count, MaxCllMode::Percentile99_99);
+        percentile.observe_many(&colors);
+        let percentile = percentile
+            .finish()
+            .expect("the percentile estimator observes every declared pixel");
+
+        let mut true_maximum = MaxCllEstimator::with_mode(pixel_count, MaxCllMode::TrueMaximum);
+        true_maximum.observe_many(&colors);
+        let true_maximum = true_maximum
+            .finish()
+            .expect("the maximum estimator observes every declared pixel");
+
+        assert_eq!(MaxCllMode::default(), MaxCllMode::Percentile99_99);
+        assert_eq!(percentile.level(), 4.0);
+        assert_eq!(percentile.channel(), ColorChannel::Red);
+        assert_eq!(true_maximum.level(), 126.0);
+        assert_eq!(true_maximum.channel(), ColorChannel::Blue);
     }
 
     #[test]
