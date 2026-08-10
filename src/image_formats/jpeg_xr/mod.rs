@@ -26,7 +26,7 @@ use ::jpegxr::{
 };
 use tonemapping::{
     AcesApproximate, AcesFitted, Clamp, ColorChannel as ToneColorChannel,
-    ExtendedLuminanceReinhard, ExtendedReinhard, Hable, LinearRgb, LuminanceReinhard,
+    ExtendedLuminanceReinhard, ExtendedReinhard, Hable, LinearRGB, LuminanceReinhard,
     LuminanceWhitePoint, MaxCllEstimator, MaxCllMode, Reinhard, ReinhardJodie, ScaledClamp,
     ToneMapper, ToneMappingMethod, WhitePoint,
 };
@@ -687,7 +687,7 @@ fn append_hdr_pixels_scalar(
             let pixel = pixel_at(row, x, layout)?;
             let (color, alpha) = layout.read_pixel(pixel)?;
             has_nonzero_alpha |= alpha > 0.0;
-            let color = display_linear_to_srgb8(mapper.map(LinearRgb::new(color)));
+            let color = display_linear_to_srgb8(mapper.map(LinearRGB::new(color)));
             rgba.extend_from_slice(&[color[0], color[1], color[2], normalized_to_u8(alpha)]);
         }
     }
@@ -716,7 +716,7 @@ fn append_hdr_pixels(
             let pixel = pixel_at(row, x, layout)?;
             let (color, alpha) = layout.read_pixel(pixel)?;
             has_nonzero_alpha |= alpha > 0.0;
-            colors.push(LinearRgb::new(color));
+            colors.push(LinearRGB::new(color));
             alphas.push(normalized_to_u8(alpha));
 
             if colors.len() == HDR_BATCH_PIXELS {
@@ -731,7 +731,7 @@ fn append_hdr_pixels(
 
 fn append_tone_mapped_batch(
     mapper: &impl ToneMapper,
-    colors: &mut Vec<LinearRgb>,
+    colors: &mut Vec<LinearRGB>,
     alphas: &mut Vec<u8>,
     rgba: &mut Vec<u8>,
 ) {
@@ -831,7 +831,7 @@ impl HDRMetrics {
                 return;
             }
             accumulator.observe(color);
-            let color = LinearRgb::new(color);
+            let color = LinearRGB::new(color);
             if let Some(estimator) = &mut luminance_white_point_estimator {
                 estimator.observe(color);
             }
@@ -933,7 +933,7 @@ impl ResolvedToneMapper {
 }
 
 impl ToneMapper for ResolvedToneMapper {
-    fn map(&self, color: LinearRgb) -> LinearRgb {
+    fn map(&self, color: LinearRGB) -> LinearRGB {
         match self {
             Self::Clamp => Clamp.map(color),
             Self::ScaledClamp(mapper) => mapper.map(color),
@@ -948,7 +948,7 @@ impl ToneMapper for ResolvedToneMapper {
         }
     }
 
-    fn map_in_place(&self, colors: &mut [LinearRgb]) {
+    fn map_in_place(&self, colors: &mut [LinearRGB]) {
         match self {
             Self::Clamp => Clamp.map_in_place(colors),
             Self::ScaledClamp(mapper) => mapper.map_in_place(colors),
@@ -1002,7 +1002,7 @@ impl LuminanceWhitePointEstimator {
         }
     }
 
-    fn observe(&mut self, color: LinearRgb) {
+    fn observe(&mut self, color: LinearRGB) {
         let luminance = OrderedLuminance(color.luminance());
         if self.luminances.len() < self.retained {
             self.luminances.push(Reverse(luminance));
@@ -1309,13 +1309,13 @@ fn decode_rgbe(pixel: &[u8]) -> Result<[f32; 3]> {
     ])
 }
 
-fn display_linear_to_srgb8(color: LinearRgb) -> [u8; 3] {
+fn display_linear_to_srgb8(color: LinearRGB) -> [u8; 3] {
     color.components().map(linear_to_srgb).map(normalized_to_u8)
 }
 
 #[cfg(test)]
 fn hdr_to_srgb8(color: [f32; 3], mapper: &impl ToneMapper) -> [u8; 3] {
-    display_linear_to_srgb8(mapper.map(LinearRgb::new(color)))
+    display_linear_to_srgb8(mapper.map(LinearRGB::new(color)))
 }
 
 fn normalize_alpha(value: f32) -> f32 {

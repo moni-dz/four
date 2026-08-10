@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use mimalloc::MiMalloc;
 use tonemapping::{
-    AcesFitted, Clamp, ExtendedReinhard, LinearRgb, MaxCllEstimator, ToneMapper, WhitePoint,
+    AcesFitted, Clamp, ExtendedReinhard, LinearRGB, MaxCllEstimator, ToneMapper, WhitePoint,
 };
 
 #[global_allocator]
@@ -31,7 +31,7 @@ fn main() {
     benchmark_max_cll(&colors, iterations);
 }
 
-fn benchmark_colors(pixel_count: usize) -> Vec<LinearRgb> {
+fn benchmark_colors(pixel_count: usize) -> Vec<LinearRGB> {
     let palette = [
         [0.0, 0.18, 1.0],
         [4.0, 2.0, 1.0],
@@ -43,14 +43,14 @@ fn benchmark_colors(pixel_count: usize) -> Vec<LinearRgb> {
         [100_000.0, 1.0, 0.0],
     ];
     (0..pixel_count)
-        .map(|index| LinearRgb::new(palette[index % palette.len()]))
+        .map(|index| LinearRGB::new(palette[index % palette.len()]))
         .collect()
 }
 
 fn benchmark_mapper(
     name: &str,
     mapper: &impl ToneMapper,
-    colors: &[LinearRgb],
+    colors: &[LinearRGB],
     iterations: NonZeroU32,
 ) {
     let mut scalar_scratch = colors.to_vec();
@@ -80,7 +80,7 @@ fn benchmark_mapper(
     print_comparison(name, scalar, bulk, iterations);
 }
 
-fn benchmark_max_cll(colors: &[LinearRgb], iterations: NonZeroU32) {
+fn benchmark_max_cll(colors: &[LinearRGB], iterations: NonZeroU32) {
     let pixel_count = NonZeroUsize::new(colors.len()).expect("benchmark colors are nonempty");
     let (scalar, bulk) = benchmark_pair(
         iterations,
