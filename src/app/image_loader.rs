@@ -481,6 +481,13 @@ fn validate_image_file_size(path: &Path, byte_count: u64) -> LoadResult<()> {
     Ok(())
 }
 
+fn display_image(source_format: SourceFormat, bytes: Vec<u8>, decoded: &DecodedImage) -> GPUIImage {
+    match source_format {
+        SourceFormat::GIF => GPUIImage::from_bytes(ImageFormat::Gif, bytes),
+        _ => GPUIImage::from_bytes(ImageFormat::Bmp, encode_bmp(decoded)),
+    }
+}
+
 pub(super) fn load_image(path: &Path) -> LoadResult<LoadedImage> {
     load_image_with_options_and_hdr_metrics(path, HDROptions::default(), false)
 }
@@ -524,10 +531,7 @@ pub(super) fn load_image_with_options_and_hdr_metrics(
     let (width, height) = decoded.image.dimensions();
     let metadata = Arc::new(ImageMetadata::new(path, &decoded));
 
-    let image = Arc::new(GPUIImage::from_bytes(
-        ImageFormat::Bmp,
-        encode_bmp(&decoded.image),
-    ));
+    let image = Arc::new(display_image(source_format, bytes, &decoded.image));
 
     let active_hdr_options = decoded
         .jpeg_xr_metadata
@@ -550,7 +554,85 @@ pub(super) fn load_image_with_options_and_hdr_metrics(
 
 #[cfg(test)]
 mod tests {
+    use ::gif::{DisposalMethod, Encoder, Frame, Repeat};
+
     use super::*;
+
+    fn animated_gif() -> Vec<u8> {
+        const PALETTE: &[u8] = &[
+            255, 0, 0, // red
+            0, 255, 0, // green
+            0, 0, 255, // blue
+        ];
+
+        let mut bytes = Vec::new();
+        let mut encoder = Encoder::new(&mut bytes, 3, 1, PALETTE).unwrap();
+        encoder.set_repeat(Repeat::Infinite).unwrap();
+        encoder
+            .write_frame(&Frame {
+                width: 3,
+                height: 1,
+                delay: 5,
+                dispose: DisposalMethod::Keep,
+                buffer: Cow::Borrowed(&[0, 0, 0]),
+                ..Frame::default()
+            })
+            .unwrap();
+
+        encoder
+            .write_frame(&Frame {
+                width: 1,
+                height: 1,
+                delay: 7,
+                dispose: DisposalMethod::Background,
+                buffer: Cow::Borrowed(&[1]),
+                ..Frame::default()
+            })
+            .unwrap();
+
+        encoder
+            .write_frame(&Frame {
+                left: 2,
+                width: 1,
+                height: 1,
+                delay: 11,
+                dispose: DisposalMethod::Keep,
+                buffer: Cow::Borrowed(&[2]),
+                ..Frame::default()
+            })
+            .unwrap();
+
+        drop(encoder);
+        bytes
+    }
+
+    #[test]
+    fn animated_gif_preserves_frames_timing_and_disposal_through_gpui() {
+        let bytes = animated_gif();
+        let decoded = gif::decode(&bytes).unwrap();
+        let image = display_image(SourceFormat::GIF, bytes, &decoded);
+        let rendered = image
+            .to_image_data(gpui::SvgRenderer::new(Arc::new(())))
+            .unwrap();
+
+        assert_eq!(image.format(), ImageFormat::Gif);
+        assert_eq!(rendered.frame_count(), 3);
+        assert_eq!(rendered.delay(0).numer_denom_ms(), (50, 1));
+        assert_eq!(rendered.delay(1).numer_denom_ms(), (70, 1));
+        assert_eq!(rendered.delay(2).numer_denom_ms(), (110, 1));
+        assert_eq!(
+            rendered.as_bytes(0).unwrap(),
+            &[0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255]
+        );
+        assert_eq!(
+            rendered.as_bytes(1).unwrap(),
+            &[0, 255, 0, 255, 0, 0, 255, 255, 0, 0, 255, 255]
+        );
+        assert_eq!(
+            rendered.as_bytes(2).unwrap(),
+            &[0, 0, 0, 0, 0, 0, 255, 255, 255, 0, 0, 255]
+        );
+    }
 
     #[test]
     fn load_error_preserves_the_decoder_error_frame() {

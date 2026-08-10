@@ -774,7 +774,7 @@ impl Root {
             .justify_center()
             .overflow_hidden()
             .when_some(image, |content, image| {
-                content.child(img(image).size_full())
+                content.child(img(image).id("displayed-image").size_full())
             })
             .when(!has_image, |content| {
                 content.child(

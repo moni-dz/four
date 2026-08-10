@@ -28,10 +28,14 @@ pub enum GIFError {
 /// A bounded GIF resource whose configured maximum was exceeded.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GIFLimit {
+    /// Maximum total decoded bytes across full-canvas animation frames.
+    AnimationBytes(u64),
     /// Maximum decoded bytes available to one codec frame.
     CodecFrameBytes(u64),
     /// Maximum accepted width or height in pixels.
     Dimensions(u32),
+    /// Maximum accepted animation frame count.
+    Frames(u64),
     /// Maximum accepted logical-screen pixel count.
     Pixels(u64),
 }
@@ -62,6 +66,11 @@ pub(super) fn error(error: GIFError) -> Error {
 
 fn write_limit_error(formatter: &mut fmt::Formatter<'_>, limit: GIFLimit) -> fmt::Result {
     match limit {
+        GIFLimit::AnimationBytes(max) => write!(
+            formatter,
+            "GIF animation output exceeds the {} MiB limit",
+            max / 1024 / 1024
+        ),
         GIFLimit::CodecFrameBytes(max) => write!(
             formatter,
             "GIF frame output exceeds the {} MiB limit",
@@ -70,6 +79,7 @@ fn write_limit_error(formatter: &mut fmt::Formatter<'_>, limit: GIFLimit) -> fmt
         GIFLimit::Dimensions(max) => {
             write!(formatter, "GIF dimensions exceed the {max}-pixel limit")
         }
+        GIFLimit::Frames(max) => write!(formatter, "GIF animation exceeds the {max}-frame limit"),
         GIFLimit::Pixels(max) => write!(
             formatter,
             "GIF pixel count exceeds the {}-megapixel limit",
