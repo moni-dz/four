@@ -19,7 +19,9 @@ use model::{
 };
 use scan::{ScanComponent, ScanHeader, parse_frame_components, parse_scan_header};
 
-use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
+use super::{
+    DIMENSION_MAX, DecodedImage, PARALLEL_PIXELS_MIN, PARALLEL_PIXELS_PER_JOB, PIXELS_MAX,
+};
 
 use zune_jpeg::JpegDecoder;
 use zune_jpeg::errors::DecodeErrors;
@@ -44,6 +46,15 @@ const ZIGZAG_TO_NATURAL: [usize; 64] = [
     13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
     52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
 ];
+
+/// Returns whether `bytes` begins with the JPEG start-of-image marker.
+///
+/// Every other format module exposes this, and its absence here made `SourceFormat::detect`
+/// open-code the check for exactly one format.
+#[must_use]
+pub fn has_signature(bytes: &[u8]) -> bool {
+    bytes.starts_with(&SIGNATURE)
+}
 
 /// Decodes an 8-bit Huffman- or arithmetic-coded sequential or progressive JPEG.
 ///
@@ -136,7 +147,10 @@ fn uses_arithmetic_coding(bytes: &[u8]) -> bool {
         };
         offset += 1;
 
-        if matches!(marker, 0xc9..=0xcf) {
+        // SOF9-SOF11 and SOF13-SOF15 are the arithmetic-coded frame headers. 0xcc is DAC, which
+        // configures arithmetic conditioning rather than starting a frame, so it is excluded here
+        // even though it only ever appears in arithmetic streams.
+        if matches!(marker, 0xc9..=0xcb | 0xcd..=0xcf) {
             return true;
         }
 

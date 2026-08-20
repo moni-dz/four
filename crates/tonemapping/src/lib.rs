@@ -8,9 +8,9 @@
 //! integer quantization remain the caller's responsibility.
 //!
 //! [`Clamp`] and [`ScaledClamp`] provide clipping baselines. The Reinhard family includes
-//! component-wise, luminance-preserving, white-point, and Reinhard-Jodie variants. [`BT2446A`]
-//! applies the standardized HDR-to-SDR conversion Method A. [`Hable`], [`ACESFitted`], and
-//! [`ACESApproximate`] provide filmic curves. [`ToneMappingMethod`] enumerates the built-in
+//! component-wise, luminance-preserving, white-point, Reinhard-Jodie, and [`Mobius`] variants.
+//! [`BT2446A`] applies the standardized HDR-to-SDR conversion Method A. [`Hable`], [`ACESFitted`],
+//! and [`ACESApproximate`] provide filmic curves. [`ToneMappingMethod`] enumerates the built-in
 //! operator families.
 //!
 //! [`MaxCLLEstimator`] selects either the nearest-rank 99.99th percentile of per-pixel
@@ -48,8 +48,20 @@ use std::simd::{
     Select, Simd,
     cmp::{SimdPartialEq, SimdPartialOrd},
 };
+use thiserror::Error;
 
-const REC709_LUMINANCE: [f64; 3] = [0.212_6, 0.715_2, 0.072_2];
+const REC709_LUMINANCE: [f32; 3] = [0.212_6, 0.715_2, 0.072_2];
+
+/// The largest component a [`LinearRGB`] may hold.
+///
+/// `f32::MAX.sqrt()` is 1.844e19. Fitted ACES, approximate ACES and Hable all square a component;
+/// past this bound they produce infinity, whose difference or quotient is `NaN`, and `displayable`
+/// maps `NaN` to zero, so the brightest possible pixel would render black. Saturating once at
+/// construction — rather than at each of the many places a component is read — is what keeps the
+/// scalar and batch paths bit-identical, since `luminance` and the operators would otherwise
+/// disagree about whether the bound had been applied. Real HDR content peaks around 1e5, so this
+/// is unreachable in practice.
+const MAX_MAPPABLE: f32 = 1.0e19;
 const MAX_CLL_LANES: usize = 8;
 
 type F32x8 = Simd<f32, MAX_CLL_LANES>;
@@ -57,8 +69,9 @@ type I32x8 = Simd<i32, MAX_CLL_LANES>;
 
 /// Stores a finite, nonnegative linear RGB color.
 ///
-/// Construction replaces negative and `NaN` components with zero and positive infinity with
-/// `f32::MAX`. Every finite nonnegative `f32` is preserved.
+/// Construction replaces negative and `NaN` components with zero, and saturates anything above
+/// `1e19` — including positive infinity — to that bound. Every other finite nonnegative `f32` is
+/// preserved.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct LinearRGB([f32; 3]);
 
@@ -86,28 +99,22 @@ impl LinearRGB {
         self.0
     }
 
-    #[inline]
-    fn components_f64(self) -> [f64; 3] {
-        self.0.map(f64::from)
-    }
-
     /// Returns linear Rec. 709 luminance.
     #[must_use]
     #[inline]
     pub fn luminance(self) -> f32 {
-        nonnegative_f64_to_f32(self.luminance_f64())
+        let luminance = REC709_LUMINANCE[0] * self.0[0]
+            + REC709_LUMINANCE[1] * self.0[1]
+            + REC709_LUMINANCE[2] * self.0[2];
+
+        // The weights sum to one, so a finite input can overflow only by a rounding step.
+        // Saturating preserves the documented guarantee that luminance is finite.
+        luminance.min(f32::MAX)
     }
 
     #[inline]
-    fn luminance_f64(self) -> f64 {
-        REC709_LUMINANCE[0] * f64::from(self.0[0])
-            + REC709_LUMINANCE[1] * f64::from(self.0[1])
-            + REC709_LUMINANCE[2] * f64::from(self.0[2])
-    }
-
-    #[inline]
-    fn displayable(components: [f64; 3]) -> Self {
-        Self(components.map(display_component))
+    fn displayable(components: [f32; 3]) -> Self {
+        Self(components.map(display_component_f32))
     }
 
     #[inline]
@@ -283,6 +290,7 @@ macro_rules! define_tone_mapping_methods {
             $method:ident {
                 label: $label:literal,
                 mapper: $mapper:ty = $constructor:expr,
+                uses_white_point: $uses_white_point:literal,
                 uses_luminance_white_point: $uses_luminance_white_point:literal,
             }
         )+
@@ -324,7 +332,9 @@ macro_rules! define_tone_mapping_methods {
             /// Reports whether this method uses an image component white point.
             #[must_use]
             pub const fn uses_white_point(self) -> bool {
-                matches!(self, Self::ScaledClamp | Self::ExtendedReinhard)
+                match self {
+                    $(Self::$method => $uses_white_point,)+
+                }
             }
 
             /// Resolves this method with image-specific white points.
@@ -384,30 +394,35 @@ define_tone_mapping_methods! {
     Clamp {
         label: "Clamp",
         mapper: Clamp = |_, _| Clamp,
+        uses_white_point: false,
         uses_luminance_white_point: false,
     }
     /// Scales components by an image white point before clipping.
     ScaledClamp {
         label: "Scaled clamp",
         mapper: ScaledClamp = |white_point, _| ScaledClamp::new(white_point),
+        uses_white_point: true,
         uses_luminance_white_point: false,
     }
     /// Applies simple Reinhard independently to each component.
     Reinhard {
         label: "Reinhard",
         mapper: Reinhard = |_, _| Reinhard,
+        uses_white_point: false,
         uses_luminance_white_point: false,
     }
     /// Applies white-point Reinhard independently to each component.
     ExtendedReinhard {
         label: "Extended Reinhard",
         mapper: ExtendedReinhard = |white_point, _| ExtendedReinhard::new(white_point),
+        uses_white_point: true,
         uses_luminance_white_point: false,
     }
     /// Applies simple Reinhard to luminance while preserving color ratios.
     LuminanceReinhard {
         label: "Luminance Reinhard",
         mapper: LuminanceReinhard = |_, _| LuminanceReinhard,
+        uses_white_point: false,
         uses_luminance_white_point: false,
     }
     /// Applies white-point Reinhard to luminance while preserving color ratios.
@@ -416,30 +431,35 @@ define_tone_mapping_methods! {
         mapper: ExtendedLuminanceReinhard = |_, luminance_white_point| {
             ExtendedLuminanceReinhard::new(luminance_white_point)
         },
+        uses_white_point: false,
         uses_luminance_white_point: true,
     }
     /// Blends component-wise and luminance-based Reinhard results.
     ReinhardJodie {
         label: "Reinhard-Jodie",
         mapper: ReinhardJodie = |_, _| ReinhardJodie,
+        uses_white_point: false,
         uses_luminance_white_point: false,
     }
     /// Applies the Uncharted 2 filmic curve.
     Hable {
         label: "Hable",
         mapper: Hable = |_, _| Hable,
+        uses_white_point: false,
         uses_luminance_white_point: false,
     }
     /// Applies the fitted ACES reference and display transform.
     ACESFitted {
         label: "ACES fitted",
         mapper: ACESFitted = |_, _| ACESFitted,
+        uses_white_point: false,
         uses_luminance_white_point: false,
     }
     /// Applies the scalar ACES curve approximation.
     ACESApproximate {
         label: "ACES approximate",
         mapper: ACESApproximate = |_, _| ACESApproximate,
+        uses_white_point: false,
         uses_luminance_white_point: false,
     }
     /// Applies ITU-R BT.2446-2 Method A.
@@ -447,7 +467,17 @@ define_tone_mapping_methods! {
     BT2446 {
         label: "ITU-R BT2446-2 A",
         mapper: BT2446A = |_, _| BT2446A,
+        uses_white_point: false,
         uses_luminance_white_point: false,
+    }
+    /// Applies a generalized Reinhard based on the Mobius transform.
+    Mobius {
+        label: "Mobius",
+        mapper: Mobius = |_, luminance_white_point| {
+            Mobius::new(luminance_white_point, 0.3)
+        },
+        uses_white_point: false,
+        uses_luminance_white_point: true,
     }
 }
 
@@ -559,7 +589,8 @@ impl MaxCll {
 }
 
 /// Reports a mismatch between declared and observed `MaxCLL` pixel counts.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[error("MaxCLL estimator expected {expected} pixels but observed {observed}")]
 pub struct MaxCllPixelCountError {
     expected: usize,
     observed: usize,
@@ -578,18 +609,6 @@ impl MaxCllPixelCountError {
         self.observed
     }
 }
-
-impl fmt::Display for MaxCllPixelCountError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "MaxCLL estimator expected {} pixels but observed {}",
-            self.expected, self.observed
-        )
-    }
-}
-
-impl std::error::Error for MaxCllPixelCountError {}
 
 /// Computes a selected `MaxCLL` from a stream of linear RGB colors.
 ///
@@ -670,6 +689,21 @@ impl MaxCLLEstimator {
             }
         } else {
             self.peaks.push(Reverse(peak));
+        }
+    }
+
+    /// Folds `other` into this estimate.
+    ///
+    /// Both estimators must have been created with the same pixel count and mode, so that they
+    /// retain the same number of samples; the result is then identical to observing every colour
+    /// through one estimator. This is what lets a caller split an image across worker threads.
+    pub fn merge(&mut self, other: Self) {
+        debug_assert_eq!(self.expected, other.expected);
+        debug_assert_eq!(self.retained, other.retained);
+
+        self.observed = self.observed.saturating_add(other.observed);
+        for peak in other.peaks {
+            self.retain_peak(peak.0);
         }
     }
 
@@ -754,7 +788,7 @@ impl Ord for PeakSample {
 
 // The heap threshold only rises once it is full. A lane that does not beat the threshold captured
 // at the start of its chunk therefore cannot become a candidate while earlier lanes are retained.
-#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+#[multiversion(targets = "simd")]
 fn observe_max_cll_candidates(estimator: &mut MaxCLLEstimator, colors: &[LinearRGB]) {
     debug_assert_eq!(
         estimator.peaks.len(),
@@ -809,6 +843,7 @@ mod clamp;
 mod hable;
 mod reinhard;
 mod simd;
+mod transcendental;
 
 #[doc(inline)]
 pub use aces::{ACESApproximate, ACESFitted};
@@ -819,15 +854,15 @@ pub use clamp::{Clamp, ScaledClamp};
 pub use hable::Hable;
 #[doc(inline)]
 pub use reinhard::{
-    ExtendedLuminanceReinhard, ExtendedReinhard, LuminanceReinhard, LuminanceWhitePoint, Reinhard,
-    ReinhardJodie, estimate_luminance_white_point,
+    ExtendedLuminanceReinhard, ExtendedReinhard, LuminanceReinhard, LuminanceWhitePoint,
+    LuminanceWhitePointEstimator, Mobius, Reinhard, ReinhardJodie, estimate_luminance_white_point,
 };
 
 fn sanitize_component(component: f32) -> f32 {
     if component.is_nan() || component <= 0.0 {
         0.0
     } else {
-        component.min(f32::MAX)
+        component.min(MAX_MAPPABLE)
     }
 }
 
@@ -840,30 +875,6 @@ fn display_component_f32(component: f32) -> f32 {
     } else {
         component
     }
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "a finite display-linear component is clamped to the f32 unit interval before casting"
-)]
-fn display_component(component: f64) -> f32 {
-    if component.is_nan() || component <= 0.0 {
-        0.0
-    } else if component >= 1.0 {
-        1.0
-    } else {
-        component as f32
-    }
-}
-
-#[allow(
-    clippy::cast_possible_truncation,
-    reason = "finite nonnegative luminance is saturated to the public f32 scalar range"
-)]
-fn nonnegative_f64_to_f32(value: f64) -> f32 {
-    debug_assert!(value.is_finite());
-    debug_assert!(value >= 0.0);
-    value.min(f64::from(f32::MAX)) as f32
 }
 
 #[cfg(test)]
@@ -956,6 +967,32 @@ mod tests {
         }
     }
 
+    /// Asserts the batch paths agree with the scalar path to within a rounding step.
+    ///
+    /// For operators that permit algebraic reassociation, which cannot promise bit-equality.
+    fn assert_batch_approximates_scalar(mapper: &dyn ToneMapper, inputs: &[LinearRGB]) {
+        let expected: Vec<_> = inputs
+            .iter()
+            .copied()
+            .map(|color| mapper.map(color))
+            .collect();
+
+        let mut actual = inputs.to_vec();
+        mapper.map_in_place(&mut actual);
+        for (actual, expected) in actual.into_iter().zip(expected.iter().copied()) {
+            assert_components_close(actual, expected.components());
+        }
+
+        let mut planes: LinearRGBPlanes = inputs.iter().copied().collect();
+        mapper.map_planes_in_place(&mut planes);
+        let channels = planes.channels();
+        for (index, expected) in expected.into_iter().enumerate() {
+            for (channel, expected) in expected.components().into_iter().enumerate() {
+                assert_approximately_equal(channels[channel][index], expected);
+            }
+        }
+    }
+
     fn estimate_max_cll_scalarly(colors: &[LinearRGB]) -> MaxCll {
         let mut estimator = MaxCLLEstimator::new(
             NonZeroUsize::new(colors.len()).expect("test MaxCLL input is nonempty"),
@@ -972,7 +1009,7 @@ mod tests {
     fn linear_rgb_preserves_every_finite_nonnegative_component() {
         let color = LinearRGB::new([70_000.0, 100_000.0, f32::INFINITY]);
 
-        assert_eq!(color.components(), [70_000.0, 100_000.0, f32::MAX]);
+        assert_eq!(color.components(), [70_000.0, 100_000.0, MAX_MAPPABLE]);
         assert!(color.luminance().is_finite());
     }
 
@@ -1004,6 +1041,7 @@ mod tests {
         let extended = ExtendedReinhard::new(white);
         let extended_luminance =
             ExtendedLuminanceReinhard::new(LuminanceWhitePoint::new(4.0).unwrap());
+        let mobius = Mobius::new(LuminanceWhitePoint::new(4.0).unwrap(), 0.3);
         let mappers: [&dyn ToneMapper; 11] = [
             &Clamp,
             &scaled,
@@ -1022,6 +1060,15 @@ mod tests {
             for length in [0, 1, 3, 4, 5, 7, 8, 9, 17] {
                 assert_batch_matches_scalar(mapper, &inputs[..length]);
             }
+        }
+
+        // Mobius evaluates with `algebraic_*` operations, which license the compiler to
+        // reassociate. It does so differently for one lane than for eight once optimizations are
+        // on, so the two paths agree to a rounding step rather than to the bit — exactly what the
+        // operator's own documentation promises. Asserting more would assert a guarantee the
+        // language does not give.
+        for length in [0, 1, 3, 4, 5, 7, 8, 9, 17] {
+            assert_batch_approximates_scalar(&mobius, &inputs[..length]);
         }
     }
 
@@ -1119,6 +1166,18 @@ mod tests {
         for mapper in mappers {
             assert_displayable(mapper.map(LinearRGB::new([0.0, f32::MAX, 100_000.0])));
             assert_eq!(mapper.map(LinearRGB::default()), LinearRGB::default());
+
+            // Asserting only that the result is finite would accept zero, and zero is exactly the
+            // failure worth catching: squaring an unbounded component overflows to infinity, whose
+            // difference is NaN, which `displayable` turns into black. The brightest possible
+            // input has to map toward white.
+            let brightest = mapper.map(LinearRGB::new([f32::MAX; 3]));
+            for component in brightest.components() {
+                assert!(
+                    component > 0.5,
+                    "the brightest input mapped to {component}, not toward display white"
+                );
+            }
         }
     }
 
@@ -1146,6 +1205,20 @@ mod tests {
         assert_approximately_equal(green, 0.326_386_15);
         assert_approximately_equal(blue, 0.163_193_08);
         assert_eq!(mapper.white_point().luminance(), 4.0);
+    }
+
+    #[test]
+    fn mobius_preserves_its_transition_and_maps_its_peak_to_white() {
+        let white_point = LuminanceWhitePoint::new(4.0).unwrap();
+        let mapper = Mobius::new(white_point, 0.3);
+
+        assert_components_close(mapper.map(LinearRGB::new([0.3; 3])), [0.3; 3]);
+        assert_components_close(
+            mapper.map(LinearRGB::new([white_point.luminance(); 3])),
+            [1.0; 3],
+        );
+        assert_eq!(mapper.white_point(), white_point);
+        assert_eq!(mapper.transition(), 0.3);
     }
 
     #[test]

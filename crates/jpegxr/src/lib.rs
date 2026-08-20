@@ -8,7 +8,7 @@
 
 #![forbid(unsafe_code)]
 #![feature(portable_simd)]
-#![allow(
+#![expect(
     clippy::comparison_chain,
     clippy::items_after_statements,
     clippy::manual_midpoint,

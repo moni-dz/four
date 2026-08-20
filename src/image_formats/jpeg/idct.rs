@@ -99,7 +99,26 @@ const BASIS: [[f32; BLOCK_SIDE]; BLOCK_SIDE] = [
     ],
 ];
 
-#[allow(
+/// Returns `matrix` with rows and columns exchanged.
+const fn transpose(matrix: [[f32; BLOCK_SIDE]; BLOCK_SIDE]) -> [[f32; BLOCK_SIDE]; BLOCK_SIDE] {
+    let mut transposed = [[0.0; BLOCK_SIDE]; BLOCK_SIDE];
+    let mut row = 0;
+    while row < BLOCK_SIDE {
+        let mut column = 0;
+        while column < BLOCK_SIDE {
+            transposed[column][row] = matrix[row][column];
+            column += 1;
+        }
+        row += 1;
+    }
+    transposed
+}
+
+// `BASIS` is indexed by sample position then frequency, which is the wrong order for accumulating
+// across frequencies. `BASIS` is not symmetric, so its transpose is a distinct table.
+const BASIS_TRANSPOSED: [[f32; BLOCK_SIDE]; BLOCK_SIDE] = transpose(BASIS);
+
+#[expect(
     clippy::cast_precision_loss,
     reason = "the floating-point IDCT intentionally maps integer coefficients into f32 lanes"
 )]
@@ -121,8 +140,8 @@ pub(super) fn inverse(coefficients: &[i32; 64]) -> [u8; 64] {
 
 // Dispatch only non-flat blocks: a dispatch before the cheap DC-only path would slow down the most
 // common case. Each target gets the same portable-SIMD algorithm, plus a safe baseline copy.
-#[multiversion(targets("x86_64+avx2+fma", "x86_64+sse4.1", "aarch64+neon"))]
-#[allow(
+#[multiversion(targets = "simd")]
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_precision_loss,
     clippy::cast_sign_loss,
@@ -134,17 +153,19 @@ fn inverse_simd(coefficients: &[i32; 64]) -> [u8; 64] {
 
     let mut intermediate = [[0.0_f32; BLOCK_SIDE]; BLOCK_SIDE];
 
+    // Accumulate across frequencies rather than reducing within a lane group. The previous form
+    // ran a horizontal `reduce_sum` per output sample — sixty-four latency-chained shuffle-and-add
+    // pairs per block, each ending in a scalar store. This is the transpose of pass two below.
     for (vertical_frequency, intermediate_row) in intermediate.iter_mut().enumerate() {
         let coefficient_start = vertical_frequency * BLOCK_SIDE;
+        let mut values = F32x8::splat(0.0);
 
-        let coefficient_row = F32x8::from_array(std::array::from_fn(|index| {
-            coefficients[coefficient_start + index] as f32
-        }));
-
-        for (x, target) in intermediate_row.iter_mut().enumerate() {
-            let basis = F32x8::from_array(BASIS[x]);
-            *target = (coefficient_row * basis).reduce_sum();
+        for (horizontal_frequency, basis) in BASIS_TRANSPOSED.iter().enumerate() {
+            let coefficient = coefficients[coefficient_start + horizontal_frequency] as f32;
+            values = F32x8::from_array(*basis).mul_add(F32x8::splat(coefficient), values);
         }
+
+        *intermediate_row = values.to_array();
     }
 
     let mut samples = [0_u8; 64];
@@ -170,7 +191,7 @@ fn inverse_simd(coefficients: &[i32; 64]) -> [u8; 64] {
     samples
 }
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "the value is rounded and clamped to the complete u8 range before conversion"
@@ -183,6 +204,83 @@ fn clamp_sample(value: f32) -> u8 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Evaluates the ITU T.81 inverse DCT directly, in f64.
+    ///
+    /// Written from the specification's double sum rather than from the implementation, so it is
+    /// an independent expectation rather than a restatement of the code under test.
+    fn reference_inverse(coefficients: &[i32; 64]) -> [f64; 64] {
+        fn normalization(frequency: usize) -> f64 {
+            if frequency == 0 {
+                std::f64::consts::FRAC_1_SQRT_2
+            } else {
+                1.0
+            }
+        }
+
+        // Every index here is below eight, so the conversion is exact.
+        fn position(index: usize) -> f64 {
+            f64::from(u8::try_from(index).expect("a block index fits u8"))
+        }
+
+        std::array::from_fn(|index| {
+            let (x, y) = (index % BLOCK_SIDE, index / BLOCK_SIDE);
+            let mut sample = 0.0;
+
+            for vertical in 0..BLOCK_SIDE {
+                for horizontal in 0..BLOCK_SIDE {
+                    let angle_x =
+                        (2.0 * position(x) + 1.0) * position(horizontal) * std::f64::consts::PI
+                            / 16.0;
+                    let angle_y =
+                        (2.0 * position(y) + 1.0) * position(vertical) * std::f64::consts::PI
+                            / 16.0;
+
+                    sample += normalization(horizontal)
+                        * normalization(vertical)
+                        * f64::from(coefficients[vertical * BLOCK_SIDE + horizontal])
+                        * angle_x.cos()
+                        * angle_y.cos();
+                }
+            }
+
+            sample / 4.0 + f64::from(LEVEL_SHIFT)
+        })
+    }
+
+    #[test]
+    fn the_transform_matches_a_direct_evaluation_of_the_specification() {
+        // The flat-block test above exercises only the DC-only shortcut, which returns before the
+        // transform runs. These blocks all carry alternating-current energy, so they reach it.
+        let mut worst = 0.0_f64;
+
+        for seed in 0..24_u32 {
+            let mut state = u64::from(seed).wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+            let coefficients: [i32; 64] = std::array::from_fn(|index| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                // Realistic magnitudes: a large DC term and quantized alternating-current terms
+                // that decay with frequency.
+                let magnitude = if index == 0 { 1024 } else { 512 >> (index / 8) };
+                let value = i64::from((state >> 40) as u32 % 1024) - 512;
+                i32::try_from(value * i64::from(magnitude) / 512).expect("test coefficient fits")
+            });
+
+            let actual = inverse(&coefficients);
+            let expected = reference_inverse(&coefficients);
+
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                let clamped = expected.round().clamp(0.0, 255.0);
+                worst = worst.max((f64::from(actual) - clamped).abs());
+            }
+        }
+
+        assert!(
+            worst <= 1.0,
+            "the transform drifted {worst} levels from a direct evaluation of the specification"
+        );
+    }
 
     #[test]
     fn dc_coefficient_produces_a_flat_block() {

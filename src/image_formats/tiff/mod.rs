@@ -12,7 +12,10 @@ use ::tiff::ColorType;
 use ::tiff::decoder::{BufferLayoutPreference, Decoder, DecodingResult, Limits};
 use rayon::prelude::*;
 
-use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
+use super::{
+    DIMENSION_MAX, DecodedImage, PARALLEL_PIXELS_MIN, PARALLEL_PIXELS_PER_JOB, PIXELS_MAX,
+    RGBA_BYTES_PER_PIXEL,
+};
 use error::error;
 
 pub use error::{Error, Result, TIFFError, TIFFLimit};
@@ -27,8 +30,6 @@ pub const SIGNATURE_BIG_LE: [u8; 4] = *b"II+\0";
 pub const SIGNATURE_BIG_BE: [u8; 4] = *b"MM\0+";
 
 const CODEC_BUFFER_MAX: usize = 512 * 1024 * 1024;
-const PARALLEL_PIXELS_MIN: usize = 256 * 1024;
-const PARALLEL_PIXELS_PER_JOB: usize = 64 * 1024;
 
 /// Returns whether `bytes` begin with a classic TIFF or `BigTIFF` signature.
 #[must_use]
@@ -272,19 +273,19 @@ fn normalize_unsigned_with_layout<T: Copy + Sync>(
 ) -> Result<Vec<u8>> {
     if width * height >= PARALLEL_PIXELS_MIN {
         let mut rgba = vec![0; width * height * 4];
-        rgba.par_chunks_exact_mut(4)
-            .with_min_len(PARALLEL_PIXELS_PER_JOB)
+        // Chunk by row, not by pixel. Chunking by pixel throws the coordinates away and then
+        // recovers them with a division and a remainder per pixel; the row index comes free from
+        // the chunk index, and the column is an induction variable.
+        rgba.par_chunks_mut(width * RGBA_BYTES_PER_PIXEL as usize)
+            .with_min_len(PARALLEL_PIXELS_PER_JOB / width.max(1))
             .enumerate()
-            .try_for_each(|(index, target)| {
-                let pixel = normalize_pixel(
-                    samples,
-                    index % width,
-                    index / width,
-                    format,
-                    layout,
-                    into_u64,
-                )?;
-                target.copy_from_slice(&pixel);
+            .try_for_each(|(y, row)| {
+                let (targets, remainder) = row.as_chunks_mut::<4>();
+                invariant_eq!(remainder.len(), 0);
+
+                for (x, target) in targets.iter_mut().enumerate() {
+                    *target = normalize_pixel(samples, x, y, format, layout, into_u64)?;
+                }
                 Ok::<(), Error>(())
             })?;
         Ok(rgba)

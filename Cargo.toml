@@ -11,6 +11,7 @@ members = ["crates/jpegxr", "crates/tonemapping"]
 resolver = "3"
 
 [workspace.dependencies]
+divan = "0.1.21"
 mimalloc = "0.1.48"
 multiversion = "0.8.0"
 rayon = "1.12.0"
@@ -33,8 +34,15 @@ tonemapping = { path = "crates/tonemapping" }
 zune-jpeg = "0.5.15"
 zerocopy = { workspace = true, features = ["simd", "simd-nightly", "float-nightly"] }
 
+[dev-dependencies]
+divan = { workspace = true }
+
 [build-dependencies]
 embed-resource = "3.0.11"
+
+[[bench]]
+name = "formats"
+harness = false
 
 [lints]
 workspace = true
@@ -47,6 +55,7 @@ opt-level = 3
 debug = "none"
 strip = "debuginfo"
 lto = "fat"
+codegen-units = 1
 
 [profile.release-with-symbols]
 inherits = "dev"

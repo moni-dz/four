@@ -7,20 +7,6 @@ use gpui_platform::application;
 
 use self::viewer::{Root, WINDOW_MIN_HEIGHT, WINDOW_MIN_WIDTH, initial_viewer};
 
-// Keep invariant diagnostics consistent with the decoder crate while leaving test assertions free
-// to use the standard macros, where custom panic messages add little value.
-macro_rules! invariant {
-    ($condition:expr, $($message:tt)+) => {
-        assert!($condition, $($message)+)
-    };
-    ($condition:expr $(,)?) => {
-        assert!(
-            $condition,
-            concat!("invariant failed: ", stringify!($condition))
-        )
-    };
-}
-
 mod image_loader;
 mod viewer;
 

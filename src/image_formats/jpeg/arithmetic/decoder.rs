@@ -251,7 +251,7 @@ struct ProbabilityEstimate {
     switch_mps: bool,
 }
 
-#[allow(
+#[expect(
     clippy::similar_names,
     reason = "MPS and LPS are the canonical ITU-T arithmetic-coder transition names"
 )]

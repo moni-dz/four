@@ -16,7 +16,34 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+    - name: Format
+      run: cargo fmt --all --check
+
+    - name: Clippy
+      run: cargo clippy --workspace --all-targets -- -D warnings
+
     - name: Build
-      run: cargo build --verbose
-    - name: Run tests
-      run: cargo test --verbose
+      run: cargo build --workspace --verbose
+
+    # The debug run keeps overflow checks live, which is what turns an arithmetic bug in a decoder
+    # into a panic instead of a wrong pixel. The release run is what actually ships.
+    - name: Test (debug)
+      run: cargo test --workspace --verbose
+
+    - name: Test (release)
+      run: cargo test --workspace --release --verbose
+
+    # Benchmarks are compiled but not run: CI timings are too noisy to gate on, and a benchmark
+    # that stops compiling is the failure worth catching here.
+    - name: Build benchmarks
+      run: cargo bench --workspace --no-run

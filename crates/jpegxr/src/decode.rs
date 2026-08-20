@@ -7,9 +7,9 @@ use crate::codestream::{
 };
 use crate::entropy::{self, AdaptiveVLC};
 use crate::error::{Error, ErrorKind, Result};
+use multiversion::multiversion;
 use rayon::prelude::*;
 use std::simd::{Simd, cmp::SimdOrd, num::SimdInt};
-use multiversion::multiversion;
 
 const MAX_DIMENSION: usize = 16_384;
 const MAX_PIXELS: usize = 64 * 1024 * 1024;
@@ -262,10 +262,7 @@ pub(crate) fn decode_bgr101010(stream: &ParsedCodestream<'_>) -> Result<Vec<u32>
     Ok(pixels)
 }
 
-#[allow(
-    clippy::similar_names,
-    reason = "the paired U and V plane names make their channel mapping explicit"
-)]
+#[multiversion(targets = "simd")]
 fn fill_bgr101010_row(
     row: &mut [u32],
     y: usize,
@@ -329,18 +326,17 @@ fn fill_bgr101010_row(
     }
 }
 
-
-#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+#[inline]
 fn clip_10_bit(value: i64) -> u32 {
     u32::try_from(value.clamp(0, 1023)).expect("clamped 10-bit sample fits u32")
 }
 
-#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+#[inline]
 fn clip_10_bit_simd(value: I64x8) -> Simd<u32, PIXEL_LANES> {
     value.simd_clamp(I64x8::splat(0), I64x8::splat(1023)).cast()
 }
 
-#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+#[inline]
 fn inverse_color_transform(y: i32, u: i32, v: i32, bias: i64) -> [i64; 3] {
     let mut green = i64::from(y) + bias;
     let mut red = -i64::from(u);
@@ -353,7 +349,7 @@ fn inverse_color_transform(y: i32, u: i32, v: i32, bias: i64) -> [i64; 3] {
     [red, green, blue]
 }
 
-#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+#[inline]
 fn inverse_color_transform_simd(y: I32x8, u: I32x8, v: I32x8, bias: i64) -> [I64x8; 3] {
     let mut green = y.cast::<i64>() + I64x8::splat(bias);
     let mut red = -u.cast::<i64>();
@@ -366,10 +362,7 @@ fn inverse_color_transform_simd(y: I32x8, u: I32x8, v: I32x8, bias: i64) -> [I64
     [red, green, blue]
 }
 
-#[allow(
-    clippy::many_single_char_names,
-    reason = "YUV-to-RGB conversion follows the T.832 sample names"
-)]
+#[multiversion(targets = "simd")]
 fn fill_rgba_row(
     row: &mut [f32],
     y: usize,
@@ -382,25 +375,36 @@ fn fill_rgba_row(
     color_format: FloatFormat,
     alpha_format: FloatFormat,
 ) -> Result<()> {
-    let color_component_len = color.width * color.height;
     let (pixels, remainder) = row.as_chunks_mut::<4>();
     debug_assert_eq!(remainder, []);
 
-    for (x, pixel) in pixels.iter_mut().enumerate() {
-        let color_index = (y + color_top) * color.width + x + color_left;
-        let [red, green, blue] = inverse_color_transform(
-            color.values[color_index],
-            color.values[color_component_len + color_index],
-            color.values[2 * color_component_len + color_index],
-            0,
-        );
+    // Slice each plane's row once, as `fill_bgr101010_row` does. Recomputing a flat index per
+    // pixel from `color.width` gave the optimizer no way to prove the accesses were in bounds, so
+    // every sample carried its own bounds check.
+    let color_component_len = color.width * color.height;
+    let color_start = (y + color_top) * color.width + color_left;
+    let color_end = color_start + pixels.len();
+    let luma = &color.values[color_start..color_end];
+    let chroma_u =
+        &color.values[color_component_len + color_start..color_component_len + color_end];
+    let chroma_v =
+        &color.values[2 * color_component_len + color_start..2 * color_component_len + color_end];
 
-        let alpha_index = (y + alpha_top) * alpha.width + x + alpha_left;
+    let alpha_start = (y + alpha_top) * alpha.width + alpha_left;
+    let alphas = &alpha.values[alpha_start..alpha_start + pixels.len()];
 
+    // The lifting is six integer operations against roughly thirty in `FloatFormat::convert`, and
+    // `convert` is fallible and data-dependent, so it stays scalar and vectorizing the transform
+    // alone would not pay. Removing the bounds checks is the win here.
+    let color_samples = luma.iter().zip(chroma_u).zip(chroma_v);
+    for ((pixel, ((luma, chroma_u), chroma_v)), alpha) in
+        pixels.iter_mut().zip(color_samples).zip(alphas)
+    {
+        let [red, green, blue] = inverse_color_transform(*luma, *chroma_u, *chroma_v, 0);
         pixel[0] = color_format.convert(red)?;
         pixel[1] = color_format.convert(green)?;
         pixel[2] = color_format.convert(blue)?;
-        pixel[3] = alpha_format.convert(i64::from(alpha.values[alpha_index]))?;
+        pixel[3] = alpha_format.convert(i64::from(*alpha))?;
     }
 
     Ok(())
@@ -635,6 +639,7 @@ pub(crate) fn predict_lowpass(
                             macroblock,
                             component,
                             dc_mode,
+                            stream.offset,
                         )?;
 
                         predict_lp(
@@ -644,6 +649,7 @@ pub(crate) fn predict_lowpass(
                             macroblock,
                             component,
                             dc_mode,
+                            stream.offset,
                         )?;
 
                         let dc_factor = quant_map(
@@ -966,6 +972,7 @@ fn reconstruct(stream: &ParsedCodestream<'_>) -> Result<IntegerImage> {
     combine_and_transform(stream, &lowpass, &highpass)
 }
 
+#[multiversion(targets = "simd")]
 fn inverse_lowpass_blocks(
     blocks: &mut [[i32; 16]],
     first_block: usize,
@@ -1159,6 +1166,7 @@ fn combine_and_transform(
     Ok(output)
 }
 
+#[multiversion(targets = "simd")]
 fn combine_and_transform_band(
     output: &mut [i32],
     band_index: usize,
@@ -1200,7 +1208,7 @@ fn combine_and_transform_band(
     Ok(())
 }
 
-#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+#[inline]
 fn inverse_transform_4x4(coefficients: &mut [i32; 16], offset: usize) -> Result<()> {
     const PERMUTATION: [usize; 16] = [0, 8, 4, 13, 2, 15, 3, 14, 1, 12, 5, 9, 7, 11, 6, 10];
 
@@ -1226,6 +1234,7 @@ fn inverse_transform_4x4(coefficients: &mut [i32; 16], offset: usize) -> Result<
     Ok(())
 }
 
+#[inline]
 fn transform_group(
     values: &mut [i64; 16],
     indexes: [usize; 4],
@@ -1239,7 +1248,7 @@ fn transform_group(
     }
 }
 
-#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+#[inline]
 fn inverse_odd_pair(values: &mut [i64; 16]) {
     let mut first = I64x2::from_array([values[2], values[8]]);
     let mut second = I64x2::from_array([values[3], values[12]]);
@@ -1269,7 +1278,7 @@ fn inverse_odd_pair(values: &mut [i64; 16]) {
     [values[7], values[13]] = [fourth_a, fourth_b];
 }
 
-#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+#[inline]
 fn t2x2_quad(values: &mut [i64; 16]) {
     let mut first = I64x4::from_array([values[0], values[5], values[1], values[4]]);
     let mut second = I64x4::from_array([values[3], values[6], values[2], values[7]]);
@@ -1295,8 +1304,8 @@ fn t2x2_quad(values: &mut [i64; 16]) {
     [values[15], values[10], values[14], values[11]] = [fourth_a, fourth_b, fourth_c, fourth_d];
 }
 
-#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
-
+#[multiversion(targets = "simd")]
+#[inline]
 fn t2x2(values: &mut [i64; 4], rounding: i64) {
     values[0] += values[3];
     values[1] -= values[2];
@@ -1308,7 +1317,7 @@ fn t2x2(values: &mut [i64; 4], rounding: i64) {
     values[1] += values[2];
 }
 
-#[multiversion(targets("x86_64+avx2", "x86_64+sse4.1", "aarch64+neon"))]
+#[inline]
 fn inverse_odd_odd(values: &mut [i64; 4]) {
     values[3] += values[0];
     values[2] -= values[1];
@@ -1511,6 +1520,7 @@ fn predict_dc(
     macroblock: usize,
     component: usize,
     mode: u8,
+    offset: usize,
 ) -> Result<()> {
     let current = (macroblock * components + component) * 16;
     let prediction = match mode {
@@ -1524,9 +1534,12 @@ fn predict_dc(
         _ => 0,
     };
 
-    raw[current] = raw[current]
-        .checked_add(prediction)
-        .ok_or_else(|| Error::new(ErrorKind::InvalidCodestream("predicted DC overflow"), 0))?;
+    raw[current] = raw[current].checked_add(prediction).ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidCodestream("predicted DC overflow"),
+            offset,
+        )
+    })?;
 
     Ok(())
 }
@@ -1538,6 +1551,7 @@ fn predict_lp(
     macroblock: usize,
     component: usize,
     dc_mode: u8,
+    offset: usize,
 ) -> Result<()> {
     let current = (macroblock * components + component) * 16;
     let (reference, coefficients): (Option<usize>, &[usize]) = match dc_mode {
@@ -1559,7 +1573,7 @@ fn predict_lp(
                 .ok_or_else(|| {
                     Error::new(
                         ErrorKind::InvalidCodestream("predicted lowpass overflow"),
-                        0,
+                        offset,
                     )
                 })?;
         }
@@ -1810,7 +1824,7 @@ fn decode_lowpass_packet(
     Ok(())
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "packet geometry is explicit at the frequency-band boundary"
 )]
@@ -1885,10 +1899,6 @@ fn decode_highpass_packet(
     Ok(())
 }
 
-#[allow(
-    clippy::too_many_arguments,
-    reason = "packet geometry is explicit at the frequency-band boundary"
-)]
 fn decode_flexbits_packet(
     packet: Packet<'_>,
     trim_present: bool,
@@ -1971,8 +1981,13 @@ fn decode_flexbits_packet(
     Ok(())
 }
 
+/// The eight adaptive VLC tables the lowpass and highpass coefficient decoders share.
+///
+/// Both bands read a first index, then a run of subsequent indices, then absolute levels, using
+/// the same tables and the same adaptation schedule. Holding them in one place keeps that schedule
+/// from drifting between the two.
 #[derive(Clone, Debug)]
-struct HighpassContext {
+struct BandVlc {
     first_luma: AdaptiveVLC,
     index_luma_zero: AdaptiveVLC,
     index_luma_one: AdaptiveVLC,
@@ -1981,21 +1996,9 @@ struct HighpassContext {
     index_chroma_one: AdaptiveVLC,
     level_zero: AdaptiveVLC,
     level_one: AdaptiveVLC,
-
-    num_cbphp: AdaptiveVLC,
-    num_block_cbphp: AdaptiveVLC,
-    cbphp_state: [u8; 2],
-    count_ones: [i8; 2],
-    count_zeroes: [i8; 2],
-
-    model_state: [i32; 2],
-    model_bits: [u8; 2],
-
-    horizontal_scan: AdaptiveScan,
-    vertical_scan: AdaptiveScan,
 }
 
-impl HighpassContext {
+impl BandVlc {
     const fn new() -> Self {
         Self {
             first_luma: AdaptiveVLC::many_tables(),
@@ -2006,18 +2009,6 @@ impl HighpassContext {
             index_chroma_one: AdaptiveVLC::many_tables(),
             level_zero: AdaptiveVLC::two_tables(),
             level_one: AdaptiveVLC::two_tables(),
-
-            num_cbphp: AdaptiveVLC::two_tables(),
-            num_block_cbphp: AdaptiveVLC::two_tables(),
-            cbphp_state: [0, 0],
-            count_ones: [-4, -4],
-            count_zeroes: [4, 4],
-
-            model_state: [0, 0],
-            model_bits: [0, 0],
-
-            horizontal_scan: AdaptiveScan::new_highpass_horizontal(),
-            vertical_scan: AdaptiveScan::new_highpass_vertical(),
         }
     }
 
@@ -2080,6 +2071,136 @@ impl HighpassContext {
         self.index_chroma_one.adapt_many(3);
         self.level_zero.adapt_two();
         self.level_one.adapt_two();
+    }
+}
+
+/// Names the two error messages that differ between the bands.
+#[derive(Clone, Copy, Debug)]
+struct BandMessages {
+    run_exceeds_block: &'static str,
+    position_exceeds_block: &'static str,
+}
+
+const LOWPASS_MESSAGES: BandMessages = BandMessages {
+    run_exceeds_block: "lowpass coefficient run exceeds block",
+    position_exceeds_block: "lowpass coefficient position exceeds block",
+};
+
+const HIGHPASS_MESSAGES: BandMessages = BandMessages {
+    run_exceeds_block: "highpass coefficient run exceeds block",
+    position_exceeds_block: "highpass coefficient position exceeds block",
+};
+
+/// Decodes one sixteen-coefficient block from either frequency band.
+///
+/// The lowpass and highpass decoders were sixty-six line-for-line identical lines apart from two
+/// error strings and the choice of scan table. `scan` is taken separately from `vlc` so a caller
+/// can borrow the two disjoint fields of its own context.
+fn decode_band_block(
+    reader: &mut BitReader<'_>,
+    vlc: &mut BandVlc,
+    scan: &mut AdaptiveScan,
+    chroma: bool,
+    coefficients: &mut [i32; 16],
+    messages: BandMessages,
+) -> Result<i32> {
+    let first = vlc.decode_first(reader, chroma)?;
+    let mut continuing = first >> 2;
+    let mut level_context = (first & 1) & continuing;
+    let negative = reader.read_bool()?;
+
+    let magnitude = if first & 2 != 0 {
+        vlc.decode_level(reader, level_context != 0)?
+    } else {
+        1
+    };
+
+    let mut value = signed_level(reader, magnitude, negative)?;
+    let mut position = 1_u8;
+
+    if first & 1 == 0 {
+        position += entropy::run(reader, 14)?;
+    }
+
+    scan.place(coefficients, position, value);
+    let mut location = position + 1;
+    let mut nonzero = 1_i32;
+
+    while continuing != 0 {
+        if continuing & 1 == 0 {
+            let maximum = 15_u8.checked_sub(location).ok_or_else(|| {
+                reader.error(ErrorKind::InvalidCodestream(messages.run_exceeds_block))
+            })?;
+            position = location + entropy::run(reader, maximum)?;
+        } else {
+            position = location;
+        }
+
+        location = position + 1;
+
+        if location > 16 {
+            return Err(reader.error(ErrorKind::InvalidCodestream(
+                messages.position_exceeds_block,
+            )));
+        }
+
+        let index = vlc.decode_index(reader, chroma, level_context != 0, location)?;
+        continuing = index >> 1;
+        level_context &= continuing;
+        let negative = reader.read_bool()?;
+
+        let magnitude = if index & 1 != 0 {
+            vlc.decode_level(reader, level_context != 0)?
+        } else {
+            1
+        };
+
+        value = signed_level(reader, magnitude, negative)?;
+        scan.place(coefficients, position, value);
+        nonzero += 1;
+    }
+
+    Ok(nonzero)
+}
+
+#[derive(Clone, Debug)]
+struct HighpassContext {
+    vlc: BandVlc,
+
+    num_cbphp: AdaptiveVLC,
+    num_block_cbphp: AdaptiveVLC,
+    cbphp_state: [u8; 2],
+    count_ones: [i8; 2],
+    count_zeroes: [i8; 2],
+
+    model_state: [i32; 2],
+    model_bits: [u8; 2],
+
+    horizontal_scan: AdaptiveScan,
+    vertical_scan: AdaptiveScan,
+}
+
+impl HighpassContext {
+    const fn new() -> Self {
+        Self {
+            vlc: BandVlc::new(),
+
+            num_cbphp: AdaptiveVLC::two_tables(),
+            num_block_cbphp: AdaptiveVLC::two_tables(),
+            cbphp_state: [0, 0],
+            count_ones: [-4, -4],
+            count_zeroes: [4, 4],
+
+            model_state: [0, 0],
+            model_bits: [0, 0],
+
+            horizontal_scan: AdaptiveScan::new_highpass_horizontal(),
+            vertical_scan: AdaptiveScan::new_highpass_vertical(),
+        }
+    }
+
+    fn adapt(&mut self) {
+        self.vlc.adapt();
         self.num_cbphp.adapt_two();
         self.num_block_cbphp.adapt_two();
     }
@@ -2116,7 +2237,7 @@ impl HighpassContext {
     }
 }
 
-#[allow(
+#[expect(
     clippy::too_many_arguments,
     reason = "CBPHP prediction needs explicit macroblock edge state"
 )]
@@ -2254,8 +2375,21 @@ fn decode_highpass_macroblock(
                 let coefficients: &mut [i32; 16] = (&mut image.values[start..start + 16])
                     .try_into()
                     .expect("highpass block has 16 coefficients");
-                laplacian[model] +=
-                    decode_highpass_block(reader, component != 0, mode, context, coefficients)?;
+                // Split-borrow the context: the shared tables and the chosen scan are disjoint
+                // fields, so both can be handed to the decoder at once.
+                let scan = if mode == 1 {
+                    &mut context.vertical_scan
+                } else {
+                    &mut context.horizontal_scan
+                };
+                laplacian[model] += decode_band_block(
+                    reader,
+                    &mut context.vlc,
+                    scan,
+                    component != 0,
+                    coefficients,
+                    HIGHPASS_MESSAGES,
+                )?;
             }
             pattern >>= 1;
         }
@@ -2266,94 +2400,9 @@ fn decode_highpass_macroblock(
     Ok(())
 }
 
-fn decode_highpass_block(
-    reader: &mut BitReader<'_>,
-    chroma: bool,
-    mode: u8,
-    context: &mut HighpassContext,
-    coefficients: &mut [i32; 16],
-) -> Result<i32> {
-    let first = context.decode_first(reader, chroma)?;
-    let mut continuing = first >> 2;
-    let mut level_context = (first & 1) & continuing;
-    let negative = reader.read_bool()?;
-
-    let magnitude = if first & 2 != 0 {
-        context.decode_level(reader, level_context != 0)?
-    } else {
-        1
-    };
-
-    let mut value = signed_level(reader, magnitude, negative)?;
-    let mut position = 1_u8;
-
-    if first & 1 == 0 {
-        position += entropy::run(reader, 14)?;
-    }
-
-    context.place_highpass(coefficients, position, value, mode);
-    let mut location = position + 1;
-    let mut nonzero = 1_i32;
-
-    while continuing != 0 {
-        if continuing & 1 == 0 {
-            let maximum = 15_u8.checked_sub(location).ok_or_else(|| {
-                reader.error(ErrorKind::InvalidCodestream(
-                    "highpass coefficient run exceeds block",
-                ))
-            })?;
-            position = location + entropy::run(reader, maximum)?;
-        } else {
-            position = location;
-        }
-
-        location = position + 1;
-
-        if location > 16 {
-            return Err(reader.error(ErrorKind::InvalidCodestream(
-                "highpass coefficient position exceeds block",
-            )));
-        }
-
-        let index = context.decode_index(reader, chroma, level_context != 0, location)?;
-        continuing = index >> 1;
-        level_context &= continuing;
-        let negative = reader.read_bool()?;
-
-        let magnitude = if index & 1 != 0 {
-            context.decode_level(reader, level_context != 0)?
-        } else {
-            1
-        };
-
-        value = signed_level(reader, magnitude, negative)?;
-        context.place_highpass(coefficients, position, value, mode);
-        nonzero += 1;
-    }
-
-    Ok(nonzero)
-}
-
-impl HighpassContext {
-    fn place_highpass(&mut self, coefficients: &mut [i32; 16], position: u8, value: i32, mode: u8) {
-        if mode == 1 {
-            self.vertical_scan.place(coefficients, position, value);
-        } else {
-            self.horizontal_scan.place(coefficients, position, value);
-        }
-    }
-}
-
 #[derive(Clone, Debug)]
 struct LowpassContext {
-    first_luma: AdaptiveVLC,
-    index_luma_zero: AdaptiveVLC,
-    index_luma_one: AdaptiveVLC,
-    first_chroma: AdaptiveVLC,
-    index_chroma_zero: AdaptiveVLC,
-    index_chroma_one: AdaptiveVLC,
-    level_zero: AdaptiveVLC,
-    level_one: AdaptiveVLC,
+    vlc: BandVlc,
 
     count_zero: i8,
     count_maximum: i8,
@@ -2367,14 +2416,7 @@ struct LowpassContext {
 impl LowpassContext {
     const fn new() -> Self {
         Self {
-            first_luma: AdaptiveVLC::many_tables(),
-            index_luma_zero: AdaptiveVLC::many_tables(),
-            index_luma_one: AdaptiveVLC::many_tables(),
-            first_chroma: AdaptiveVLC::many_tables(),
-            index_chroma_zero: AdaptiveVLC::many_tables(),
-            index_chroma_one: AdaptiveVLC::many_tables(),
-            level_zero: AdaptiveVLC::two_tables(),
-            level_one: AdaptiveVLC::two_tables(),
+            vlc: BandVlc::new(),
 
             count_zero: 1,
             count_maximum: 1,
@@ -2386,65 +2428,8 @@ impl LowpassContext {
         }
     }
 
-    fn decode_first(&mut self, reader: &mut BitReader<'_>, chroma: bool) -> Result<u8> {
-        entropy::first_index(
-            reader,
-            if chroma {
-                &mut self.first_chroma
-            } else {
-                &mut self.first_luma
-            },
-        )
-    }
-
-    fn decode_index(
-        &mut self,
-        reader: &mut BitReader<'_>,
-        chroma: bool,
-        context: bool,
-        location: u8,
-    ) -> Result<u8> {
-        if location < 15 {
-            let adaptive = match (chroma, context) {
-                (false, false) => &mut self.index_luma_zero,
-                (false, true) => &mut self.index_luma_one,
-                (true, false) => &mut self.index_chroma_zero,
-                (true, true) => &mut self.index_chroma_one,
-            };
-            entropy::index_a(reader, adaptive)
-        } else if location == 15 {
-            if !reader.read_bool()? {
-                Ok(0)
-            } else if !reader.read_bool()? {
-                Ok(2)
-            } else {
-                Ok(1 + 2 * reader.read_u8(1)?)
-            }
-        } else {
-            reader.read_u8(1)
-        }
-    }
-
-    fn decode_level(&mut self, reader: &mut BitReader<'_>, context: bool) -> Result<u32> {
-        decode_absolute_level(
-            reader,
-            if context {
-                &mut self.level_one
-            } else {
-                &mut self.level_zero
-            },
-        )
-    }
-
     fn adapt(&mut self) {
-        self.first_luma.adapt_many(4);
-        self.index_luma_zero.adapt_many(3);
-        self.index_luma_one.adapt_many(3);
-        self.first_chroma.adapt_many(4);
-        self.index_chroma_zero.adapt_many(3);
-        self.index_chroma_one.adapt_many(3);
-        self.level_zero.adapt_two();
-        self.level_one.adapt_two();
+        self.vlc.adapt();
     }
 
     fn update_model(&mut self, format: InternalColorFormat, mut laplacian: [i32; 2]) {
@@ -2556,7 +2541,14 @@ fn decode_lowpass_macroblock(
             .expect("component coefficient slice has length 16");
 
         let nonzero = if coded_pattern & (1 << component) != 0 {
-            decode_block(reader, component != 0, context, coefficients)?
+            decode_band_block(
+                reader,
+                &mut context.vlc,
+                &mut context.scan,
+                component != 0,
+                coefficients,
+                LOWPASS_MESSAGES,
+            )?
         } else {
             0
         };
@@ -2568,73 +2560,6 @@ fn decode_lowpass_macroblock(
     context.update_model(plane.internal_color_format, laplacian);
 
     Ok(output)
-}
-
-fn decode_block(
-    reader: &mut BitReader<'_>,
-    chroma: bool,
-    context: &mut LowpassContext,
-    coefficients: &mut [i32; 16],
-) -> Result<i32> {
-    let first = context.decode_first(reader, chroma)?;
-    let mut continuing = first >> 2;
-    let mut level_context = (first & 1) & continuing;
-    let negative = reader.read_bool()?;
-
-    let magnitude = if first & 2 != 0 {
-        context.decode_level(reader, level_context != 0)?
-    } else {
-        1
-    };
-
-    let mut value = signed_level(reader, magnitude, negative)?;
-    let mut position = 1_u8;
-
-    if first & 1 == 0 {
-        position += entropy::run(reader, 14)?;
-    }
-
-    context.scan.place(coefficients, position, value);
-    let mut location = position + 1;
-    let mut nonzero = 1_i32;
-
-    while continuing != 0 {
-        if continuing & 1 == 0 {
-            let maximum = 15_u8.checked_sub(location).ok_or_else(|| {
-                reader.error(ErrorKind::InvalidCodestream(
-                    "lowpass coefficient run exceeds block",
-                ))
-            })?;
-            position = location + entropy::run(reader, maximum)?;
-        } else {
-            position = location;
-        }
-
-        location = position + 1;
-
-        if location > 16 {
-            return Err(reader.error(ErrorKind::InvalidCodestream(
-                "lowpass coefficient position exceeds block",
-            )));
-        }
-
-        let index = context.decode_index(reader, chroma, level_context != 0, location)?;
-        continuing = index >> 1;
-        level_context &= continuing;
-        let negative = reader.read_bool()?;
-
-        let magnitude = if index & 1 != 0 {
-            context.decode_level(reader, level_context != 0)?
-        } else {
-            1
-        };
-
-        value = signed_level(reader, magnitude, negative)?;
-        context.scan.place(coefficients, position, value);
-        nonzero += 1;
-    }
-
-    Ok(nonzero)
 }
 
 fn signed_level(reader: &BitReader<'_>, magnitude: u32, negative: bool) -> Result<i32> {
@@ -2752,39 +2677,16 @@ impl DcContext {
         } else {
             2
         };
-        for (model, laplacian) in laplacian.into_iter().enumerate().take(models) {
-            let mut state = self.model_state[model];
-            let mut delta = (laplacian - 70) >> 2;
 
-            if delta <= -8 {
-                delta = (delta + 4).max(-16);
-                state += delta;
-
-                if state < -8 {
-                    if self.model_bits[model] == 0 {
-                        state = -8;
-                    } else {
-                        state = 0;
-                        self.model_bits[model] -= 1;
-                    }
-                }
-            } else if delta >= 8 {
-                delta = (delta - 4).min(15);
-                state += delta;
-
-                if state > 8 {
-                    if self.model_bits[model] >= 15 {
-                        self.model_bits[model] = 15;
-                        state = 8;
-                    } else {
-                        state = 0;
-                        self.model_bits[model] += 1;
-                    }
-                }
-            }
-
-            self.model_state[model] = state;
-        }
+        // The adaptation state machine is shared with the lowpass and highpass contexts. It used
+        // to be spelled out a second time here, so a correction to the T.832 rules had to be
+        // applied in two places sixty lines apart.
+        update_model(
+            &mut self.model_state,
+            &mut self.model_bits,
+            laplacian,
+            models,
+        );
     }
 }
 
@@ -2927,6 +2829,77 @@ mod tests {
             channel | (channel << 10) | (channel << 20)
         });
         assert_eq!(pixels, expected);
+    }
+
+    #[test]
+    fn rgba_rows_read_color_and_alpha_at_their_own_strides() {
+        // The color and alpha planes have different widths and different origins, which is the
+        // case a shared index expression gets wrong. Expected samples are IEEE-754 words written
+        // out directly rather than recomputed with `convert`, so this does not assert the
+        // implementation against itself.
+        const COLOR_WIDTH: usize = 6;
+        const COLOR_HEIGHT: usize = 3;
+        const ALPHA_WIDTH: usize = 5;
+        const ALPHA_HEIGHT: usize = 3;
+        const POISON: i32 = 0x7f7f_7f7f;
+
+        let luma = [0x3f80_0000, 0x4000_0000, 0x3e80_0000];
+        let chroma_u = [-0x0080_0000, 0x0040_0000, 0x0000_0000];
+        let chroma_v = [0x3f00_0000, 0x3f80_0000, 0x4040_0000];
+        let alpha_samples = [0x3f80_0000, 0x3f00_0000, 0x0000_0000];
+
+        // Row 1, columns 2..5 of each color plane; row 2, columns 1..4 of the alpha plane.
+        let (color_left, color_top) = (2, 1);
+        let (alpha_left, alpha_top) = (1, 2);
+        let color_start = (color_top * COLOR_WIDTH) + color_left;
+        let alpha_start = (alpha_top * ALPHA_WIDTH) + alpha_left;
+
+        let plane_len = COLOR_WIDTH * COLOR_HEIGHT;
+        let mut values = vec![POISON; plane_len * 3];
+        for (component, samples) in [luma, chroma_u, chroma_v].into_iter().enumerate() {
+            for (index, sample) in samples.into_iter().enumerate() {
+                values[component * plane_len + color_start + index] = sample;
+            }
+        }
+        let color = IntegerImage {
+            width: COLOR_WIDTH,
+            height: COLOR_HEIGHT,
+            components: 3,
+            values,
+        };
+
+        let mut values = vec![POISON; ALPHA_WIDTH * ALPHA_HEIGHT];
+        for (index, sample) in alpha_samples.into_iter().enumerate() {
+            values[alpha_start + index] = sample;
+        }
+        let alpha = IntegerImage {
+            width: ALPHA_WIDTH,
+            height: ALPHA_HEIGHT,
+            components: 1,
+            values,
+        };
+
+        // Identity BD32F parameters: `convert` then reassembles the sample word unchanged.
+        let format = FloatFormat {
+            mantissa_bits: 23,
+            exponent_bias: 127,
+            offset: 0,
+        };
+
+        let mut row = [0.0_f32; 12];
+        fill_rgba_row(
+            &mut row, 0, color_left, color_top, alpha_left, alpha_top, &color, &alpha, format,
+            format,
+        )
+        .unwrap();
+
+        let expected = [
+            [0x2040_0000_u32, 0x3f40_0000, 0x5f40_0000, 0x3f80_0000],
+            [0x2020_0000, 0x4020_0000, 0x5fa0_0000, 0x3f00_0000],
+            [0x1e60_0000, 0x3e80_0000, 0x5ea0_0000, 0x0000_0000],
+        ];
+        let actual: Vec<u32> = row.iter().map(|sample| sample.to_bits()).collect();
+        assert_eq!(actual, expected.concat());
     }
 
     #[test]

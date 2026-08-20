@@ -139,10 +139,6 @@ pub(super) fn error(error: JPEGError) -> Error {
         !error.to_string().is_empty(),
         "a JPEG error must have a useful display message"
     );
-    invariant!(
-        size_of::<JPEGError>() > 0,
-        "JPEGError must remain inhabited"
-    );
     error.raise()
 }
 

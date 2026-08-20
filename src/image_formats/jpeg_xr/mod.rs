@@ -24,8 +24,6 @@
 
 mod error;
 
-use std::cmp::{Ordering, Reverse};
-use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;
 use std::simd::{Select, Simd, StdFloat, cmp::SimdPartialOrd, num::SimdFloat};
 
@@ -36,11 +34,14 @@ use multiversion::multiversion;
 use rayon::prelude::*;
 use tonemapping::{
     Clamp, ColorChannel as ToneColorChannel, LinearRGB, LinearRGBPlanes, LuminanceWhitePoint,
-    MaxCLLMode, MaxCLLEstimator, ToneMapper, ToneMappingMethod, WhitePoint,
+    LuminanceWhitePointEstimator, MaxCLLEstimator, MaxCLLMode, ToneMapper, ToneMappingMethod,
+    WhitePoint,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
-use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
+use super::{
+    DIMENSION_MAX, DecodedImage, PARALLEL_PIXELS_MIN, PARALLEL_PIXELS_PER_JOB, PIXELS_MAX,
+};
 use error::error;
 
 pub use error::{Error, JPEGXRError, JPEGXRLimit, Result};
@@ -54,8 +55,6 @@ const SOURCE_BUFFER_MAX: usize = 512 * 1024 * 1024;
 const HDR_BATCH_PIXELS: usize = 1_024;
 const COLOR_LANES: usize = 4;
 const SRGB_LANES: usize = 8;
-const PARALLEL_PIXELS_MIN: usize = 256 * 1024;
-const PARALLEL_PIXELS_PER_JOB: usize = 64 * 1024;
 
 type F32x4 = Simd<f32, COLOR_LANES>;
 type F32x8 = Simd<f32, SRGB_LANES>;
@@ -292,8 +291,8 @@ impl JPEGXRMetadata {
 
 /// Returns whether `bytes` begins with the JPEG XR file signature.
 #[must_use]
-pub fn has_signature(bytes: impl AsRef<[u8]>) -> bool {
-    bytes.as_ref().starts_with(&SIGNATURE)
+pub fn has_signature(bytes: &[u8]) -> bool {
+    bytes.starts_with(&SIGNATURE)
 }
 
 /// Decodes a JPEG XR image and normalizes it to SDR RGBA8.
@@ -436,7 +435,7 @@ pub fn decode_with_metadata_and_options(
     })
 }
 
-#[allow(
+#[expect(
     dead_code,
     reason = "normalization primitives remain available for future decoder profiles"
 )]
@@ -483,7 +482,7 @@ impl SampleEncoding {
     }
 }
 
-#[allow(
+#[expect(
     clippy::struct_excessive_bools,
     reason = "the fields describe independent WIC pixel-layout properties"
 )]
@@ -850,7 +849,7 @@ fn write_tone_mapped_batch(
     alphas.clear();
 }
 
-#[multiversion(targets("x86_64+avx2", "aarch64+neon"))]
+#[multiversion(targets = "simd")]
 fn write_display_pixels(colors: &LinearRGBPlanes, alphas: &[u8], targets: &mut [[u8; 4]]) {
     invariant_eq!(colors.len(), alphas.len());
     invariant_eq!(colors.len(), targets.len());
@@ -869,14 +868,24 @@ fn write_display_pixels(colors: &LinearRGBPlanes, alphas: &[u8], targets: &mut [
         .zip(alpha_chunks)
         .zip(target_chunks)
     {
-        let encoded = [*red, *green, *blue]
-            .map(|channel| linear_to_srgb_simd(F32x8::from_array(channel)).to_array());
+        // Quantize in the vector too. Only the transfer function used to be vectorized, leaving
+        // twenty-four scalar clamp-scale-round-convert sequences per eight-pixel group. The
+        // operations mirror `normalized_to_u8` exactly: `Simd::round` is also half-away-from-zero,
+        // and a float-to-integer `cast` saturates the same way `as` does.
+        let encoded = [*red, *green, *blue].map(|channel| {
+            let srgb = linear_to_srgb_simd(F32x8::from_array(channel));
+            (srgb.simd_clamp(F32x8::splat(0.0), F32x8::splat(1.0))
+                * F32x8::splat(f32::from(u8::MAX)))
+            .round()
+            .cast::<u8>()
+            .to_array()
+        });
 
         for lane in 0..SRGB_LANES {
             targets[lane] = [
-                normalized_to_u8(encoded[0][lane]),
-                normalized_to_u8(encoded[1][lane]),
-                normalized_to_u8(encoded[2][lane]),
+                encoded[0][lane],
+                encoded[1][lane],
+                encoded[2][lane],
                 alphas[lane],
             ];
         }
@@ -959,6 +968,7 @@ struct HDRAnalysis {
     hdr_metrics: Option<HDRMetrics>,
 }
 
+#[derive(Clone, Copy, Debug)]
 struct HDRPixelSelection {
     count: usize,
     exclude_fully_transparent: bool,
@@ -1021,6 +1031,109 @@ impl HDRMetrics {
     }
 }
 
+/// The parameters that decide which measurements an analysis pass collects.
+#[derive(Clone, Copy, Debug)]
+struct AnalysisRequest {
+    selection: HDRPixelSelection,
+    pixel_count: usize,
+    max_cll_mode: MaxCLLMode,
+    estimate_max_cll: bool,
+    estimate_luminance_white_point: bool,
+    collect_hdr_metrics: bool,
+}
+
+/// The measurements one worker gathers from its share of the image.
+///
+/// Every field merges associatively, which is what lets the analysis pass run in parallel: each
+/// worker builds its own totals over a row group, and the results fold together into the answer
+/// the sequential pass would have produced.
+#[derive(Debug)]
+struct AnalysisTotals {
+    accumulator: Option<HDRMetricAccumulator>,
+    max_cll_estimator: Option<MaxCLLEstimator>,
+    luminance_white_point_estimator: Option<LuminanceWhitePointEstimator>,
+    max_cll_batch: Option<Vec<LinearRGB>>,
+}
+
+impl AnalysisTotals {
+    fn new(request: &AnalysisRequest) -> Self {
+        Self {
+            accumulator: request.collect_hdr_metrics.then(HDRMetricAccumulator::new),
+            // Every partial estimator declares the whole image, so the merged observation count
+            // matches what `finish` requires and the retained sample counts agree.
+            max_cll_estimator: request.estimate_max_cll.then(|| {
+                MaxCLLEstimator::with_mode(
+                    NonZeroUsize::new(request.pixel_count)
+                        .expect("HDR analysis includes at least one pixel"),
+                    request.max_cll_mode,
+                )
+            }),
+            luminance_white_point_estimator: request
+                .estimate_luminance_white_point
+                .then(|| LuminanceWhitePointEstimator::new(request.pixel_count)),
+            max_cll_batch: request
+                .estimate_max_cll
+                .then(|| Vec::with_capacity(HDR_BATCH_PIXELS.min(request.pixel_count))),
+        }
+    }
+
+    fn observe_slab(
+        &mut self,
+        source: &[u8],
+        row_stride: usize,
+        layout: PixelLayout,
+        request: &AnalysisRequest,
+    ) -> Result<()> {
+        visit_pixels(source, row_stride, layout, |color, alpha| {
+            if request.selection.exclude_fully_transparent && alpha == 0.0 {
+                return;
+            }
+            if let Some(accumulator) = &mut self.accumulator {
+                accumulator.observe(color);
+            }
+            let color = LinearRGB::new(color);
+            if let Some(estimator) = &mut self.luminance_white_point_estimator {
+                estimator.observe(color);
+            }
+            if let Some(batch) = &mut self.max_cll_batch {
+                batch.push(color);
+                if batch.len() == HDR_BATCH_PIXELS {
+                    self.max_cll_estimator
+                        .as_mut()
+                        .expect("a MaxCLL batch has an estimator")
+                        .observe_many(batch);
+                    batch.clear();
+                }
+            }
+        })
+    }
+
+    fn merge(&mut self, other: Self) {
+        if let (Some(accumulator), Some(other)) = (&mut self.accumulator, other.accumulator) {
+            accumulator.merge(other);
+        }
+
+        // Drain the other worker's pending batch into its own estimator before merging, so no
+        // observation is lost and the counts still add up.
+        let mut other_max_cll = other.max_cll_estimator;
+        if let (Some(estimator), Some(batch)) =
+            (other_max_cll.as_mut(), other.max_cll_batch.as_ref())
+        {
+            estimator.observe_many(batch);
+        }
+        if let (Some(estimator), Some(other)) = (&mut self.max_cll_estimator, other_max_cll) {
+            estimator.merge(other);
+        }
+
+        if let (Some(estimator), Some(other)) = (
+            &mut self.luminance_white_point_estimator,
+            other.luminance_white_point_estimator,
+        ) {
+            estimator.merge(other);
+        }
+    }
+}
+
 impl HDRAnalysis {
     fn estimate(
         source: &[u8],
@@ -1038,40 +1151,47 @@ impl HDRAnalysis {
         let selection = HDRPixelSelection::new(source, row_stride, layout)?;
         let pixel_count = selection.count;
 
-        let mut accumulator = collect_hdr_metrics.then(HDRMetricAccumulator::new);
-        let mut max_cll_estimator = estimate_max_cll.then(|| {
-            MaxCLLEstimator::with_mode(
-                NonZeroUsize::new(pixel_count).expect("HDR analysis includes at least one pixel"),
-                max_cll_mode,
-            )
-        });
-        let mut luminance_white_point_estimator =
-            estimate_luminance_white_point.then(|| LuminanceWhitePointEstimator::new(pixel_count));
-        let mut max_cll_batch =
-            estimate_max_cll.then(|| Vec::with_capacity(HDR_BATCH_PIXELS.min(pixel_count)));
+        let request = AnalysisRequest {
+            selection,
+            pixel_count,
+            max_cll_mode,
+            estimate_max_cll,
+            estimate_luminance_white_point,
+            collect_hdr_metrics,
+        };
 
-        visit_pixels(source, row_stride, layout, |color, alpha| {
-            if selection.exclude_fully_transparent && alpha == 0.0 {
-                return;
-            }
-            if let Some(accumulator) = &mut accumulator {
-                accumulator.observe(color);
-            }
-            let color = LinearRGB::new(color);
-            if let Some(estimator) = &mut luminance_white_point_estimator {
-                estimator.observe(color);
-            }
-            if let Some(batch) = &mut max_cll_batch {
-                batch.push(color);
-                if batch.len() == HDR_BATCH_PIXELS {
-                    max_cll_estimator
-                        .as_mut()
-                        .expect("a MaxCLL batch has an estimator")
-                        .observe_many(batch);
-                    batch.clear();
-                }
-            }
-        })?;
+        // This pass used to run on one thread while the write pass that follows it was already
+        // parallel, which made it the largest serial block in an HDR decode. All three
+        // accumulators merge associatively, so the image can be split by row groups.
+        let rows_per_job = PARALLEL_PIXELS_PER_JOB.div_ceil(row_stride.max(1)).max(1);
+        let totals = if pixel_count < PARALLEL_PIXELS_MIN {
+            let mut totals = AnalysisTotals::new(&request);
+            totals.observe_slab(source, row_stride, layout, &request)?;
+            totals
+        } else {
+            source
+                .par_chunks(rows_per_job * row_stride)
+                .map(|slab| {
+                    let mut totals = AnalysisTotals::new(&request);
+                    totals.observe_slab(slab, row_stride, layout, &request)?;
+                    Ok(totals)
+                })
+                .try_reduce(
+                    || AnalysisTotals::new(&request),
+                    |mut left, right| {
+                        left.merge(right);
+                        Ok::<AnalysisTotals, Error>(left)
+                    },
+                )?
+        };
+
+        let AnalysisTotals {
+            accumulator,
+            mut max_cll_estimator,
+            luminance_white_point_estimator,
+            max_cll_batch,
+        } = totals;
+
         if let Some(batch) = &max_cll_batch {
             max_cll_estimator
                 .as_mut()
@@ -1155,63 +1275,6 @@ fn display_luminance_white_point() -> LuminanceWhitePoint {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct OrderedLuminance(f32);
-
-impl PartialEq for OrderedLuminance {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.to_bits() == other.0.to_bits()
-    }
-}
-
-impl Eq for OrderedLuminance {}
-
-impl PartialOrd for OrderedLuminance {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for OrderedLuminance {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.0.total_cmp(&other.0)
-    }
-}
-
-struct LuminanceWhitePointEstimator {
-    retained: usize,
-    luminances: BinaryHeap<Reverse<OrderedLuminance>>,
-}
-
-impl LuminanceWhitePointEstimator {
-    fn new(pixel_count: usize) -> Self {
-        invariant!(pixel_count > 0);
-        let retained = pixel_count / 10_000 + 1;
-
-        Self {
-            retained,
-            luminances: BinaryHeap::with_capacity(retained),
-        }
-    }
-
-    fn observe(&mut self, color: LinearRGB) {
-        let luminance = OrderedLuminance(color.luminance());
-
-        if self.luminances.len() < self.retained {
-            self.luminances.push(Reverse(luminance));
-        } else if let Some(mut threshold) = self.luminances.peek_mut()
-            && luminance > threshold.0
-        {
-            *threshold = Reverse(luminance);
-        }
-    }
-
-    fn finish(self) -> Option<LuminanceWhitePoint> {
-        self.luminances
-            .peek()
-            .and_then(|luminance| LuminanceWhitePoint::new(luminance.0.0))
-    }
-}
-
 struct HDRMetricAccumulator {
     pixel_count: u64,
     luminance_sum_nits: f64,
@@ -1248,6 +1311,20 @@ impl HDRMetricAccumulator {
             GamutMembership::DisplayP3Only => self.dci_p3_pixels += 1,
             GamutMembership::OutsideDisplayP3 => {}
         }
+    }
+
+    /// Folds `other` into these metrics.
+    ///
+    /// Counts add, extremes take the wider bound, and the luminance sum adds. Summation order
+    /// changes with the number of workers, so the average luminance can move by a rounding step
+    /// between runs on differently sized machines.
+    fn merge(&mut self, other: Self) {
+        self.pixel_count += other.pixel_count;
+        self.luminance_sum_nits += other.luminance_sum_nits;
+        self.max_luminance_nits = self.max_luminance_nits.max(other.max_luminance_nits);
+        self.min_luminance_nits = self.min_luminance_nits.min(other.min_luminance_nits);
+        self.rec709_pixels += other.rec709_pixels;
+        self.dci_p3_pixels += other.dci_p3_pixels;
     }
 
     fn finish(
@@ -1318,7 +1395,7 @@ fn sanitize_metric_sample(value: f32) -> f64 {
     }
 }
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     reason = "bounded metadata values are intentionally returned as the decoder's f32 scalar type"
 )]
@@ -1337,7 +1414,7 @@ fn percentage(part: u64, total: u64) -> f32 {
     percentage_from_u32(part, total)
 }
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     reason = "a bounded 0..=100 metadata percentage is intentionally stored as f32"
 )]
@@ -1517,7 +1594,7 @@ fn read_sample<T: FromBytes + Sized>(bytes: &[u8]) -> T {
     T::read_from_bytes(bytes).expect("JPEG XR sample length must match its encoding")
 }
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     reason = "s7.24 fixed-point values are intentionally converted to f32 for tone mapping"
 )]
@@ -1525,21 +1602,13 @@ fn fixed32_to_f32(value: i32) -> f32 {
     (f64::from(value) / 16_777_216.0) as f32
 }
 
+/// Widens an IEEE 754 binary16 sample to `f32`.
+///
+/// The hand-rolled decomposition this replaced called `powi` — a libm call — once per sample, and
+/// twice on the subnormal path. Widening is a single instruction wherever `f16c` or NEON is
+/// available, and a short branchless sequence where it is not.
 fn half_to_f32(bits: u16) -> f32 {
-    let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
-    let exponent = (bits >> 10) & 0x1f;
-    let mantissa = bits & 0x03ff;
-
-    match exponent {
-        0 if mantissa == 0 => sign * 0.0,
-        0 => sign * f32::from(mantissa) * 2.0_f32.powi(-24),
-        0x1f if mantissa == 0 => sign * f32::INFINITY,
-        0x1f => f32::NAN,
-        _ => {
-            let significand = 1.0 + f32::from(mantissa) / 1024.0;
-            sign * significand * 2.0_f32.powi(i32::from(exponent) - 15)
-        }
-    }
+    f32::from(f16::from_bits(bits))
 }
 
 fn decode_rgbe(pixel: &[u8]) -> Result<[f32; 3]> {
@@ -1598,7 +1667,7 @@ fn linear_to_srgb_simd(value: F32x8) -> F32x8 {
         .select(linear, nonlinear)
 }
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "the normalized sample is rounded and clamped to u8 before conversion"
@@ -1629,6 +1698,181 @@ fn codec_error(source: &jpegxr::Error) -> Error {
 mod tests {
     use super::*;
     use tonemapping::{ACESFitted, BT2446A, ExtendedLuminanceReinhard, ExtendedReinhard};
+
+    #[test]
+    fn display_pixel_batches_match_the_scalar_tail() {
+        // `write_display_pixels` vectorizes complete lane groups and falls back to
+        // `display_linear_to_srgb8` for the remainder. The two must agree exactly, or a pixel
+        // would change appearance depending on its position within the batch. Lengths straddle
+        // the lane boundary so both paths run on the same values.
+        let sample = |index: usize| {
+            let step = f32::from(u16::try_from(index).expect("test index fits u16"));
+            [
+                step * 0.013,
+                (1.0 - step * 0.017).max(0.0),
+                (step * 0.0007).min(1.5),
+            ]
+        };
+
+        for length in [1, 7, 8, 9, 15, 16, 17, 33] {
+            let colors: LinearRGBPlanes = (0..length).map(|i| LinearRGB::new(sample(i))).collect();
+            let alphas: Vec<u8> = (0..length)
+                .map(|i| u8::try_from(i % 256).expect("test alpha fits u8"))
+                .collect();
+
+            let mut batched = vec![[0_u8; 4]; length];
+            write_display_pixels(&colors, &alphas, &mut batched);
+
+            for (index, actual) in batched.into_iter().enumerate() {
+                let [red, green, blue] = display_linear_to_srgb8(LinearRGB::new(sample(index)));
+                assert_eq!(
+                    actual,
+                    [red, green, blue, alphas[index]],
+                    "pixel {index} of a {length}-pixel batch"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parallel_analysis_matches_the_sequential_pass() {
+        // Above `PARALLEL_PIXELS_MIN` the analysis splits across worker threads and folds the
+        // partial estimators back together. Below it, one thread does the whole image. The two
+        // must produce the same measurements, and the same image is run at both sizes rather than
+        // comparing against restated expectations.
+        let colors: Vec<[f32; 3]> = (0..PARALLEL_PIXELS_MIN + 4_096)
+            .map(|index| {
+                let step = f32::from(u16::try_from(index % 4_099).expect("test step fits u16"));
+                [
+                    step * 0.011,
+                    (400.0 - step * 0.017).max(0.0),
+                    step * 0.000_7 + 0.25,
+                ]
+            })
+            .collect();
+
+        let row_stride = 12 * 512;
+        let full = float_rgb_source(&colors);
+        assert_eq!(full.len() % row_stride, 0);
+
+        let parallel = HDRAnalysis::estimate(
+            &full,
+            row_stride,
+            float_rgb_layout(),
+            MaxCLLMode::Percentile99_99,
+            true,
+            true,
+            true,
+        )
+        .unwrap();
+
+        // The same pixels, analysed one row group at a time and folded by hand, which is the
+        // sequential path the parallel one has to agree with.
+        let request = AnalysisRequest {
+            selection: HDRPixelSelection::new(&full, row_stride, float_rgb_layout()).unwrap(),
+            pixel_count: colors.len(),
+            max_cll_mode: MaxCLLMode::Percentile99_99,
+            estimate_max_cll: true,
+            estimate_luminance_white_point: true,
+            collect_hdr_metrics: true,
+        };
+        let mut sequential = AnalysisTotals::new(&request);
+        sequential
+            .observe_slab(&full, row_stride, float_rgb_layout(), &request)
+            .unwrap();
+
+        let mut max_cll_estimator = sequential.max_cll_estimator.unwrap();
+        max_cll_estimator.observe_many(&sequential.max_cll_batch.unwrap());
+        let expected_max_cll = finish_max_cll(max_cll_estimator);
+        let expected_white_point = sequential
+            .luminance_white_point_estimator
+            .unwrap()
+            .finish()
+            .unwrap();
+
+        assert_eq!(
+            parallel.max_cll.unwrap().relative_light_level(),
+            expected_max_cll.relative_light_level()
+        );
+        assert_eq!(parallel.max_cll.unwrap().channel, expected_max_cll.channel);
+        assert_eq!(
+            parallel.luminance_white_point.unwrap().luminance(),
+            expected_white_point.luminance()
+        );
+
+        let metrics = parallel.hdr_metrics.unwrap();
+        let expected = sequential.accumulator.unwrap().finish(
+            expected_max_cll,
+            MaxCLLMode::Percentile99_99,
+            Some(expected_white_point),
+        );
+
+        assert_eq!(metrics.max_luminance_nits, expected.max_luminance_nits);
+        assert_eq!(metrics.min_luminance_nits, expected.min_luminance_nits);
+        assert_eq!(metrics.rec709_percentage, expected.rec709_percentage);
+        assert_eq!(metrics.dci_p3_percentage, expected.dci_p3_percentage);
+
+        // Summation order differs between the two, so the mean agrees to a rounding step rather
+        // than to the bit.
+        assert_approximately_equal(
+            metrics.average_luminance_nits,
+            expected.average_luminance_nits,
+            expected.average_luminance_nits * 1.0e-5,
+        );
+    }
+
+    #[test]
+    fn binary16_widening_round_trips_every_bit_pattern() {
+        // Exhaustive over the whole input domain, which is only 65,536 values. Round-tripping back
+        // to binary16 is an independent property: it holds for the correct widening and fails for
+        // any that misplaces the exponent bias, drops the implicit bit, or mishandles subnormals.
+        for bits in 0..=u16::MAX {
+            let widened = half_to_f32(bits);
+            let exponent = (bits >> 10) & 0x1f;
+            let mantissa = bits & 0x03ff;
+
+            if exponent == 0x1f && mantissa != 0 {
+                assert!(widened.is_nan(), "{bits:#06x} should widen to NaN");
+                continue;
+            }
+
+            assert_eq!(
+                (widened as f16).to_bits(),
+                bits,
+                "{bits:#06x} did not survive the round trip"
+            );
+
+            // Independently reconstruct the value from the binary16 field definitions.
+            let sign = if bits & 0x8000 == 0 { 1.0 } else { -1.0 };
+            let expected = if exponent == 0x1f {
+                sign * f32::INFINITY
+            } else if exponent == 0 {
+                sign * f32::from(mantissa) * 2.0_f32.powi(-24)
+            } else {
+                sign * (1.0 + f32::from(mantissa) / 1024.0) * 2.0_f32.powi(i32::from(exponent) - 15)
+            };
+            assert_eq!(
+                widened.to_bits(),
+                expected.to_bits(),
+                "{bits:#06x} widened to the wrong value"
+            );
+        }
+    }
+
+    #[test]
+    fn binary16_widening_places_the_documented_values() {
+        // Spot values taken from the IEEE 754 binary16 definition, not from any implementation.
+        assert_eq!(half_to_f32(0x0000), 0.0);
+        assert!(half_to_f32(0x8000).is_sign_negative());
+        assert_eq!(half_to_f32(0x3c00), 1.0);
+        assert_eq!(half_to_f32(0xc000), -2.0);
+        assert_eq!(half_to_f32(0x3555), 0.333_251_95);
+        // Largest finite binary16, and the smallest positive subnormal.
+        assert_eq!(half_to_f32(0x7bff), 65_504.0);
+        assert_eq!(half_to_f32(0x0001), 2.0_f32.powi(-24));
+        assert!(half_to_f32(0x7c00).is_infinite());
+        assert!(half_to_f32(0x7e00).is_nan());
+    }
 
     #[test]
     #[ignore = "requires JPEGXR_SAMPLE to name a local HDR image"]

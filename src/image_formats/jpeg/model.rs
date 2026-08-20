@@ -5,11 +5,10 @@ use rayon::prelude::*;
 
 use super::{
     BLOCK_SIDE, COMPONENTS_MAX, DIMENSION_MAX, DecodedImage, Error, JPEGError, JPEGLimit,
-    JPEGTableKind, PIXELS_MAX, PROGRESSIVE_COEFFICIENT_BYTES_MAX, Result, divide_ceil, error, idct,
+    JPEGTableKind, PARALLEL_PIXELS_MIN, PARALLEL_PIXELS_PER_JOB, PIXELS_MAX,
+    PROGRESSIVE_COEFFICIENT_BYTES_MAX, Result, divide_ceil, error, idct,
 };
 
-const PARALLEL_PIXELS_MIN: usize = 256 * 1024;
-const PARALLEL_PIXELS_PER_JOB: usize = 64 * 1024;
 const PARALLEL_BLOCKS_MIN: usize = 4 * 1024;
 const PARALLEL_BLOCKS_PER_JOB: usize = 1_024;
 
@@ -181,13 +180,22 @@ impl Frame {
     fn rgba_pixels_parallel(&self, transform: ColorTransform, capacity: usize) -> Vec<u8> {
         let width = usize::try_from(self.width).expect("validated JPEG width fits usize");
         let mut rgba = vec![0; capacity];
-        rgba.par_chunks_exact_mut(4)
-            .with_min_len(PARALLEL_PIXELS_PER_JOB)
+
+        // Chunk by row, not by pixel. Chunking by pixel discards the coordinates and then recovers
+        // them with a division and a remainder per pixel; as rows, the row index is the chunk index
+        // and the column is an induction variable.
+        rgba.par_chunks_mut(width * 4)
+            .with_min_len(PARALLEL_PIXELS_PER_JOB / width.max(1))
             .enumerate()
-            .for_each(|(index, target)| {
-                let x = u32::try_from(index % width).expect("JPEG pixel x fits u32");
-                let y = u32::try_from(index / width).expect("JPEG pixel y fits u32");
-                target.copy_from_slice(&self.rgba_pixel(x, y, transform));
+            .for_each(|(row_index, row)| {
+                let y = u32::try_from(row_index).expect("JPEG pixel y fits u32");
+                let (targets, remainder) = row.as_chunks_mut::<4>();
+                invariant_eq!(remainder.len(), 0);
+
+                for (column_index, target) in targets.iter_mut().enumerate() {
+                    let x = u32::try_from(column_index).expect("JPEG pixel x fits u32");
+                    *target = self.rgba_pixel(x, y, transform);
+                }
             });
         rgba
     }
@@ -210,10 +218,20 @@ impl Frame {
 
         let component = &self.components[component_index];
 
-        let sample_x =
-            x * u32::from(component.horizontal_sampling) / u32::from(self.max_horizontal_sampling);
-        let sample_y =
-            y * u32::from(component.vertical_sampling) / u32::from(self.max_vertical_sampling);
+        // An unsubsampled component — always the case for luma, and for every component of a
+        // 4:4:4 image — maps position to sample directly. Taking that branch keeps two integer
+        // divisions out of the per-pixel path, and it predicts perfectly because the sampling
+        // factors are fixed for the whole frame.
+        let sample_x = if component.horizontal_sampling == self.max_horizontal_sampling {
+            x
+        } else {
+            x * u32::from(component.horizontal_sampling) / u32::from(self.max_horizontal_sampling)
+        };
+        let sample_y = if component.vertical_sampling == self.max_vertical_sampling {
+            y
+        } else {
+            y * u32::from(component.vertical_sampling) / u32::from(self.max_vertical_sampling)
+        };
 
         let index = u64::from(sample_y) * u64::from(component.plane_width) + u64::from(sample_x);
         let index = usize::try_from(index).expect("the bounded component plane index fits usize");
@@ -452,7 +470,7 @@ fn convert_color(first: u8, second: u8, third: u8, transform: ColorTransform) ->
     }
 }
 
-#[allow(
+#[expect(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     reason = "YCbCr conversion values are rounded and clamped to u8 before conversion"
@@ -525,6 +543,64 @@ mod tests {
 
         component.coefficients = vec![coefficients; block_count];
         component
+    }
+
+    #[test]
+    fn subsampled_components_replicate_across_the_parallel_and_sequential_paths() {
+        // 4:2:0 chroma: the two chroma planes are half resolution in both axes, so the sampling
+        // branch in `sample` is taken for them and not for luma. The image is above
+        // `PARALLEL_PIXELS_MIN` so the row-chunked parallel path runs, and the expectation is
+        // built from the plane contents directly rather than by calling `sample`.
+        let width = 512_u32;
+        let height = 512_u32;
+
+        let mut luma = component(width, height, |index| {
+            u8::try_from(index % 251).expect("test sample fits u8")
+        });
+        luma.horizontal_sampling = 2;
+        luma.vertical_sampling = 2;
+
+        let chroma = |offset: usize| {
+            let mut plane = component(width / 2, height / 2, move |index| {
+                u8::try_from((index * 7 + offset) % 241).expect("test sample fits u8")
+            });
+            plane.horizontal_sampling = 1;
+            plane.vertical_sampling = 1;
+            plane
+        };
+
+        let mut frame = frame(width, height, vec![luma, chroma(11), chroma(23)]);
+        frame.max_horizontal_sampling = 2;
+        frame.max_vertical_sampling = 2;
+
+        let planes: Vec<Vec<u8>> = frame
+            .components
+            .iter()
+            .map(|component| component.plane.clone())
+            .collect();
+
+        let image = frame.into_image(ColorTransform::YCbCr);
+        let (parallel, remainder) = image.rgba8().as_chunks::<4>();
+        assert_eq!(remainder.len(), 0);
+
+        for y in 0..height {
+            for x in 0..width {
+                let luma_index = (y * width + x) as usize;
+                let chroma_index = ((y / 2) * (width / 2) + x / 2) as usize;
+                let expected = convert_color(
+                    planes[0][luma_index],
+                    planes[1][chroma_index],
+                    planes[2][chroma_index],
+                    ColorTransform::YCbCr,
+                );
+
+                assert_eq!(
+                    parallel[(y * width + x) as usize],
+                    expected,
+                    "pixel ({x}, {y})"
+                );
+            }
+        }
     }
 
     #[test]

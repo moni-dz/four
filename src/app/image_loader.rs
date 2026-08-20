@@ -30,7 +30,7 @@ pub(super) struct LoadError {
 impl LoadError {
     pub(super) fn new(message: impl Into<String>) -> Self {
         let message = message.into();
-        invariant!(!message.is_empty());
+        assert_ne!(message.len(), 0);
         Self { message }
     }
 }
@@ -54,7 +54,7 @@ pub(super) fn format_load_error(error: &LoadException) -> String {
 
     for _ in 0..ERROR_FRAMES_MAX {
         let Some(child) = frame.children().first() else {
-            invariant!(!message.is_empty());
+            assert_ne!(message.len(), 0);
             return message;
         };
 
@@ -66,7 +66,7 @@ pub(super) fn format_load_error(error: &LoadException) -> String {
         message.push_str(": additional error context omitted");
     }
 
-    invariant!(!message.is_empty());
+    assert_ne!(message.len(), 0);
     message
 }
 
@@ -131,14 +131,14 @@ pub(super) struct ImageMetadata {
 impl ImageMetadata {
     fn new(path: &Path, decoded: &DecodedImageState) -> Self {
         let (width, height) = decoded.image.dimensions();
-        invariant!(width > 0);
-        invariant!(height > 0);
-        invariant!(decoded.byte_count <= IMAGE_FILE_BYTES_MAX);
+        assert!(width > 0);
+        assert!(height > 0);
+        assert!(decoded.byte_count <= IMAGE_FILE_BYTES_MAX);
 
         let divisor = greatest_common_divisor(width, height);
         let pixel_count = u64::from(width) * u64::from(height);
         let (pixels, remainder) = decoded.image.rgba8().as_chunks::<4>();
-        invariant!(remainder.is_empty());
+        assert_eq!(remainder.len(), 0);
         let transparency = pixels.iter().any(|pixel| pixel[3] != u8::MAX);
 
         let mut fields = vec![
@@ -168,7 +168,7 @@ impl ImageMetadata {
             if transparency { "Present" } else { "None" },
         ));
 
-        invariant!(fields.iter().all(|field| !field.value.is_empty()));
+        assert!(fields.iter().all(|field| !field.value.is_empty()));
         Self {
             fields,
             has_hdr_metrics,
@@ -186,8 +186,8 @@ pub(super) struct MetadataField {
 impl MetadataField {
     fn new(label: &'static str, value: impl Into<SharedString>) -> Self {
         let value = value.into();
-        invariant!(!label.is_empty());
-        invariant!(!value.is_empty());
+        assert_ne!(label.len(), 0);
+        assert_ne!(value.len(), 0);
         Self {
             label,
             value,
@@ -245,7 +245,7 @@ impl SourceFormat {
             return Self::TIFF;
         }
 
-        if bytes.starts_with(&jpeg::SIGNATURE) {
+        if jpeg::has_signature(bytes) {
             return Self::JPEG;
         }
 
@@ -431,14 +431,14 @@ fn jpeg_xr_hdr_fields(metadata: jpeg_xr::JPEGXRMetadata) -> [MetadataField; 6] {
 }
 
 fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
-    invariant!(left > 0);
-    invariant!(right > 0);
+    assert!(left > 0);
+    assert!(right > 0);
 
     while right != 0 {
         (left, right) = (right, left % right);
     }
 
-    invariant!(left > 0);
+    assert!(left > 0);
     left
 }
 
@@ -465,8 +465,8 @@ fn format_pixel_count(pixels: u64) -> String {
 }
 
 fn format_hundredths(value: u64, unit: u64, suffix: &str) -> String {
-    invariant!(unit > 0);
-    invariant!(!suffix.is_empty());
+    assert!(unit > 0);
+    assert_ne!(suffix.len(), 0);
 
     let scaled = value
         .checked_mul(100)
@@ -554,7 +554,7 @@ pub(super) fn load_image_with_options_and_hdr_metrics(
         status: format!("{} — {width} × {height}", display_file_name(path)).into(),
     };
 
-    invariant!(!loaded.status.is_empty());
+    assert_ne!(loaded.status.len(), 0);
     Ok(loaded)
 }
 

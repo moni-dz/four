@@ -20,6 +20,20 @@ const DIMENSION_MAX: u32 = 16_384;
 const PIXELS_MAX: u64 = 64 * 1024 * 1024;
 const RGBA_BYTES_PER_PIXEL: u32 = 4;
 
+/// Pixel count below which a decoder normalizes on the calling thread.
+///
+/// Spawning rayon jobs costs more than it saves for a small image, and the viewer opens far more
+/// small images than large ones. A quarter of a megapixel is roughly where the two balance on a
+/// typical desktop; it is a threshold, not a measured optimum, so moving it changes throughput
+/// rather than correctness.
+const PARALLEL_PIXELS_MIN: usize = 256 * 1024;
+
+/// Pixels per rayon job once a decoder does go parallel.
+///
+/// Large enough that per-job overhead is negligible, small enough that a four-megapixel image
+/// still splits into enough jobs to fill a many-core machine.
+const PARALLEL_PIXELS_PER_JOB: usize = 64 * 1024;
+
 /// Owned RGBA8 pixels produced by one of our format parsers.
 ///
 /// Keeping this type independent of GPUI makes the parsers usable in tests and keeps the boundary

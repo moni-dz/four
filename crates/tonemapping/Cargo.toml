@@ -7,8 +7,10 @@ publish = false
 
 [dependencies]
 multiversion = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
+divan = { workspace = true }
 mimalloc = { workspace = true }
 
 [lints]
@@ -17,4 +19,3 @@ workspace = true
 [[bench]]
 name = "bulk"
 harness = false
-test = false

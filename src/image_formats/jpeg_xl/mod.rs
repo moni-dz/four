@@ -27,8 +27,7 @@ const DECODER_MEMORY_MAX: usize = 512 * 1024 * 1024;
 
 /// Returns whether `bytes` begins with a standard JPEG XL signature.
 #[must_use]
-pub fn has_signature(bytes: impl AsRef<[u8]>) -> bool {
-    let bytes = bytes.as_ref();
+pub fn has_signature(bytes: &[u8]) -> bool {
     bytes.starts_with(&CODESTREAM_SIGNATURE) || bytes.starts_with(&CONTAINER_SIGNATURE)
 }
 

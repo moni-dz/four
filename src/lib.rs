@@ -1,4 +1,4 @@
-#![feature(portable_simd)]
+#![feature(f16, f32_from_f16, portable_simd)]
 #![warn(missing_docs)]
 //! Decodes images into a small, format-independent RGBA representation.
 //!

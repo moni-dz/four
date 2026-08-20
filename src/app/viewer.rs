@@ -65,7 +65,7 @@ impl ViewerState {
     }
 
     fn apply_result(&mut self, result: LoadResult<LoadedImage>) {
-        invariant!(!self.status().is_empty());
+        assert!(!self.status().is_empty());
 
         let previous_image = self.displayed().cloned();
         *self = match result {
@@ -81,7 +81,7 @@ impl ViewerState {
             },
         };
 
-        invariant!(!self.status().is_empty());
+        assert!(!self.status().is_empty());
     }
 
     fn status(&self) -> &SharedString {
@@ -92,7 +92,7 @@ impl ViewerState {
             Self::Loaded(state) => &state.status,
         };
 
-        invariant!(!status.is_empty());
+        assert_ne!(status.len(), 0);
         status
     }
 
@@ -222,8 +222,8 @@ impl Root {
         position.x = position.x.max(px(0.0));
         position.y = position.y.max(px(DRAG_REGION_HEIGHT));
 
-        invariant!(position.x >= px(0.0));
-        invariant!(position.y >= px(DRAG_REGION_HEIGHT));
+        assert!(position.x >= px(0.0));
+        assert!(position.y >= px(DRAG_REGION_HEIGHT));
 
         self.tone_mapping_menu_open = false;
         self.context_menu_position = Some(position);
@@ -270,7 +270,7 @@ impl Root {
     }
 
     fn open_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        invariant!(!self.viewer.status().is_empty());
+        assert!(!self.viewer.status().is_empty());
 
         self.context_menu_position = None;
         self.tone_mapping_menu_open = false;
@@ -374,7 +374,7 @@ impl Root {
             return false;
         }
 
-        invariant!(!self.viewer.status().is_empty());
+        assert!(!self.viewer.status().is_empty());
         self.context_menu_position = None;
 
         let load_succeeded = result.is_ok();
@@ -384,7 +384,7 @@ impl Root {
             self.tone_mapping_menu_open = false;
         }
 
-        invariant!(!self.viewer.status().is_empty());
+        assert!(!self.viewer.status().is_empty());
         true
     }
 
@@ -397,7 +397,7 @@ impl Root {
             return false;
         }
 
-        invariant!(!self.viewer.status().is_empty());
+        assert!(!self.viewer.status().is_empty());
         self.context_menu_position = None;
 
         let displayed_options = self
@@ -420,7 +420,7 @@ impl Root {
 
         self.tone_mapping_menu_open = false;
 
-        invariant!(!self.viewer.status().is_empty());
+        assert!(!self.viewer.status().is_empty());
         true
     }
 
@@ -536,8 +536,8 @@ impl Root {
         metadata_visible: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        invariant!(position.x >= px(0.0));
-        invariant!(position.y >= px(DRAG_REGION_HEIGHT));
+        assert!(position.x >= px(0.0));
+        assert!(position.y >= px(DRAG_REGION_HEIGHT));
 
         deferred(
             div()
@@ -582,7 +582,7 @@ impl Root {
         hdr_options: Option<HDROptions>,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        invariant!(!metadata.fields.is_empty());
+        assert_ne!(metadata.fields.len(), 0);
 
         div()
             .absolute()
@@ -833,8 +833,8 @@ impl Root {
 
 impl Render for Root {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        invariant!(!self.viewer.status().is_empty());
-        invariant!(
+        assert!(!self.viewer.status().is_empty());
+        assert!(
             self.context_menu_position
                 .is_none_or(|position| position.x >= px(0.0))
         );
@@ -912,8 +912,8 @@ const fn context_menu_height(has_image: bool) -> f32 {
 }
 
 fn menu_item(identifier: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
-    invariant!(!identifier.is_empty());
-    invariant!(!label.is_empty());
+    assert_ne!(identifier.len(), 0);
+    assert_ne!(label.len(), 0);
 
     div()
         .id(identifier)
@@ -957,8 +957,8 @@ fn tone_mapping_menu_item(
 }
 
 fn metadata_field(field: &MetadataField) -> gpui::Div {
-    invariant!(!field.label.is_empty());
-    invariant!(!field.value.is_empty());
+    assert_ne!(field.label.len(), 0);
+    assert_ne!(field.value.len(), 0);
 
     div()
         .w_full()
@@ -989,7 +989,7 @@ pub(super) fn initial_viewer(path: Option<&Path>) -> ViewerState {
         None => ViewerState::empty(),
     };
 
-    invariant!(!viewer.status().is_empty());
+    assert!(!viewer.status().is_empty());
     viewer
 }
 

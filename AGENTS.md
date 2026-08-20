@@ -1,5 +1,105 @@
 <!-- Copyright (c) Microsoft Corporation. Licensed under the MIT license. -->
 
+# four — project conventions
+
+Everything below the `Pragmatic Rust Guidelines` heading is the unmodified upstream document and
+contains no project-specific content. This section is the project delta and takes precedence where
+the two disagree.
+
+## Layout
+
+- `four` (root crate) — the gpui viewer plus six format decoders under `src/image_formats/`. The
+  binary in `src/app/` consumes the library through `use four::…` rather than reaching into it.
+- `crates/jpegxr` — a standalone T.832 JPEG XR codec. Decode only, borrowed input, no I/O, no
+  color science. It is shaped to be published on its own, so it must not gain a dependency on
+  anything in the root crate.
+- `crates/tonemapping` — the HDR operators. A leaf crate; it depends on nothing in the workspace.
+
+`src/image_formats/jpeg_xr/` is not a second JPEG XR decoder. It is the HDR-to-SDR pipeline that
+sits on top of `crates/jpegxr`: PQ to scRGB, MaxCLL and gamut analysis, tone mapping, sRGB encoding.
+
+## Portability and target features
+
+Do not add `.cargo/config.toml` with `-C target-cpu`. Runtime dispatch through `multiversion` is
+the portability policy for this project — a fixed `target-cpu` would either defeat the dispatchers
+or produce a binary that will not start on older hardware. M-TARGET-CPU is satisfied by documenting
+that decision here.
+
+Use `#[multiversion(targets = "simd")]`. The `"simd"` shorthand expands to a maintained list
+(`x86_64+avx2+fma`, `x86_64+sse4.2`, `x86+avx2+fma`, `x86+sse4.2`, `x86+sse2`, `aarch64+neon`), so
+no target list should be spelled out by hand. Spell one out only to reach AVX-512, which the
+shorthand deliberately omits.
+
+**`#[multiversion]` goes on the outermost function that owns a pixel loop.** Never on a leaf helper,
+and never on anything marked `#[inline]`. A multiversioned function expands into a
+feature-detecting dispatcher that cannot be inlined, so annotating a leaf both blocks inlining and
+leaves the surrounding loop compiled at the baseline target. A leaf inherits target features only
+by being inlined *into* the annotated function. See `src/image_formats/jpeg/idct.rs` for the shape
+to copy.
+
+## Scalar and SIMD pairs
+
+Several kernels exist twice, once scalar and once vectorized, with a test asserting the two agree
+bit-for-bit. Where that pairing exists, **both paths must use the same primitives in the same
+association order**. Do not write `powf` in one and `log2`/`exp2` in the other, and never introduce
+`mul_add` in only one of the two — the pair no longer has f64 headroom to absorb the difference.
+Association counts as much as choice of function: `-k * x.powi(2)` and `-k * x * x` are different
+computations in f32.
+
+`crates/tonemapping/src/transcendental.rs` is written once over `Simd<f32, N>` and evaluated at
+`N == 1` for the scalar path, so parity there holds by construction rather than by review. Prefer
+that shape for any new pair.
+
+The exception is an operator built on `algebraic_*` operations, which explicitly license the
+compiler to reassociate — it will do so differently for one lane than for eight once optimizations
+are on. Such an operator gets a tolerance assertion, not a bit-exact one, and must say so in its
+own documentation. `Mobius` is the only one today. Note that this class of divergence appears only
+in release builds, which is why CI runs the tests in both profiles.
+
+## Errors
+
+`exn` and `thiserror` are two different strategies, not complementary tools. **Never combine them
+in one error module.**
+
+- The `four` package is the application. It uses `exn` throughout, including `src/image_formats/`:
+  `pub type Error = exn::Exn<XError>` with a hand-written `Display` and a `#[track_caller]` `error`
+  helper that raises at the validation site so the propagation frames are useful.
+- `crates/jpegxr` and `crates/tonemapping` are library crates. They use `thiserror` and plain
+  `std::result::Result`, and they do not depend on `exn`.
+
+The boilerplate in the application's error modules — the repeated `Display` arms and the
+`write_limit_error` helpers — is the cost of that choice. Do not "reduce" it by deriving `thiserror`
+on an `exn` error type: it compiles, but it mixes the two idioms.
+
+## Unsafe
+
+`crates/jpegxr` is `#![forbid(unsafe_code)]` and stays that way: it parses untrusted input, and
+saving a bounds check is not worth the trade. Elsewhere the workspace lints set
+`unsafe_code = "warn"`, so any use needs an `#[expect]`, the plain-text safety argument M-UNSAFE
+requires, a benchmark showing the win, and a Miri run. Reach for slicing and `zerocopy` first —
+`zerocopy` is a workspace dependency for exactly this reason, and the root crate already enables
+its `simd` and `float-nightly` features.
+
+## Lint overrides
+
+Use `#[expect(..., reason = "…")]`, never `#[allow]` (M-LINT-OVERRIDE-EXPECT). This is enforced in
+practice, not just by policy: converting the tree to `#[expect]` immediately surfaced two
+suppressions that no longer applied.
+
+## Benchmarks and golden output
+
+Benchmarks use `divan`. `crates/jpegxr/src/lib.rs` carries a crate-level `#[expect]` that suppresses
+the complexity lints; it is a known debt, not a standing exemption.
+
+`tests/decode_golden.rs` is the gate that matters. It pins the decoded output of every fixture in
+`tests/fixtures/`. A change that claims not to alter output must leave it byte-identical. A change
+that legitimately alters output re-records it in its own commit, with the reason and the magnitude
+of the pixel difference stated in the commit message. Re-recording a golden to make a build pass,
+without that justification, is the one thing this file exists to prevent.
+
+---
+
+
 # Pragmatic Rust Guidelines
 
 This file contains all guidelines concatenated for easy reference.
