@@ -3,8 +3,8 @@
 //! [`Decoder`] validates the Annex A tag container and embedded T.832 codestream headers before
 //! coefficient decoding begins. Input is borrowed, so inspection does not copy compressed data.
 //! Pixel reconstruction supports the native Windows HDR screenshot profiles for packed
-//! `BGR101010` and `RGBA128Float` pixels. Other valid profiles return a precise
-//! [`ErrorKind::Unsupported`] error.
+//! `BGR101010` and `RGBA128Float` pixels. Other valid profiles return a precise error where
+//! [`Error::is_unsupported`] returns `true`.
 
 #![forbid(unsafe_code)]
 #![feature(portable_simd)]
@@ -34,7 +34,9 @@ pub use codestream::{
     Bands, CodestreamInfo, InternalColorFormat, OutputBitDepth, OutputColorFormat, OverlapMode,
 };
 pub use container::{PixelFormat, Resolution};
-pub use error::{Error, ErrorKind, Result};
+pub use error::{Error, Result};
+
+use error::ErrorKind;
 
 use codestream::ParsedCodestream;
 use container::Container;
@@ -468,6 +470,7 @@ mod tests {
         file[..4].copy_from_slice(&super::SIGNATURE);
         file[4..8].copy_from_slice(&8_u32.to_le_bytes());
         file[8..10].copy_from_slice(&5_u16.to_le_bytes());
+
         write_entry(&mut file, 10, 0xBC01, 1, 16, pixel_offset);
         write_entry(&mut file, 22, 0xBC80, 4, 1, 16);
         write_entry(&mut file, 34, 0xBC81, 4, 1, 16);

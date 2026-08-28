@@ -11,10 +11,10 @@ pub type Error = exn::Exn<PNGError>;
 pub type Result<T> = exn::Result<T, PNGError>;
 
 /// A PNG decoding failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum PNGError {
     /// The underlying PNG codec rejected the datastream.
-    Codec(String),
+    Codec(Box<dyn std::error::Error + Send + Sync + 'static>),
     /// Input exceeded an explicit decoder resource limit.
     LimitExceeded(PNGLimit),
     /// Decoded samples violated the codec adapter's output contract.
@@ -27,19 +27,39 @@ pub enum PNGError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PNGLimit {
     /// Maximum memory available to the underlying codec.
+    ///
+    /// The `png` crate's `DecodingError::LimitsExceeded` carries no observed byte count, so
+    /// only the configured maximum can be reported here.
     CodecMemory(usize),
     /// Maximum decoded byte count accepted from the codec.
-    DecodedBytes(usize),
+    DecodedBytes {
+        /// The decoded byte count that exceeded `max`.
+        actual: usize,
+        /// The configured maximum decoded byte count.
+        max: usize,
+    },
     /// Maximum accepted width or height in pixels.
-    Dimensions(u32),
+    Dimensions {
+        /// The observed width that exceeded `max`, in pixels.
+        actual_width: u32,
+        /// The observed height that exceeded `max`, in pixels.
+        actual_height: u32,
+        /// The configured maximum width or height, in pixels.
+        max: u32,
+    },
     /// Maximum accepted decoded pixel count.
-    Pixels(u64),
+    Pixels {
+        /// The pixel count that exceeded `max`.
+        actual: u64,
+        /// The configured maximum pixel count.
+        max: u64,
+    },
 }
 
 impl fmt::Display for PNGError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Codec(detail) => write!(f, "PNG codec error: {detail}"),
+            Self::Codec(source) => write!(f, "PNG codec error: {source}"),
             Self::LimitExceeded(limit) => write_limit_error(f, *limit),
             Self::Output(detail) => f.write_str(detail),
             Self::Signature => f.write_str("input does not begin with the PNG signature"),
@@ -47,7 +67,14 @@ impl fmt::Display for PNGError {
     }
 }
 
-impl std::error::Error for PNGError {}
+impl std::error::Error for PNGError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Codec(source) => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// Raises a leaf error at its validation site.
 #[track_caller]
@@ -66,17 +93,24 @@ fn write_limit_error(formatter: &mut fmt::Formatter<'_>, limit: PNGLimit) -> fmt
             "PNG codec memory exceeds the {} MiB limit",
             max / 1024 / 1024
         ),
-        PNGLimit::DecodedBytes(max) => write!(
+        PNGLimit::DecodedBytes { actual, max } => write!(
             formatter,
-            "PNG decoded output exceeds the {} MiB limit",
+            "PNG decoded output of {} MiB exceeds the {} MiB limit",
+            actual / 1024 / 1024,
             max / 1024 / 1024
         ),
-        PNGLimit::Dimensions(max) => {
-            write!(formatter, "PNG dimensions exceed the {max}-pixel limit")
-        }
-        PNGLimit::Pixels(max) => write!(
+        PNGLimit::Dimensions {
+            actual_width,
+            actual_height,
+            max,
+        } => write!(
             formatter,
-            "PNG pixel count exceeds the {}-megapixel limit",
+            "PNG dimensions {actual_width}x{actual_height} exceed the {max}-pixel limit"
+        ),
+        PNGLimit::Pixels { actual, max } => write!(
+            formatter,
+            "PNG pixel count of {} megapixels exceeds the {}-megapixel limit",
+            actual / 1024 / 1024,
             max / 1024 / 1024
         ),
     }

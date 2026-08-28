@@ -128,6 +128,7 @@ pub fn encode_bmp(image: &DecodedImage) -> Vec<u8> {
     bmp.extend_from_slice(&file_bytes.to_le_bytes());
     bmp.extend_from_slice(&[0; 4]);
     bmp.extend_from_slice(&BMP_HEADER_BYTES.to_le_bytes());
+
     bmp.extend_from_slice(&BMP_DIB_HEADER_BYTES.to_le_bytes());
     bmp.extend_from_slice(&width_i32.to_le_bytes());
     bmp.extend_from_slice(&(-height_i32).to_le_bytes());
@@ -136,6 +137,7 @@ pub fn encode_bmp(image: &DecodedImage) -> Vec<u8> {
     bmp.extend_from_slice(&BMP_BITFIELDS_COMPRESSION.to_le_bytes());
     bmp.extend_from_slice(&pixel_bytes.to_le_bytes());
     bmp.extend_from_slice(&[0; 16]);
+
     bmp.extend_from_slice(&BMP_RED_MASK.to_le_bytes());
     bmp.extend_from_slice(&BMP_GREEN_MASK.to_le_bytes());
     bmp.extend_from_slice(&BMP_BLUE_MASK.to_le_bytes());

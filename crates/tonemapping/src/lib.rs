@@ -1,4 +1,4 @@
-#![feature(portable_simd)]
+#![feature(error_generic_member_access, portable_simd)]
 #![warn(missing_docs)]
 //! Maps high-dynamic-range linear RGB colors into a displayable range.
 //!
@@ -40,6 +40,7 @@
 //! [Smith and Zink]: https://doi.org/10.5594/JMI.2021.3090176
 
 use multiversion::multiversion;
+use std::backtrace::Backtrace;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 use std::fmt;
@@ -220,19 +221,74 @@ impl LinearRGBPlanes {
             self.set_color(index, mapper.map(self.color(index)));
         }
     }
+
+    /// Returns an iterator over the stored colors in insertion order.
+    #[must_use]
+    pub const fn iter(&self) -> Iter<'_> {
+        Iter {
+            planes: self,
+            index: 0,
+        }
+    }
 }
 
 impl FromIterator<LinearRGB> for LinearRGBPlanes {
     fn from_iter<T: IntoIterator<Item = LinearRGB>>(iter: T) -> Self {
         let colors = iter.into_iter();
         let (lower, _) = colors.size_hint();
+
         let mut planes = Self::with_capacity(lower);
         for color in colors {
             planes.push(color);
         }
+
         planes
     }
 }
+
+impl<'a> IntoIterator for &'a LinearRGBPlanes {
+    type Item = LinearRGB;
+    type IntoIter = Iter<'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
+impl Extend<LinearRGB> for LinearRGBPlanes {
+    fn extend<T: IntoIterator<Item = LinearRGB>>(&mut self, iter: T) {
+        for color in iter {
+            self.push(color);
+        }
+    }
+}
+
+/// An iterator over the colors stored in a [`LinearRGBPlanes`].
+#[derive(Debug)]
+pub struct Iter<'a> {
+    planes: &'a LinearRGBPlanes,
+    index: usize,
+}
+
+impl Iterator for Iter<'_> {
+    type Item = LinearRGB;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.planes.len() {
+            return None;
+        }
+        let color = self.planes.color(self.index);
+        self.index += 1;
+        Some(color)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.planes.len() - self.index;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for Iter<'_> {}
 
 /// Maps a linear HDR color into display-linear RGB.
 pub trait ToneMapper {
@@ -340,6 +396,12 @@ macro_rules! define_tone_mapping_methods {
             /// Resolves this method with image-specific white points.
             ///
             /// Methods that do not use one or both white points ignore those arguments.
+            ///
+            /// # Panics
+            ///
+            /// Never panics: [`Mobius`] is the only method built from a caller-visible parameter
+            /// (a fixed `0.3` transition), and that value is always a valid transition below
+            /// display white.
             #[must_use]
             pub fn resolve(
                 self,
@@ -475,6 +537,7 @@ define_tone_mapping_methods! {
         label: "Mobius",
         mapper: Mobius = |_, luminance_white_point| {
             Mobius::new(luminance_white_point, 0.3)
+                .expect("0.3 is a positive finite transition below display white")
         },
         uses_white_point: false,
         uses_luminance_white_point: true,
@@ -488,19 +551,24 @@ pub struct WhitePoint(f32);
 impl WhitePoint {
     /// Creates a white point from a positive finite linear-light level.
     ///
-    /// Returns `None` when `level` is zero, negative, or non-finite.
+    /// # Errors
+    ///
+    /// Returns [`WhitePointError`] when `level` is zero, negative, or non-finite.
     ///
     /// # Examples
     ///
     /// ```
     /// use tonemapping::WhitePoint;
     ///
-    /// assert_eq!(WhitePoint::new(4.0).map(WhitePoint::level), Some(4.0));
-    /// assert!(WhitePoint::new(0.0).is_none());
+    /// assert_eq!(WhitePoint::new(4.0).map(WhitePoint::level), Ok(4.0));
+    /// assert!(WhitePoint::new(0.0).is_err());
     /// ```
-    #[must_use]
-    pub fn new(level: f32) -> Option<Self> {
-        (level.is_finite() && level > 0.0).then_some(Self(level))
+    pub fn new(level: f32) -> Result<Self, WhitePointError> {
+        if level.is_finite() && level > 0.0 {
+            Ok(Self(level))
+        } else {
+            Err(WhitePointError(level))
+        }
     }
 
     /// Returns the relative linear-light level represented by this white point.
@@ -509,6 +577,19 @@ impl WhitePoint {
         self.0
     }
 }
+
+impl TryFrom<f32> for WhitePoint {
+    type Error = WhitePointError;
+
+    fn try_from(level: f32) -> Result<Self, Self::Error> {
+        Self::new(level)
+    }
+}
+
+/// A scene level that cannot serve as a [`WhitePoint`].
+#[derive(Clone, Copy, Debug, Error, PartialEq)]
+#[error("white point level must be positive and finite, got {0}")]
+pub struct WhitePointError(f32);
 
 /// Identifies the RGB component that determines a content-light level.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -584,29 +665,36 @@ impl MaxCll {
     /// Returns this content level as a white point when it is nonzero.
     #[must_use]
     pub fn white_point(self) -> Option<WhitePoint> {
-        WhitePoint::new(self.level)
+        WhitePoint::new(self.level).ok()
     }
 }
 
 /// Reports a mismatch between declared and observed `MaxCLL` pixel counts.
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+#[derive(Debug, Error)]
 #[error("MaxCLL estimator expected {expected} pixels but observed {observed}")]
 pub struct MaxCllPixelCountError {
     expected: usize,
     observed: usize,
+    backtrace: Backtrace,
 }
 
 impl MaxCllPixelCountError {
     /// Returns the pixel count declared when the estimator was created.
     #[must_use]
-    pub const fn expected(self) -> usize {
+    pub const fn expected(&self) -> usize {
         self.expected
     }
 
     /// Returns the number of colors passed to the estimator.
     #[must_use]
-    pub const fn observed(self) -> usize {
+    pub const fn observed(&self) -> usize {
         self.observed
+    }
+
+    /// Returns the backtrace captured when the mismatch was detected.
+    #[must_use]
+    pub const fn backtrace(&self) -> &Backtrace {
+        &self.backtrace
     }
 }
 
@@ -698,8 +786,16 @@ impl MaxCLLEstimator {
     /// retain the same number of samples; the result is then identical to observing every colour
     /// through one estimator. This is what lets a caller split an image across worker threads.
     pub fn merge(&mut self, other: Self) {
-        debug_assert_eq!(self.expected, other.expected);
-        debug_assert_eq!(self.retained, other.retained);
+        debug_assert_eq!(
+            self.expected, other.expected,
+            "merged MaxCLL estimators must share a declared pixel count: {} vs {}",
+            self.expected, other.expected
+        );
+        debug_assert_eq!(
+            self.retained, other.retained,
+            "merged MaxCLL estimators must retain the same sample count: {} vs {}",
+            self.retained, other.retained
+        );
 
         self.observed = self.observed.saturating_add(other.observed);
         for peak in other.peaks {
@@ -718,6 +814,7 @@ impl MaxCLLEstimator {
             return Err(MaxCllPixelCountError {
                 expected: self.expected.get(),
                 observed: self.observed,
+                backtrace: Backtrace::capture(),
             });
         }
 
@@ -1039,9 +1136,12 @@ mod tests {
         let white = WhitePoint::new(4.0).unwrap();
         let scaled = ScaledClamp::new(white);
         let extended = ExtendedReinhard::new(white);
+
         let extended_luminance =
             ExtendedLuminanceReinhard::new(LuminanceWhitePoint::new(4.0).unwrap());
-        let mobius = Mobius::new(LuminanceWhitePoint::new(4.0).unwrap(), 0.3);
+
+        let mobius = Mobius::new(LuminanceWhitePoint::new(4.0).unwrap(), 0.3).unwrap();
+
         let mappers: [&dyn ToneMapper; 11] = [
             &Clamp,
             &scaled,
@@ -1210,7 +1310,7 @@ mod tests {
     #[test]
     fn mobius_preserves_its_transition_and_maps_its_peak_to_white() {
         let white_point = LuminanceWhitePoint::new(4.0).unwrap();
-        let mapper = Mobius::new(white_point, 0.3);
+        let mapper = Mobius::new(white_point, 0.3).unwrap();
 
         assert_components_close(mapper.map(LinearRGB::new([0.3; 3])), [0.3; 3]);
         assert_components_close(

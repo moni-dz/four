@@ -3,16 +3,37 @@ use multiversion::multiversion;
 use super::{LinearRGB, LinearRGBPlanes, ToneMapper};
 use crate::simd::{COLOR_LANES, F32x8, displayable, map_colors, map_planes};
 
+/// Converts linear sRGB into the fitted curve's working space.
+///
+/// From [Stephen Hill's fitted ACES reference and display transform].
+///
+/// [Stephen Hill's fitted ACES reference and display transform]: https://64.github.io/tonemapping/
 const ACES_INPUT_MATRIX: [[f32; 3]; 3] = [
     [0.597_19, 0.354_58, 0.048_23],
     [0.076_00, 0.908_34, 0.015_66],
     [0.028_40, 0.133_83, 0.837_77],
 ];
+
+/// Converts the fitted curve's working space back to linear sRGB.
+///
+/// From [Stephen Hill's fitted ACES reference and display transform].
+///
+/// [Stephen Hill's fitted ACES reference and display transform]: https://64.github.io/tonemapping/
 const ACES_OUTPUT_MATRIX: [[f32; 3]; 3] = [
     [1.604_75, -0.531_08, -0.073_67],
     [-0.102_08, 1.108_13, -0.006_05],
     [-0.003_27, -0.072_76, 1.076_02],
 ];
+
+/// Rational-fit coefficients for one channel of [Stephen Hill's fitted ACES curve]: `x*(x+A)-B`
+/// over `x*(C*x+D)+E`. Shared by the scalar and SIMD evaluations so the two stay bit-identical.
+///
+/// [Stephen Hill's fitted ACES curve]: https://64.github.io/tonemapping/
+const ACES_FIT_A: f32 = 0.024_578_6;
+const ACES_FIT_B: f32 = 0.000_090_537;
+const ACES_FIT_C: f32 = 0.983_729;
+const ACES_FIT_D: f32 = 0.432_951;
+const ACES_FIT_E: f32 = 0.238_081;
 
 /// Applies [Stephen Hill's fitted ACES reference and display transform].
 ///
@@ -52,12 +73,14 @@ impl ToneMapper for ACESFitted {
 #[inline]
 fn aces_fitted(color: LinearRGB) -> LinearRGB {
     let transformed = multiply_rgb(ACES_INPUT_MATRIX, color.components());
+
     let fitted = transformed.map(|component| {
-        let numerator = component * (component + 0.024_578_6) - 0.000_090_537;
-        let denominator = component * (0.983_729 * component + 0.432_951) + 0.238_081;
+        let numerator = component * (component + ACES_FIT_A) - ACES_FIT_B;
+        let denominator = component * (ACES_FIT_C * component + ACES_FIT_D) + ACES_FIT_E;
 
         numerator / denominator
     });
+
     LinearRGB::displayable(multiply_rgb(ACES_OUTPUT_MATRIX, fitted))
 }
 
@@ -80,11 +103,11 @@ fn aces_fitted_batch(colors: &mut [LinearRGB]) {
 
         let fitted = transformed.map(|component| {
             let numerator =
-                component * (component + F32x8::splat(0.024_578_6)) - F32x8::splat(0.000_090_537);
+                component * (component + F32x8::splat(ACES_FIT_A)) - F32x8::splat(ACES_FIT_B);
 
             let denominator = component
-                * (F32x8::splat(0.983_729) * component + F32x8::splat(0.432_951))
-                + F32x8::splat(0.238_081);
+                * (F32x8::splat(ACES_FIT_C) * component + F32x8::splat(ACES_FIT_D))
+                + F32x8::splat(ACES_FIT_E);
 
             numerator / denominator
         });
@@ -112,10 +135,12 @@ fn aces_fitted_planes(colors: &mut LinearRGBPlanes) {
 
         let fitted = transformed.map(|component| {
             let numerator =
-                component * (component + F32x8::splat(0.024_578_6)) - F32x8::splat(0.000_090_537);
+                component * (component + F32x8::splat(ACES_FIT_A)) - F32x8::splat(ACES_FIT_B);
+
             let denominator = component
-                * (F32x8::splat(0.983_729) * component + F32x8::splat(0.432_951))
-                + F32x8::splat(0.238_081);
+                * (F32x8::splat(ACES_FIT_C) * component + F32x8::splat(ACES_FIT_D))
+                + F32x8::splat(ACES_FIT_E);
+
             numerator / denominator
         });
 

@@ -313,15 +313,8 @@ impl<'a, State> Parser<'a, State> {
                 let lower = value & 0x0f;
                 let upper = value >> 4;
 
-                if lower > upper {
-                    return Err(error(JPEGError::Table(
-                        JPEGTableKind::ArithmeticConditioning,
-                        "DC arithmetic conditioning requires L <= U",
-                    )));
-                }
-
                 self.arithmetic_conditioning.dc[table] =
-                    arithmetic::DCConditioning { lower, upper };
+                    arithmetic::DCConditioning::parse(lower, upper)?;
             } else {
                 if !(1..=63).contains(&value) {
                     return Err(error(JPEGError::Table(
@@ -499,7 +492,10 @@ impl Parser<'_, Scanned> {
 impl<State: FramePhase> Parser<'_, State> {
     fn parse_scan_and_decode(&mut self, scan_count: u32) -> Result<u8> {
         if scan_count >= SCANS_MAX {
-            return Err(error(JPEGError::LimitExceeded(JPEGLimit::Scans(SCANS_MAX))));
+            return Err(error(JPEGError::LimitExceeded(JPEGLimit::Scans {
+                actual: scan_count,
+                max: SCANS_MAX,
+            })));
         }
 
         let scan = {

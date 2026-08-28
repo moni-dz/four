@@ -3,8 +3,8 @@
 use exn::OptionExt;
 
 use super::{
-    COMPONENTS_MAX, CodingProcess, Frame, FrameComponent, JPEGError, JPEGLimit, JPEGTableKind,
-    QUANTIZATION_TABLES_MAX, Result, arithmetic, error, reader::Reader,
+    COMPONENTS_MAX, CodingProcess, FRAME_DATA_UNITS_MAX, Frame, FrameComponent, JPEGError,
+    JPEGLimit, JPEGTableKind, QUANTIZATION_TABLES_MAX, Result, arithmetic, error, reader::Reader,
 };
 
 pub(super) struct ScanComponent {
@@ -75,10 +75,11 @@ pub(super) fn parse_frame_components(
         });
     }
 
-    if blocks_per_mcu > 10 {
-        return Err(error(JPEGError::LimitExceeded(JPEGLimit::FrameDataUnits(
-            10,
-        ))));
+    if blocks_per_mcu > FRAME_DATA_UNITS_MAX {
+        return Err(error(JPEGError::LimitExceeded(JPEGLimit::FrameDataUnits {
+            actual: blocks_per_mcu,
+            max: FRAME_DATA_UNITS_MAX,
+        })));
     }
 
     Ok(components)

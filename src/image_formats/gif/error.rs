@@ -11,10 +11,10 @@ pub type Error = exn::Exn<GIFError>;
 pub type Result<T> = exn::Result<T, GIFError>;
 
 /// A GIF decoding failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum GIFError {
     /// The underlying GIF codec rejected the datastream.
-    Codec(String),
+    Codec(Box<dyn std::error::Error + Send + Sync + 'static>),
     /// Input exceeded an explicit decoder resource limit.
     LimitExceeded(GIFLimit),
     /// The datastream contains no image frame.
@@ -29,21 +29,46 @@ pub enum GIFError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GIFLimit {
     /// Maximum total decoded bytes across full-canvas animation frames.
-    AnimationBytes(u64),
+    AnimationBytes {
+        /// The decoded byte count that exceeded `max`.
+        actual: u64,
+        /// The configured maximum decoded byte count.
+        max: u64,
+    },
     /// Maximum decoded bytes available to one codec frame.
+    ///
+    /// The `gif` crate's `MemoryLimit`/`OutOfMemory` errors carry no observed byte count, so
+    /// only the configured maximum can be reported here.
     CodecFrameBytes(u64),
     /// Maximum accepted width or height in pixels.
-    Dimensions(u32),
+    Dimensions {
+        /// The observed width that exceeded `max`, in pixels.
+        actual_width: u32,
+        /// The observed height that exceeded `max`, in pixels.
+        actual_height: u32,
+        /// The configured maximum width or height, in pixels.
+        max: u32,
+    },
     /// Maximum accepted animation frame count.
-    Frames(u64),
+    Frames {
+        /// The frame count that exceeded `max`.
+        actual: u64,
+        /// The configured maximum frame count.
+        max: u64,
+    },
     /// Maximum accepted logical-screen pixel count.
-    Pixels(u64),
+    Pixels {
+        /// The pixel count that exceeded `max`.
+        actual: u64,
+        /// The configured maximum pixel count.
+        max: u64,
+    },
 }
 
 impl fmt::Display for GIFError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Codec(detail) => write!(f, "GIF codec error: {detail}"),
+            Self::Codec(source) => write!(f, "GIF codec error: {source}"),
             Self::LimitExceeded(limit) => write_limit_error(f, *limit),
             Self::NoFrame => f.write_str("GIF datastream contains no image frame"),
             Self::Output(detail) => f.write_str(detail),
@@ -52,7 +77,14 @@ impl fmt::Display for GIFError {
     }
 }
 
-impl std::error::Error for GIFError {}
+impl std::error::Error for GIFError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Codec(source) => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// Raises a leaf error at its validation site.
 #[track_caller]
@@ -66,9 +98,10 @@ pub(super) fn error(error: GIFError) -> Error {
 
 fn write_limit_error(formatter: &mut fmt::Formatter<'_>, limit: GIFLimit) -> fmt::Result {
     match limit {
-        GIFLimit::AnimationBytes(max) => write!(
+        GIFLimit::AnimationBytes { actual, max } => write!(
             formatter,
-            "GIF animation output exceeds the {} MiB limit",
+            "GIF animation output of {} MiB exceeds the {} MiB limit",
+            actual / 1024 / 1024,
             max / 1024 / 1024
         ),
         GIFLimit::CodecFrameBytes(max) => write!(
@@ -76,13 +109,22 @@ fn write_limit_error(formatter: &mut fmt::Formatter<'_>, limit: GIFLimit) -> fmt
             "GIF frame output exceeds the {} MiB limit",
             max / 1024 / 1024
         ),
-        GIFLimit::Dimensions(max) => {
-            write!(formatter, "GIF dimensions exceed the {max}-pixel limit")
-        }
-        GIFLimit::Frames(max) => write!(formatter, "GIF animation exceeds the {max}-frame limit"),
-        GIFLimit::Pixels(max) => write!(
+        GIFLimit::Dimensions {
+            actual_width,
+            actual_height,
+            max,
+        } => write!(
             formatter,
-            "GIF pixel count exceeds the {}-megapixel limit",
+            "GIF dimensions {actual_width}x{actual_height} exceed the {max}-pixel limit"
+        ),
+        GIFLimit::Frames { actual, max } => write!(
+            formatter,
+            "GIF animation of {actual} frames exceeds the {max}-frame limit"
+        ),
+        GIFLimit::Pixels { actual, max } => write!(
+            formatter,
+            "GIF pixel count of {} megapixels exceeds the {}-megapixel limit",
+            actual / 1024 / 1024,
             max / 1024 / 1024
         ),
     }

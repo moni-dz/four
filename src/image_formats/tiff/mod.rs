@@ -57,21 +57,26 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
 
     let mut limits = Limits::default();
     limits.decoding_buffer_size = CODEC_BUFFER_MAX;
+
     let mut decoder = Decoder::new(Cursor::new(bytes))
-        .map_err(|source| codec_error(&source))?
+        .map_err(|source| codec_error(source, None))?
         .with_limits(limits);
+
     let (width, height) = decoder
         .dimensions()
-        .map_err(|source| codec_error(&source))?;
+        .map_err(|source| codec_error(source, None))?;
     validate_dimensions(width, height)?;
-    let color = decoder.colortype().map_err(|source| codec_error(&source))?;
+
+    let color = decoder
+        .colortype()
+        .map_err(|source| codec_error(source, None))?;
     let format = PixelFormat::from_color(color)?;
-    validate_raw_size(width, height, format)?;
+    let raw_bytes = validate_raw_size(width, height, format)?;
 
     let mut sample_buffer = DecodingResult::U8(Vec::new());
     let layout = decoder
         .read_image_to_buffer(&mut sample_buffer)
-        .map_err(|source| codec_error(&source))?;
+        .map_err(|source| codec_error(source, Some(raw_bytes)))?;
     let rgba = match sample_buffer {
         DecodingResult::U8(samples) => {
             normalize_unsigned(&samples, width, height, format, &layout, u64::from)?
@@ -218,22 +223,25 @@ fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     }
 
     if width > DIMENSION_MAX || height > DIMENSION_MAX {
-        return Err(error(TIFFError::LimitExceeded(TIFFLimit::Dimensions(
-            DIMENSION_MAX,
-        ))));
+        return Err(error(TIFFError::LimitExceeded(TIFFLimit::Dimensions {
+            actual_width: width,
+            actual_height: height,
+            max: DIMENSION_MAX,
+        })));
     }
 
     let pixels = u64::from(width) * u64::from(height);
     if pixels > PIXELS_MAX {
-        return Err(error(TIFFError::LimitExceeded(TIFFLimit::Pixels(
-            PIXELS_MAX,
-        ))));
+        return Err(error(TIFFError::LimitExceeded(TIFFLimit::Pixels {
+            actual: pixels,
+            max: PIXELS_MAX,
+        })));
     }
 
     Ok(())
 }
 
-fn validate_raw_size(width: u32, height: u32, format: PixelFormat) -> Result<()> {
+fn validate_raw_size(width: u32, height: u32, format: PixelFormat) -> Result<u64> {
     let sample_bytes = u64::from(format.bit_depth).div_ceil(8);
     let bytes = u64::from(width)
         * u64::from(height)
@@ -242,11 +250,14 @@ fn validate_raw_size(width: u32, height: u32, format: PixelFormat) -> Result<()>
 
     if bytes > CODEC_BUFFER_MAX as u64 {
         return Err(error(TIFFError::LimitExceeded(
-            TIFFLimit::CodecBufferBytes(CODEC_BUFFER_MAX),
+            TIFFLimit::CodecBufferBytes {
+                actual: Some(bytes),
+                max: CODEC_BUFFER_MAX,
+            },
         )));
     }
 
-    Ok(())
+    Ok(bytes)
 }
 
 fn normalize_unsigned<T: Copy + Sync>(
@@ -362,13 +373,14 @@ fn cmyk_to_rgb(cyan: u8, magenta: u8, yellow: u8, black: u8) -> [u8; 3] {
     [convert(cyan), convert(magenta), convert(yellow)]
 }
 
-fn codec_error(source: &::tiff::TiffError) -> Error {
+fn codec_error(source: ::tiff::TiffError, attempted_bytes: Option<u64>) -> Error {
     if matches!(source, ::tiff::TiffError::LimitsExceeded) {
-        error(TIFFError::LimitExceeded(TIFFLimit::CodecBufferBytes(
-            CODEC_BUFFER_MAX,
-        )))
+        error(TIFFError::LimitExceeded(TIFFLimit::CodecBufferBytes {
+            actual: attempted_bytes,
+            max: CODEC_BUFFER_MAX,
+        }))
     } else {
-        error(TIFFError::Codec(source.to_string()))
+        error(TIFFError::Codec(Box::new(source)))
     }
 }
 

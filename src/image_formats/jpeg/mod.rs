@@ -36,6 +36,9 @@ pub const SIGNATURE: [u8; 2] = [0xff, 0xd8];
 
 const BLOCK_SIDE: u32 = 8;
 const COMPONENTS_MAX: usize = 3;
+// ITU-T T.81 Annex A.2.4 bounds the sum of each frame component's horizontal x vertical sampling
+// factors at ten data units per MCU.
+const FRAME_DATA_UNITS_MAX: u32 = 10;
 const PROGRESSIVE_COEFFICIENT_BYTES_MAX: u64 = 512 * 1024 * 1024;
 const QUANTIZATION_TABLES_MAX: usize = 4;
 const SCANS_MAX: u32 = 4_096;
@@ -94,16 +97,21 @@ fn decode_huffman(bytes: &[u8]) -> Result<DecodedImage> {
     })?;
 
     let width = u32::try_from(width).map_err(|_source| {
-        error(JPEGError::LimitExceeded(JPEGLimit::Dimensions(
-            DIMENSION_MAX,
-        )))
+        // `width` didn't fit u32, so u32::MAX is the closest representable observed value.
+        error(JPEGError::LimitExceeded(JPEGLimit::Dimensions {
+            actual: u32::MAX,
+            max: DIMENSION_MAX,
+        }))
     })?;
 
     let height = u32::try_from(height).map_err(|_source| {
-        error(JPEGError::LimitExceeded(JPEGLimit::Dimensions(
-            DIMENSION_MAX,
-        )))
+        // `height` didn't fit u32, so u32::MAX is the closest representable observed value.
+        error(JPEGError::LimitExceeded(JPEGLimit::Dimensions {
+            actual: u32::MAX,
+            max: DIMENSION_MAX,
+        }))
     })?;
+
     validate_dimensions(width, height)?;
 
     let expected = usize::try_from(u64::from(width) * u64::from(height) * 4)
@@ -139,12 +147,15 @@ fn uses_arithmetic_coding(bytes: &[u8]) -> bool {
         if bytes[offset] != 0xff {
             return false;
         }
+
         while bytes.get(offset) == Some(&0xff) {
             offset += 1;
         }
+
         let Some(&marker) = bytes.get(offset) else {
             return false;
         };
+
         offset += 1;
 
         // SOF9-SOF11 and SOF13-SOF15 are the arithmetic-coded frame headers. 0xcc is DAC, which
@@ -167,6 +178,7 @@ fn uses_arithmetic_coding(bytes: &[u8]) -> bool {
         };
 
         let length = usize::from(u16::from_be_bytes([length_bytes[0], length_bytes[1]]));
+
         if length < 2 {
             return false;
         }
@@ -185,6 +197,9 @@ fn uses_arithmetic_coding(bytes: &[u8]) -> bool {
     false
 }
 
+// `DecodeErrors` implements `std::error::Error` but derives neither `Clone` nor `Eq`/`PartialEq`,
+// while `JPEGError` derives all three for value-based error classification; stringifying here is
+// the narrowest way to keep the codec's diagnostic text without weakening those derives.
 fn codec_error(source: &DecodeErrors) -> Error {
     error(JPEGError::Codec(source.to_string()))
 }

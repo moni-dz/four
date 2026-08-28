@@ -14,7 +14,7 @@ pub type Result<T> = exn::Result<T, JPEGXRError>;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JPEGXRError {
     /// The underlying JPEG XR codec rejected the input.
-    Codec(String),
+    Codec(jpegxr::Error),
     /// Input exceeded an explicit decoder resource bound.
     LimitExceeded(JPEGXRLimit),
     /// Decoded pixels or dimensions violate the output contract.
@@ -26,20 +26,38 @@ pub enum JPEGXRError {
 }
 
 /// A bounded JPEG XR resource whose configured maximum was exceeded.
+///
+/// `actual` is `None` when the codec rejected the input before a precise measurement was
+/// available (it reports only which bound was crossed, not by how much).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JPEGXRLimit {
     /// Maximum accepted width or height in pixels.
-    Dimensions(u32),
+    Dimensions {
+        /// The rejected width or height, when known.
+        actual: Option<u32>,
+        /// The configured maximum.
+        max: u32,
+    },
     /// Maximum accepted decoded source-buffer size in bytes.
-    SourceBufferBytes(usize),
+    SourceBufferBytes {
+        /// The rejected buffer size, when known.
+        actual: Option<usize>,
+        /// The configured maximum.
+        max: usize,
+    },
     /// Maximum accepted decoded pixel count.
-    Pixels(u64),
+    Pixels {
+        /// The rejected pixel count, when known.
+        actual: Option<u64>,
+        /// The configured maximum.
+        max: u64,
+    },
 }
 
 impl fmt::Display for JPEGXRError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Codec(detail) => write!(f, "JPEG XR codec error: {detail}"),
+            Self::Codec(source) => write!(f, "JPEG XR codec error: {source}"),
             Self::LimitExceeded(limit) => write_limit_error(f, *limit),
             Self::Output(detail) => f.write_str(detail),
             Self::Signature => f.write_str("expected a JPEG XR file signature"),
@@ -50,7 +68,14 @@ impl fmt::Display for JPEGXRError {
     }
 }
 
-impl std::error::Error for JPEGXRError {}
+impl std::error::Error for JPEGXRError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Codec(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 #[track_caller]
 pub(super) fn error(error: JPEGXRError) -> Error {
@@ -63,15 +88,40 @@ pub(super) fn error(error: JPEGXRError) -> Error {
 
 fn write_limit_error(formatter: &mut fmt::Formatter<'_>, limit: JPEGXRLimit) -> fmt::Result {
     match limit {
-        JPEGXRLimit::Dimensions(max) => {
+        JPEGXRLimit::Dimensions {
+            actual: Some(actual),
+            max,
+        } => write!(
+            formatter,
+            "JPEG XR dimension {actual} exceeds the {max}-pixel limit"
+        ),
+        JPEGXRLimit::Dimensions { actual: None, max } => {
             write!(formatter, "JPEG XR dimensions exceed the {max}-pixel limit")
         }
-        JPEGXRLimit::SourceBufferBytes(max) => write!(
+        JPEGXRLimit::SourceBufferBytes {
+            actual: Some(actual),
+            max,
+        } => write!(
+            formatter,
+            "JPEG XR source buffer of {} MiB exceeds the {} MiB limit",
+            actual / 1024 / 1024,
+            max / 1024 / 1024
+        ),
+        JPEGXRLimit::SourceBufferBytes { actual: None, max } => write!(
             formatter,
             "JPEG XR source pixels exceed the {} MiB buffer limit",
             max / 1024 / 1024
         ),
-        JPEGXRLimit::Pixels(max) => write!(
+        JPEGXRLimit::Pixels {
+            actual: Some(actual),
+            max,
+        } => write!(
+            formatter,
+            "JPEG XR pixel count of {} megapixels exceeds the {}-megapixel limit",
+            actual / 1024 / 1024,
+            max / 1024 / 1024
+        ),
+        JPEGXRLimit::Pixels { actual: None, max } => write!(
             formatter,
             "JPEG XR pixel count exceeds the {}-megapixel limit",
             max / 1024 / 1024

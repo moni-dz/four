@@ -3,6 +3,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use exn::ErrorExt;
+
 use gpui::{
     Anchor, AnchoredPositionMode, Image as GPUIImage, MouseButton, MouseDownEvent,
     PathPromptOptions, Pixels, Point, Role, SharedString, Toggled, Window, WindowControlArea,
@@ -11,8 +13,8 @@ use gpui::{
 use tonemapping::{MaxCLLMode, ToneMappingMethod};
 
 use super::image_loader::{
-    DisplayedImage, HDROptions, ImageMetadata, LoadResult, LoadedImage, MetadataField,
-    format_load_error, load_image, load_image_with_options_and_hdr_metrics,
+    DisplayedImage, HDROptions, ImageMetadata, LoadError, LoadResult, LoadedImage, MetadataField,
+    format_load_error, load_image, load_image_with,
 };
 
 const CONTEXT_MENU_ITEM_HEIGHT: f32 = 36.0;
@@ -28,8 +30,46 @@ const MAX_CLL_SELECTOR_HEIGHT: f32 = 30.0;
 const TONE_MAPPING_MENU_ITEM_HEIGHT: f32 = 30.0;
 const TONE_MAPPING_MENU_MARGIN: f32 = 4.0;
 const TONE_MAPPING_MENU_WIDTH: f32 = 292.0;
+const TONE_MAPPING_LABEL_WIDTH: f32 = 100.0;
 const TONE_MAPPING_TITLEBAR_WIDTH: f32 = 480.0;
 const TONE_MAPPING_SELECTOR_HEIGHT: f32 = 30.0;
+
+/// Background of the root viewer surface.
+const COLOR_APP_BACKGROUND: u32 = 0x0015_1515;
+/// Primary text on the root viewer surface.
+const COLOR_TEXT_PRIMARY: u32 = 0x00d8_d8d8;
+/// Secondary text: field labels, muted captions, the tone-mapping menu caret.
+const COLOR_TEXT_SECONDARY: u32 = 0x009d_9d9d;
+/// Text inside the metadata overlay's value column.
+const COLOR_TEXT_VALUE: u32 = 0x00e8_e8e8;
+/// Hint text shown when no image is loaded.
+const COLOR_TEXT_HINT: u32 = 0x0088_8888;
+/// Text in the right-click context menu and tone-mapping method list.
+const COLOR_TEXT_MENU: u32 = 0x00ff_ffff;
+/// Checkmark and selected-method accent color.
+const COLOR_ACCENT_GREEN: u32 = 0x00a9_d18e;
+/// Background shared by the context menu and the tone-mapping method list panel.
+const COLOR_PANEL_BACKGROUND: u32 = 0x0029_2929;
+/// Border shared by the context menu and the tone-mapping method list panel.
+const COLOR_PANEL_BORDER: u32 = 0x0045_4545;
+/// Hover background for context-menu and tone-mapping method-list items.
+const COLOR_MENU_ITEM_HOVER: u32 = 0x003d_3d3d;
+/// Background of the status bar and its embedded controls' resting state.
+const COLOR_CONTROL_BACKGROUND: u32 = 0x0024_2424;
+/// Hover background for the tone-mapping and `MaxCLL` selector controls.
+const COLOR_CONTROL_HOVER: u32 = 0x0032_3232;
+/// Border for the tone-mapping and `MaxCLL` selector controls (translucent white).
+const COLOR_CONTROL_BORDER: u32 = 0xff_ff_ff_2e;
+/// Border of the status bar strip (translucent white).
+const COLOR_STATUS_BAR_BORDER: u32 = 0xff_ff_ff_22;
+/// Border for the `MaxCLL` checkbox (translucent white).
+const COLOR_CHECKBOX_BORDER: u32 = 0xff_ff_ff_55;
+/// Background of a selected tone-mapping method or a checked `MaxCLL` checkbox.
+const COLOR_SELECTED_BACKGROUND: u32 = 0x0038_3838;
+/// Background of the status bar strip along the window's bottom edge.
+const COLOR_STATUS_BAR_BACKGROUND: u32 = 0x0d_0d_0d_e8;
+/// Background of the metadata overlay panel.
+const COLOR_METADATA_OVERLAY_BACKGROUND: u32 = 0x0020_2020;
 
 pub(super) const WINDOW_MIN_WIDTH: f32 = 1280.0;
 pub(super) const WINDOW_MIN_HEIGHT: f32 = 720.0;
@@ -65,7 +105,10 @@ impl ViewerState {
     }
 
     fn apply_result(&mut self, result: LoadResult<LoadedImage>) {
-        assert!(!self.status().is_empty());
+        assert!(
+            !self.status().is_empty(),
+            "viewer status must never be blank before a result is applied"
+        );
 
         let previous_image = self.displayed().cloned();
         *self = match result {
@@ -81,7 +124,10 @@ impl ViewerState {
             },
         };
 
-        assert!(!self.status().is_empty());
+        assert!(
+            !self.status().is_empty(),
+            "viewer status must never be blank after a result is applied"
+        );
     }
 
     fn status(&self) -> &SharedString {
@@ -92,7 +138,7 @@ impl ViewerState {
             Self::Loaded(state) => &state.status,
         };
 
-        assert_ne!(status.len(), 0);
+        assert_ne!(status.len(), 0, "viewer status must never be blank");
         status
     }
 
@@ -116,7 +162,7 @@ struct LoadRequest(u64);
 enum LoadPurpose {
     Image,
     HdrMetrics,
-    HdrOptions,
+    HDROptions,
 }
 
 #[derive(Debug)]
@@ -222,8 +268,16 @@ impl Root {
         position.x = position.x.max(px(0.0));
         position.y = position.y.max(px(DRAG_REGION_HEIGHT));
 
-        assert!(position.x >= px(0.0));
-        assert!(position.y >= px(DRAG_REGION_HEIGHT));
+        assert!(
+            position.x >= px(0.0),
+            "context menu x position must be clamped nonnegative, got {:?}",
+            position.x
+        );
+        assert!(
+            position.y >= px(DRAG_REGION_HEIGHT),
+            "context menu y position must clear the drag region, got {:?}",
+            position.y
+        );
 
         self.tone_mapping_menu_open = false;
         self.context_menu_position = Some(position);
@@ -270,7 +324,10 @@ impl Root {
     }
 
     fn open_image(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        assert!(!self.viewer.status().is_empty());
+        assert!(
+            !self.viewer.status().is_empty(),
+            "viewer status must never be blank"
+        );
 
         self.context_menu_position = None;
         self.tone_mapping_menu_open = false;
@@ -284,7 +341,17 @@ impl Root {
         cx.spawn_in(window, async move |root, cx| {
             let path = match paths.await {
                 Ok(Ok(Some(mut paths))) => paths.pop(),
-                _ => None,
+                Ok(Ok(None)) | Err(_) => None,
+                Ok(Err(prompt_error)) => {
+                    let _ = root.update_in(cx, |root, _window, cx| {
+                        root.context_menu_position = None;
+                        root.tone_mapping_menu_open = false;
+                        root.viewer
+                            .apply_result(Err(LoadError::new(prompt_error.to_string()).raise()));
+                        cx.notify();
+                    });
+                    return;
+                }
             };
             let Some(path) = path else {
                 return;
@@ -293,9 +360,11 @@ impl Root {
             let _ = root.update_in(cx, |root, window, cx| {
                 root.context_menu_position = None;
                 root.tone_mapping_menu_open = false;
+
                 let request = root.begin_load_request();
                 root.hdr_metrics_request = None;
                 root.pending_hdr_options = None;
+
                 root.schedule_decode(
                     DecodeJob {
                         request,
@@ -309,6 +378,7 @@ impl Root {
                     window,
                     cx,
                 );
+
                 cx.notify();
             });
         })
@@ -338,11 +408,7 @@ impl Root {
         cx.spawn_in(window, async move |root, cx| {
             let result = cx
                 .background_spawn(async move {
-                    load_image_with_options_and_hdr_metrics(
-                        path.as_ref(),
-                        hdr_options,
-                        include_hdr_metrics,
-                    )
+                    load_image_with(path.as_ref(), hdr_options, include_hdr_metrics)
                 })
                 .await;
 
@@ -351,9 +417,10 @@ impl Root {
                 if root.hdr_metrics_request == Some(request) {
                     root.hdr_metrics_request = None;
                 }
+
                 let applied = match purpose {
                     LoadPurpose::Image => root.apply_load_result(request, result),
-                    LoadPurpose::HdrMetrics | LoadPurpose::HdrOptions => {
+                    LoadPurpose::HdrMetrics | LoadPurpose::HDROptions => {
                         root.apply_hdr_options_result(request, result)
                     }
                 };
@@ -361,6 +428,7 @@ impl Root {
                 if let Some(next) = next {
                     Self::spawn_decode(next, window, cx);
                 }
+
                 if applied {
                     cx.notify();
                 }
@@ -374,7 +442,10 @@ impl Root {
             return false;
         }
 
-        assert!(!self.viewer.status().is_empty());
+        assert!(
+            !self.viewer.status().is_empty(),
+            "viewer status must never be blank before a load result is applied"
+        );
         self.context_menu_position = None;
 
         let load_succeeded = result.is_ok();
@@ -384,7 +455,10 @@ impl Root {
             self.tone_mapping_menu_open = false;
         }
 
-        assert!(!self.viewer.status().is_empty());
+        assert!(
+            !self.viewer.status().is_empty(),
+            "viewer status must never be blank after a load result is applied"
+        );
         true
     }
 
@@ -397,7 +471,10 @@ impl Root {
             return false;
         }
 
-        assert!(!self.viewer.status().is_empty());
+        assert!(
+            !self.viewer.status().is_empty(),
+            "viewer status must never be blank before an HDR options result is applied"
+        );
         self.context_menu_position = None;
 
         let displayed_options = self
@@ -420,7 +497,10 @@ impl Root {
 
         self.tone_mapping_menu_open = false;
 
-        assert!(!self.viewer.status().is_empty());
+        assert!(
+            !self.viewer.status().is_empty(),
+            "viewer status must never be blank after an HDR options result is applied"
+        );
         true
     }
 
@@ -476,7 +556,7 @@ impl Root {
                     hdr_options: options,
                     include_hdr_metrics: self.metadata_visible,
                     path: source_path,
-                    purpose: LoadPurpose::HdrOptions,
+                    purpose: LoadPurpose::HDROptions,
                 },
             },
             window,
@@ -536,8 +616,16 @@ impl Root {
         metadata_visible: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        assert!(position.x >= px(0.0));
-        assert!(position.y >= px(DRAG_REGION_HEIGHT));
+        assert!(
+            position.x >= px(0.0),
+            "context menu x position must be clamped nonnegative, got {:?}",
+            position.x
+        );
+        assert!(
+            position.y >= px(DRAG_REGION_HEIGHT),
+            "context menu y position must clear the drag region, got {:?}",
+            position.y
+        );
 
         deferred(
             div()
@@ -550,8 +638,8 @@ impl Root {
                 .rounded_md()
                 .shadow_lg()
                 .border_1()
-                .border_color(rgb(0x0045_4545))
-                .bg(rgb(0x0029_2929))
+                .border_color(rgb(COLOR_PANEL_BORDER))
+                .bg(rgb(COLOR_PANEL_BACKGROUND))
                 .flex()
                 .flex_col()
                 .on_mouse_down_out(cx.listener(|root, _, _, cx| {
@@ -582,7 +670,11 @@ impl Root {
         hdr_options: Option<HDROptions>,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
-        assert_ne!(metadata.fields.len(), 0);
+        assert_ne!(
+            metadata.fields.len(),
+            0,
+            "metadata overlay requires at least one field to display"
+        );
 
         div()
             .absolute()
@@ -592,9 +684,9 @@ impl Root {
             .p_3()
             .rounded_md()
             .border_1()
-            .border_color(rgba(0xff_ff_ff_22))
+            .border_color(rgba(COLOR_STATUS_BAR_BORDER))
             .shadow_lg()
-            .bg(rgba(0x0d_0d_0d_e8))
+            .bg(rgba(COLOR_STATUS_BAR_BACKGROUND))
             .font_family("Consolas")
             .text_sm()
             .flex()
@@ -622,12 +714,17 @@ impl Root {
             .px_2()
             .rounded_sm()
             .border_1()
-            .border_color(rgba(0xff_ff_ff_2e))
-            .bg(rgb(0x0024_2424))
+            .border_color(rgba(COLOR_CONTROL_BORDER))
+            .bg(rgb(COLOR_CONTROL_BACKGROUND))
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(0x0032_3232)))
+            .hover(|style| style.bg(rgb(COLOR_CONTROL_HOVER)))
             .child(active_method.label())
-            .child(div().ml_2().text_color(rgb(0x009d_9d9d)).child("▼"))
+            .child(
+                div()
+                    .ml_2()
+                    .text_color(rgb(COLOR_TEXT_SECONDARY))
+                    .child("▼"),
+            )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |root, _, _, cx| {
@@ -647,9 +744,9 @@ impl Root {
             .gap(px(METADATA_FIELD_GAP))
             .child(
                 div()
-                    .w(px(100.0))
+                    .w(px(TONE_MAPPING_LABEL_WIDTH))
                     .flex_none()
-                    .text_color(rgb(0x009d_9d9d))
+                    .text_color(rgb(COLOR_TEXT_SECONDARY))
                     .child("Tone mapper"),
             )
             .child(selector)
@@ -682,10 +779,10 @@ impl Root {
             .px_2()
             .rounded_sm()
             .border_1()
-            .border_color(rgba(0xff_ff_ff_2e))
-            .bg(rgb(0x0024_2424))
+            .border_color(rgba(COLOR_CONTROL_BORDER))
+            .bg(rgb(COLOR_CONTROL_BACKGROUND))
             .cursor_pointer()
-            .hover(|style| style.bg(rgb(0x0032_3232)))
+            .hover(|style| style.bg(rgb(COLOR_CONTROL_HOVER)))
             .child(
                 div()
                     .size(px(MAX_CLL_CHECKBOX_SIZE))
@@ -695,9 +792,11 @@ impl Root {
                     .justify_center()
                     .rounded_xs()
                     .border_1()
-                    .border_color(rgba(0xff_ff_ff_55))
-                    .when(checked, |checkbox| checkbox.bg(rgb(0x0038_3838)))
-                    .text_color(rgb(0x00a9_d18e))
+                    .border_color(rgba(COLOR_CHECKBOX_BORDER))
+                    .when(checked, |checkbox| {
+                        checkbox.bg(rgb(COLOR_SELECTED_BACKGROUND))
+                    })
+                    .text_color(rgb(COLOR_ACCENT_GREEN))
                     .child(if checked { "✓" } else { "" }),
             )
             .child(description)
@@ -715,7 +814,7 @@ impl Root {
                 div()
                     .w(px(METADATA_LABEL_WIDTH))
                     .flex_none()
-                    .text_color(rgb(0x009d_9d9d))
+                    .text_color(rgb(COLOR_TEXT_SECONDARY))
                     .child("MaxCLL"),
             )
             .child(selector)
@@ -742,8 +841,8 @@ impl Root {
                         .rounded_md()
                         .shadow_lg()
                         .border_1()
-                        .border_color(rgb(0x0045_4545))
-                        .bg(rgb(0x0029_2929))
+                        .border_color(rgb(COLOR_PANEL_BORDER))
+                        .bg(rgb(COLOR_PANEL_BACKGROUND))
                         .flex()
                         .flex_col()
                         .children(ToneMappingMethod::ALL.map(|method| {
@@ -780,7 +879,7 @@ impl Root {
                 content.child(
                     div()
                         .text_sm()
-                        .text_color(rgb(0x0088_8888))
+                        .text_color(rgb(COLOR_TEXT_HINT))
                         .child("Right-click anywhere, then choose Open image…"),
                 )
             })
@@ -799,7 +898,7 @@ impl Root {
             .flex()
             .items_center()
             .text_sm()
-            .bg(rgb(0x0020_2020))
+            .bg(rgb(COLOR_METADATA_OVERLAY_BACKGROUND))
             .child(
                 div()
                     .h_full()
@@ -833,27 +932,24 @@ impl Root {
 
 impl Render for Root {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        assert!(!self.viewer.status().is_empty());
+        assert!(
+            !self.viewer.status().is_empty(),
+            "viewer status must never be blank"
+        );
         assert!(
             self.context_menu_position
-                .is_none_or(|position| position.x >= px(0.0))
+                .is_none_or(|position| position.x >= px(0.0)),
+            "context menu x position must be clamped nonnegative, got {:?}",
+            self.context_menu_position
         );
 
         let context_menu_position = self.context_menu_position;
-        let displayed = self.viewer.displayed().cloned();
+        let displayed = self.viewer.displayed();
         let has_image = displayed.is_some();
 
-        let image = displayed
-            .as_ref()
-            .map(|displayed| Arc::clone(&displayed.image));
-
-        let metadata = displayed
-            .as_ref()
-            .map(|displayed| Arc::clone(&displayed.metadata));
-
-        let active_hdr_options = displayed
-            .as_ref()
-            .and_then(|displayed| displayed.hdr_options);
+        let image = displayed.map(|displayed| Arc::clone(&displayed.image));
+        let metadata = displayed.map(|displayed| Arc::clone(&displayed.metadata));
+        let active_hdr_options = displayed.and_then(|displayed| displayed.hdr_options);
 
         let hdr_options = active_hdr_options.map(|active_options| {
             self.pending_hdr_options
@@ -869,8 +965,8 @@ impl Render for Root {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(0x0015_1515))
-            .text_color(rgb(0x00d8_d8d8))
+            .bg(rgb(COLOR_APP_BACKGROUND))
+            .text_color(rgb(COLOR_TEXT_PRIMARY))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|root, event: &MouseDownEvent, window, cx| {
@@ -912,8 +1008,12 @@ const fn context_menu_height(has_image: bool) -> f32 {
 }
 
 fn menu_item(identifier: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
-    assert_ne!(identifier.len(), 0);
-    assert_ne!(label.len(), 0);
+    assert_ne!(
+        identifier.len(),
+        0,
+        "menu item identifier must not be blank"
+    );
+    assert_ne!(label.len(), 0, "menu item label must not be blank");
 
     div()
         .id(identifier)
@@ -925,8 +1025,8 @@ fn menu_item(identifier: &'static str, label: &'static str) -> gpui::Stateful<gp
         .rounded_sm()
         .cursor_pointer()
         .text_sm()
-        .text_color(rgb(0x00ff_ffff))
-        .hover(|style| style.bg(rgb(0x003d_3d3d)))
+        .text_color(rgb(COLOR_TEXT_MENU))
+        .hover(|style| style.bg(rgb(COLOR_MENU_ITEM_HOVER)))
         .child(label)
 }
 
@@ -943,22 +1043,33 @@ fn tone_mapping_menu_item(
         .px_2()
         .rounded_sm()
         .cursor_pointer()
-        .text_color(rgb(0x00ff_ffff))
-        .hover(|style| style.bg(rgb(0x003d_3d3d)))
-        .when(method == active_method, |item| item.bg(rgb(0x0038_3838)))
+        .text_color(rgb(COLOR_TEXT_MENU))
+        .hover(|style| style.bg(rgb(COLOR_MENU_ITEM_HOVER)))
+        .when(method == active_method, |item| {
+            item.bg(rgb(COLOR_SELECTED_BACKGROUND))
+        })
         .child(
             div()
                 .w_5()
                 .flex_none()
-                .text_color(rgb(0x00a9_d18e))
+                .text_color(rgb(COLOR_ACCENT_GREEN))
                 .child(if method == active_method { "✓" } else { "" }),
         )
         .child(method.label())
 }
 
 fn metadata_field(field: &MetadataField) -> gpui::Div {
-    assert_ne!(field.label.len(), 0);
-    assert_ne!(field.value.len(), 0);
+    assert_ne!(
+        field.label.len(),
+        0,
+        "metadata field label must not be blank"
+    );
+    assert_ne!(
+        field.value.len(),
+        0,
+        "metadata field value for {:?} must not be blank",
+        field.label
+    );
 
     div()
         .w_full()
@@ -971,14 +1082,14 @@ fn metadata_field(field: &MetadataField) -> gpui::Div {
             div()
                 .w(px(METADATA_LABEL_WIDTH))
                 .flex_none()
-                .text_color(rgb(0x009d_9d9d))
+                .text_color(rgb(COLOR_TEXT_SECONDARY))
                 .child(field.label),
         )
         .child(
             div()
                 .min_w_0()
                 .flex_1()
-                .text_color(rgb(0x00e8_e8e8))
+                .text_color(rgb(COLOR_TEXT_VALUE))
                 .child(field.value.clone()),
         )
 }
@@ -995,10 +1106,7 @@ pub(super) fn initial_viewer(path: Option<&Path>) -> ViewerState {
 
 #[cfg(test)]
 mod tests {
-    use exn::ErrorExt as _;
-
     use super::*;
-    use crate::app::image_loader::LoadError;
 
     fn loaded_hdr_viewer(options: HDROptions) -> ViewerState {
         ViewerState::Loaded(LoadedImage {

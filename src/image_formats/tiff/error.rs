@@ -11,10 +11,10 @@ pub type Error = exn::Exn<TIFFError>;
 pub type Result<T> = exn::Result<T, TIFFError>;
 
 /// A TIFF decoding failure.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub enum TIFFError {
     /// The underlying TIFF codec rejected the datastream.
-    Codec(String),
+    Codec(Box<dyn std::error::Error + Send + Sync + 'static>),
     /// Input exceeded an explicit decoder resource limit.
     LimitExceeded(TIFFLimit),
     /// Decoded samples violated the codec adapter's output contract.
@@ -29,17 +29,39 @@ pub enum TIFFError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TIFFLimit {
     /// Maximum decoded buffer size available to the codec.
-    CodecBufferBytes(usize),
+    ///
+    /// `actual` is the raw sample buffer size computed before decoding. It is `None` when the
+    /// codec's own `TIFFError::LimitsExceeded` fires on an internal allocation (for example
+    /// while reading IFD tags) before that size is known, since that variant carries no
+    /// observed byte count.
+    CodecBufferBytes {
+        /// The raw buffer size that exceeded `max`, when known.
+        actual: Option<u64>,
+        /// The configured maximum decoded buffer size.
+        max: usize,
+    },
     /// Maximum accepted width or height in pixels.
-    Dimensions(u32),
+    Dimensions {
+        /// The observed width that exceeded `max`, in pixels.
+        actual_width: u32,
+        /// The observed height that exceeded `max`, in pixels.
+        actual_height: u32,
+        /// The configured maximum width or height, in pixels.
+        max: u32,
+    },
     /// Maximum accepted decoded pixel count.
-    Pixels(u64),
+    Pixels {
+        /// The pixel count that exceeded `max`.
+        actual: u64,
+        /// The configured maximum pixel count.
+        max: u64,
+    },
 }
 
 impl fmt::Display for TIFFError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Codec(detail) => write!(f, "TIFF codec error: {detail}"),
+            Self::Codec(source) => write!(f, "TIFF codec error: {source}"),
             Self::LimitExceeded(limit) => write_limit_error(f, *limit),
             Self::Output(detail) => f.write_str(detail),
             Self::Signature => f.write_str("input does not begin with a TIFF signature"),
@@ -48,7 +70,14 @@ impl fmt::Display for TIFFError {
     }
 }
 
-impl std::error::Error for TIFFError {}
+impl std::error::Error for TIFFError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Codec(source) => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// Raises a leaf error at its validation site.
 #[track_caller]
@@ -62,17 +91,32 @@ pub(super) fn error(error: TIFFError) -> Error {
 
 fn write_limit_error(formatter: &mut fmt::Formatter<'_>, limit: TIFFLimit) -> fmt::Result {
     match limit {
-        TIFFLimit::CodecBufferBytes(max) => write!(
+        TIFFLimit::CodecBufferBytes {
+            actual: Some(actual),
+            max,
+        } => write!(
+            formatter,
+            "TIFF decoded buffer of {} MiB exceeds the {} MiB limit",
+            actual / 1024 / 1024,
+            max / 1024 / 1024
+        ),
+        TIFFLimit::CodecBufferBytes { actual: None, max } => write!(
             formatter,
             "TIFF decoded buffer exceeds the {} MiB limit",
             max / 1024 / 1024
         ),
-        TIFFLimit::Dimensions(max) => {
-            write!(formatter, "TIFF dimensions exceed the {max}-pixel limit")
-        }
-        TIFFLimit::Pixels(max) => write!(
+        TIFFLimit::Dimensions {
+            actual_width,
+            actual_height,
+            max,
+        } => write!(
             formatter,
-            "TIFF pixel count exceeds the {}-megapixel limit",
+            "TIFF dimensions {actual_width}x{actual_height} exceed the {max}-pixel limit"
+        ),
+        TIFFLimit::Pixels { actual, max } => write!(
+            formatter,
+            "TIFF pixel count of {} megapixels exceeds the {}-megapixel limit",
+            actual / 1024 / 1024,
             max / 1024 / 1024
         ),
     }

@@ -248,12 +248,12 @@ fn materialize_component_sequential(
         let block_index =
             u32::try_from(block_index_usize).expect("the bounded component block count fits u32");
 
-        let quantized = component.coefficients[block_index_usize];
-        let coefficients = dequantize_block(&quantized, quantization)?;
+        let coefficients =
+            dequantize_block(&component.coefficients[block_index_usize], quantization)?;
         let samples = idct::inverse(&coefficients);
+
         let block_x = block_index % component.block_columns;
         let block_y = block_index / component.block_columns;
-
         write_block(component, block_x, block_y, &samples);
     }
     Ok(())
@@ -382,7 +382,10 @@ fn validate_progressive_storage(
 
     if byte_count > PROGRESSIVE_COEFFICIENT_BYTES_MAX {
         return Err(error(JPEGError::LimitExceeded(
-            JPEGLimit::ProgressiveCoefficientBytes(PROGRESSIVE_COEFFICIENT_BYTES_MAX),
+            JPEGLimit::ProgressiveCoefficientBytes {
+                actual: byte_count,
+                max: PROGRESSIVE_COEFFICIENT_BYTES_MAX,
+            },
         )));
     }
     Ok(())
@@ -455,6 +458,13 @@ fn allocate_component_storage(
     Ok(())
 }
 
+/// Converts a decoded sample triple to RGB, applying the frame's color transform.
+///
+/// The `YCbCr` arm implements the full-range `YCbCr`-to-RGB conversion defined by ITU-T T.871
+/// (the JFIF/JPEG realization of the ITU-R BT.601 color matrix for 8-bit sample ranges): 128.0 is
+/// the level shift that recenters the unsigned 8-bit chroma samples on zero, and 1.402, 0.344136,
+/// 0.714136, and 1.772 are that standard's published conversion coefficients, rounded to six
+/// significant digits as specified.
 fn convert_color(first: u8, second: u8, third: u8, transform: ColorTransform) -> [u8; 4] {
     match transform {
         ColorTransform::RGB => [first, second, third, 255],
@@ -486,15 +496,18 @@ pub(super) fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     }
 
     if width > DIMENSION_MAX || height > DIMENSION_MAX {
-        return Err(error(JPEGError::LimitExceeded(JPEGLimit::Dimensions(
-            DIMENSION_MAX,
-        ))));
+        return Err(error(JPEGError::LimitExceeded(JPEGLimit::Dimensions {
+            actual: width.max(height),
+            max: DIMENSION_MAX,
+        })));
     }
 
-    if u64::from(width) * u64::from(height) > PIXELS_MAX {
-        return Err(error(JPEGError::LimitExceeded(JPEGLimit::Pixels(
-            PIXELS_MAX,
-        ))));
+    let pixel_count = u64::from(width) * u64::from(height);
+    if pixel_count > PIXELS_MAX {
+        return Err(error(JPEGError::LimitExceeded(JPEGLimit::Pixels {
+            actual: pixel_count,
+            max: PIXELS_MAX,
+        })));
     }
 
     Ok(())

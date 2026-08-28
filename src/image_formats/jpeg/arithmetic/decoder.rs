@@ -43,9 +43,11 @@ impl<'a> Decoder<'a> {
         self.renormalize()?;
         let mps = *state >> 7;
         let estimate = PROBABILITY_ESTIMATES[usize::from(*state & 0x7f)];
+
         self.interval -= u32::from(estimate.value);
         let mps_interval = self.interval;
         let boundary = self.interval << self.bit_count;
+
         let decision = if self.code >= boundary {
             self.code -= boundary;
             self.decode_lps_path(state, estimate, mps, mps_interval)
@@ -54,6 +56,7 @@ impl<'a> Decoder<'a> {
         } else {
             mps
         };
+
         invariant!(decision <= 1);
         Ok(decision)
     }
@@ -70,10 +73,10 @@ impl<'a> Decoder<'a> {
 
         self.interval = u32::from(estimate.value);
         if mps_interval < u32::from(estimate.value) {
-            Self::update_mps(state, estimate);
+            update_mps(state, estimate);
             mps
         } else {
-            Self::update_lps(state, estimate);
+            update_lps(state, estimate);
             mps ^ 1
         }
     }
@@ -88,30 +91,12 @@ impl<'a> Decoder<'a> {
         invariant!(mps <= 1);
 
         if self.interval < u32::from(estimate.value) {
-            Self::update_lps(state, estimate);
+            update_lps(state, estimate);
             mps ^ 1
         } else {
-            Self::update_mps(state, estimate);
+            update_mps(state, estimate);
             mps
         }
-    }
-
-    fn update_lps(state: &mut u8, estimate: ProbabilityEstimate) {
-        let mut mps = *state >> 7;
-        invariant!(mps <= 1);
-        invariant!(usize::from(estimate.next_lps) < PROBABILITY_ESTIMATES.len());
-
-        if estimate.switch_mps {
-            mps ^= 1;
-        }
-        *state = (mps << 7) | estimate.next_lps;
-    }
-
-    fn update_mps(state: &mut u8, estimate: ProbabilityEstimate) {
-        let mps = *state >> 7;
-        invariant!(mps <= 1);
-        invariant!(usize::from(estimate.next_mps) < PROBABILITY_ESTIMATES.len());
-        *state = (mps << 7) | estimate.next_mps;
     }
 
     fn renormalize(&mut self) -> Result<()> {
@@ -241,6 +226,24 @@ impl<'a> Decoder<'a> {
         self.offset += 1;
         Ok(byte)
     }
+}
+
+fn update_lps(state: &mut u8, estimate: ProbabilityEstimate) {
+    let mut mps = *state >> 7;
+    invariant!(mps <= 1);
+    invariant!(usize::from(estimate.next_lps) < PROBABILITY_ESTIMATES.len());
+
+    if estimate.switch_mps {
+        mps ^= 1;
+    }
+    *state = (mps << 7) | estimate.next_lps;
+}
+
+fn update_mps(state: &mut u8, estimate: ProbabilityEstimate) {
+    let mps = *state >> 7;
+    invariant!(mps <= 1);
+    invariant!(usize::from(estimate.next_mps) < PROBABILITY_ESTIMATES.len());
+    *state = (mps << 7) | estimate.next_mps;
 }
 
 #[derive(Clone, Copy)]

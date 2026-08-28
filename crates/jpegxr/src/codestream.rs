@@ -7,7 +7,7 @@ use crate::error::{ErrorKind, Result};
 const CODESTREAM_SIGNATURE: u64 = 0x574D_5048_4F54_4F00;
 const MAX_TILES: usize = 4_096;
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct ParsedCodestream<'a> {
     pub(crate) bytes: &'a [u8],
     pub(crate) offset: usize,
@@ -287,7 +287,7 @@ impl OverlapMode {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct ImageHeader {
     pub(crate) frequency_mode: bool,
     pub(crate) spatial_transform: u8,
@@ -314,7 +314,7 @@ pub(crate) struct Margins {
     pub(crate) right: u8,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct PlaneHeader {
     pub(crate) internal_color_format: InternalColorFormat,
     pub(crate) scaled: bool,
@@ -330,7 +330,7 @@ pub(crate) struct PlaneHeader {
     pub(crate) highpass_quantization: Option<QuantizationSet>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub(crate) struct QuantizationSet {
     pub(crate) components: Vec<u8>,
 }
@@ -373,6 +373,7 @@ pub(crate) fn parse(codestream: Codestream<'_>) -> Result<ParsedCodestream<'_>> 
     } else {
         tile_count
     };
+
     let index_offsets = if header.index_table_present {
         let start_code = reader.read_u16(16)?;
 
@@ -440,6 +441,7 @@ pub(crate) fn parse(codestream: Codestream<'_>) -> Result<ParsedCodestream<'_>> 
     }
 
     let tiles_offset = reader.byte_position();
+
     let info = CodestreamInfo {
         width: header.width,
         height: header.height,
@@ -500,10 +502,12 @@ fn parse_image_header(reader: &mut BitReader<'_>) -> Result<ImageHeader> {
     let output_bit_depth = OutputBitDepth::parse(reader.read_u8(4)?, reader)?;
 
     let dimension_bits = if short_header { 16 } else { 32 };
+
     let width = reader
         .read_u32(dimension_bits)?
         .checked_add(1)
         .ok_or_else(|| reader.error(ErrorKind::LimitExceeded("image width")))?;
+
     let height = reader
         .read_u32(dimension_bits)?
         .checked_add(1)
@@ -517,6 +521,7 @@ fn parse_image_header(reader: &mut BitReader<'_>) -> Result<ImageHeader> {
     } else {
         (1, 1)
     };
+
     let tile_count = tile_columns
         .checked_mul(tile_rows)
         .ok_or_else(|| reader.error(ErrorKind::LimitExceeded("tile count")))?;
@@ -526,9 +531,11 @@ fn parse_image_header(reader: &mut BitReader<'_>) -> Result<ImageHeader> {
     }
 
     let tile_size_bits = if short_header { 8 } else { 16 };
+
     let transmitted_widths = (0..tile_columns.saturating_sub(1))
         .map(|_| reader.read_u16(tile_size_bits))
         .collect::<Result<Vec<_>>>()?;
+
     let transmitted_heights = (0..tile_rows.saturating_sub(1))
         .map(|_| reader.read_u16(tile_size_bits))
         .collect::<Result<Vec<_>>>()?;
@@ -551,6 +558,7 @@ fn parse_image_header(reader: &mut BitReader<'_>) -> Result<ImageHeader> {
     let extended_width = width
         .checked_add(u32::from(margins.left) + u32::from(margins.right))
         .ok_or_else(|| reader.error(ErrorKind::LimitExceeded("extended image width")))?;
+
     let extended_height = height
         .checked_add(u32::from(margins.top) + u32::from(margins.bottom))
         .ok_or_else(|| reader.error(ErrorKind::LimitExceeded("extended image height")))?;
@@ -563,8 +571,10 @@ fn parse_image_header(reader: &mut BitReader<'_>) -> Result<ImageHeader> {
 
     let macroblock_width = u16::try_from(extended_width / 16)
         .map_err(|_conversion_error| reader.error(ErrorKind::LimitExceeded("macroblock width")))?;
+
     let macroblock_height = u16::try_from(extended_height / 16)
         .map_err(|_conversion_error| reader.error(ErrorKind::LimitExceeded("macroblock height")))?;
+
     let tile_widths = complete_tile_sizes(transmitted_widths, macroblock_width, reader)?;
     let tile_heights = complete_tile_sizes(transmitted_heights, macroblock_height, reader)?;
 
@@ -651,6 +661,7 @@ fn parse_plane_header(reader: &mut BitReader<'_>, header: &ImageHeader) -> Resul
         };
 
     let dc_uniform = reader.read_bool()?;
+
     let dc_quantization = dc_uniform
         .then(|| parse_quantization(reader, component_count))
         .transpose()?;
@@ -659,6 +670,7 @@ fn parse_plane_header(reader: &mut BitReader<'_>, header: &ImageHeader) -> Resul
     let mut lowpass_quantization = None;
     let mut highpass_uniform = false;
     let mut highpass_quantization = None;
+
     if bands != Bands::DCOnly {
         let _reserved_i = reader.read_bool()?;
         lowpass_uniform = reader.read_bool()?;

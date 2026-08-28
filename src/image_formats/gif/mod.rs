@@ -54,9 +54,7 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
     options.set_memory_limit(MemoryLimit::Bytes(frame_limit));
     options.check_frame_consistency(true);
 
-    let mut decoder = options
-        .read_info(Cursor::new(bytes))
-        .map_err(|source| codec_error(&source))?;
+    let mut decoder = options.read_info(Cursor::new(bytes)).map_err(codec_error)?;
 
     let (width, height) = (u32::from(decoder.width()), u32::from(decoder.height()));
     validate_dimensions(width, height)?;
@@ -76,10 +74,7 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
     let mut frame_count = 0_u64;
     let mut first_rgba = None;
 
-    while let Some(frame) = decoder
-        .read_next_frame()
-        .map_err(|source| codec_error(&source))?
-    {
+    while let Some(frame) = decoder.read_next_frame().map_err(codec_error)? {
         account_frame(&mut frame_count, &mut decoded_animation_bytes, canvas_bytes)?;
         let (frame_width, frame_height, left, top) =
             validate_frame(frame, canvas_width, canvas_height)?;
@@ -106,16 +101,20 @@ fn account_frame(frame_count: &mut u64, decoded_bytes: &mut u64, canvas_bytes: u
         .checked_add(1)
         .ok_or_else(|| error(GIFError::Output("GIF frame count overflowed")))?;
     if *frame_count > FRAMES_MAX {
-        return Err(error(GIFError::LimitExceeded(GIFLimit::Frames(FRAMES_MAX))));
+        return Err(error(GIFError::LimitExceeded(GIFLimit::Frames {
+            actual: *frame_count,
+            max: FRAMES_MAX,
+        })));
     }
 
     *decoded_bytes = decoded_bytes
         .checked_add(canvas_bytes)
         .ok_or_else(|| error(GIFError::Output("GIF animation byte count overflowed")))?;
     if *decoded_bytes > ANIMATION_BYTES_MAX {
-        return Err(error(GIFError::LimitExceeded(GIFLimit::AnimationBytes(
-            ANIMATION_BYTES_MAX,
-        ))));
+        return Err(error(GIFError::LimitExceeded(GIFLimit::AnimationBytes {
+            actual: *decoded_bytes,
+            max: ANIMATION_BYTES_MAX,
+        })));
     }
 
     Ok(())
@@ -182,20 +181,25 @@ fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     }
 
     if width > DIMENSION_MAX || height > DIMENSION_MAX {
-        return Err(error(GIFError::LimitExceeded(GIFLimit::Dimensions(
-            DIMENSION_MAX,
-        ))));
+        return Err(error(GIFError::LimitExceeded(GIFLimit::Dimensions {
+            actual_width: width,
+            actual_height: height,
+            max: DIMENSION_MAX,
+        })));
     }
 
     let pixels = u64::from(width) * u64::from(height);
     if pixels > PIXELS_MAX {
-        return Err(error(GIFError::LimitExceeded(GIFLimit::Pixels(PIXELS_MAX))));
+        return Err(error(GIFError::LimitExceeded(GIFLimit::Pixels {
+            actual: pixels,
+            max: PIXELS_MAX,
+        })));
     }
 
     Ok(())
 }
 
-fn codec_error(source: &::gif::DecodingError) -> Error {
+fn codec_error(source: ::gif::DecodingError) -> Error {
     let detail = source.to_string();
     let lowercase = detail.to_ascii_lowercase();
 
@@ -204,7 +208,7 @@ fn codec_error(source: &::gif::DecodingError) -> Error {
             FRAME_BYTES_MAX,
         )))
     } else {
-        error(GIFError::Codec(detail))
+        error(GIFError::Codec(Box::new(source)))
     }
 }
 

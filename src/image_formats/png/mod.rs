@@ -52,7 +52,7 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
     decoder.set_ignore_text_chunk(true);
     decoder.set_ignore_iccp_chunk(true);
 
-    let mut reader = decoder.read_info().map_err(|source| codec_error(&source))?;
+    let mut reader = decoder.read_info().map_err(codec_error)?;
     let (width, height) = (reader.info().width, reader.info().height);
     validate_dimensions(width, height)?;
 
@@ -64,15 +64,14 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
 
     let rgba_size = rgba_size(width, height)?;
     if output_size > rgba_size {
-        return Err(error(PNGError::LimitExceeded(PNGLimit::DecodedBytes(
-            rgba_size,
-        ))));
+        return Err(error(PNGError::LimitExceeded(PNGLimit::DecodedBytes {
+            actual: output_size,
+            max: rgba_size,
+        })));
     }
 
     let mut pixel_buffer = vec![0; output_size];
-    let output = reader
-        .next_frame(&mut pixel_buffer)
-        .map_err(|source| codec_error(&source))?;
+    let output = reader.next_frame(&mut pixel_buffer).map_err(codec_error)?;
 
     if output.width != width || output.height != height {
         return Err(error(PNGError::Output(
@@ -105,14 +104,19 @@ fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     }
 
     if width > DIMENSION_MAX || height > DIMENSION_MAX {
-        return Err(error(PNGError::LimitExceeded(PNGLimit::Dimensions(
-            DIMENSION_MAX,
-        ))));
+        return Err(error(PNGError::LimitExceeded(PNGLimit::Dimensions {
+            actual_width: width,
+            actual_height: height,
+            max: DIMENSION_MAX,
+        })));
     }
 
     let pixels = u64::from(width) * u64::from(height);
     if pixels > PIXELS_MAX {
-        return Err(error(PNGError::LimitExceeded(PNGLimit::Pixels(PIXELS_MAX))));
+        return Err(error(PNGError::LimitExceeded(PNGLimit::Pixels {
+            actual: pixels,
+            max: PIXELS_MAX,
+        })));
     }
 
     Ok(())
@@ -135,6 +139,7 @@ fn normalize_rgba(
 ) -> Result<Vec<u8>> {
     let pixel_count = usize::try_from(u64::from(width) * u64::from(height))
         .expect("validated PNG pixel count fits usize");
+
     let channels = match color_type {
         ColorType::Grayscale => 1,
         ColorType::GrayscaleAlpha => 2,
@@ -146,14 +151,17 @@ fn normalize_rgba(
             )));
         }
     };
+
     let expected = pixel_count
         .checked_mul(channels)
         .ok_or_else(|| error(PNGError::Output("PNG sample count exceeds this platform")))?;
+
     if samples.len() != expected {
         return Err(error(PNGError::Output(
             "PNG codec returned an unexpected sample count",
         )));
     }
+
     if color_type == ColorType::Rgba {
         return Ok(samples.to_vec());
     }
@@ -185,13 +193,14 @@ fn normalize_rgba(
     Ok(rgba)
 }
 
-fn codec_error(source: &::png::DecodingError) -> Error {
-    let detail = source.to_string();
-    if detail.to_ascii_lowercase().contains("limit") {
+fn codec_error(source: ::png::DecodingError) -> Error {
+    // `png::DecodingError::LimitsExceeded` is a structured signal for the configured memory
+    // cap; it does not need substring matching against the error text.
+    if matches!(source, ::png::DecodingError::LimitsExceeded) {
         error(PNGError::LimitExceeded(PNGLimit::CodecMemory(
             CODEC_MEMORY_MAX,
         )))
     } else {
-        error(PNGError::Codec(detail))
+        error(PNGError::Codec(Box::new(source)))
     }
 }

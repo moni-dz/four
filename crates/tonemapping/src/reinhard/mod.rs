@@ -1,10 +1,15 @@
 use multiversion::multiversion;
+use std::backtrace::Backtrace;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::num::NonZeroUsize;
 use std::simd::{Select, cmp::SimdPartialOrd, num::SimdFloat};
 
-use super::{LinearRGB, LinearRGBPlanes, MaxCll, OrderedLevel, ToneMapper, WhitePoint};
+use super::{
+    LinearRGB, LinearRGBPlanes, MaxCll, OrderedLevel, ToneMapper, WhitePoint, WhitePointError,
+};
 use crate::simd::{COLOR_LANES, F32x8, map_colors, map_planes};
+use thiserror::Error;
 
 /// Applies the simple Reinhard curve independently to each component.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -156,9 +161,10 @@ pub struct LuminanceWhitePoint(WhitePoint);
 impl LuminanceWhitePoint {
     /// Creates a white point from a positive finite luminance.
     ///
-    /// Returns `None` when `luminance` is zero, negative, or non-finite.
-    #[must_use]
-    pub fn new(luminance: f32) -> Option<Self> {
+    /// # Errors
+    ///
+    /// Returns [`WhitePointError`] when `luminance` is zero, negative, or non-finite.
+    pub fn new(luminance: f32) -> Result<Self, WhitePointError> {
         WhitePoint::new(luminance).map(Self)
     }
 
@@ -169,10 +175,23 @@ impl LuminanceWhitePoint {
     }
 }
 
+impl TryFrom<f32> for LuminanceWhitePoint {
+    type Error = WhitePointError;
+
+    fn try_from(luminance: f32) -> Result<Self, Self::Error> {
+        Self::new(luminance)
+    }
+}
+
 /// Estimates a p99.99 luminance white point for a complete still image.
 ///
 /// This adapts [Smith and Zink]'s per-frame `MaxCLL` outlier percentile to Rec. 709 luminance. It is
 /// an analogous statistic for luminance-based curves, not `MaxCLL`.
+///
+/// # Panics
+///
+/// Never panics: `colors` is checked non-empty before it sizes the estimator, and every color is
+/// observed exactly once, so the declared and observed pixel counts always agree.
 ///
 /// [Smith and Zink]: https://doi.org/10.5594/JMI.2021.3090176
 #[must_use]
@@ -181,11 +200,15 @@ pub fn estimate_luminance_white_point(colors: &[LinearRGB]) -> Option<LuminanceW
         return None;
     }
 
-    let mut estimator = LuminanceWhitePointEstimator::new(colors.len());
+    let pixel_count = NonZeroUsize::new(colors.len()).expect("checked colors is not empty above");
+    let mut estimator = LuminanceWhitePointEstimator::new(pixel_count);
     for color in colors {
         estimator.observe(*color);
     }
-    estimator.finish()
+
+    estimator
+        .finish()
+        .expect("every declared color was observed above")
 }
 
 /// Estimates a p99.99 luminance white point from a stream of colors.
@@ -195,7 +218,9 @@ pub fn estimate_luminance_white_point(colors: &[LinearRGB]) -> Option<LuminanceW
 /// copy of this heap, without the parallel-merge support below.
 #[derive(Debug)]
 pub struct LuminanceWhitePointEstimator {
+    expected: NonZeroUsize,
     retained: usize,
+    observed: usize,
     luminances: BinaryHeap<Reverse<OrderedLevel>>,
 }
 
@@ -205,11 +230,13 @@ impl LuminanceWhitePointEstimator {
     /// Retains the brightest `floor(pixel_count / 10_000) + 1` luminances, which bounds memory
     /// while producing the same answer as sorting them all.
     #[must_use]
-    pub fn new(pixel_count: usize) -> Self {
-        let retained = pixel_count / 10_000 + 1;
+    pub fn new(pixel_count: NonZeroUsize) -> Self {
+        let retained = pixel_count.get() / 10_000 + 1;
 
         Self {
+            expected: pixel_count,
             retained,
+            observed: 0,
             luminances: BinaryHeap::with_capacity(retained),
         }
     }
@@ -217,6 +244,7 @@ impl LuminanceWhitePointEstimator {
     /// Includes one color in the estimate.
     #[inline]
     pub fn observe(&mut self, color: LinearRGB) {
+        self.observed = self.observed.saturating_add(1);
         self.retain(OrderedLevel(color.luminance()));
     }
 
@@ -236,19 +264,75 @@ impl LuminanceWhitePointEstimator {
     /// Both estimators must have been created with the same pixel count, so that they retain the
     /// same number of samples. This is what lets a caller split an image across worker threads.
     pub fn merge(&mut self, other: Self) {
-        debug_assert_eq!(self.retained, other.retained);
+        debug_assert_eq!(
+            self.expected, other.expected,
+            "merged luminance white point estimators must share a declared pixel count: {} vs {}",
+            self.expected, other.expected
+        );
 
+        debug_assert_eq!(
+            self.retained, other.retained,
+            "merged luminance white point estimators must retain the same sample count: {} vs {}",
+            self.retained, other.retained
+        );
+
+        self.observed = self.observed.saturating_add(other.observed);
         for luminance in other.luminances {
             self.retain(luminance.0);
         }
     }
 
-    /// Returns the estimated white point, or `None` if nothing was observed.
-    #[must_use]
-    pub fn finish(self) -> Option<LuminanceWhitePoint> {
-        self.luminances
+    /// Finishes the estimate after exactly the declared number of observations.
+    ///
+    /// Returns `Ok(None)` when every observed color mapped to zero luminance, since no positive
+    /// white point exists to report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LuminanceWhitePointCountError`] when the observed pixel count differs from the
+    /// count passed when constructing the estimator.
+    pub fn finish(self) -> Result<Option<LuminanceWhitePoint>, LuminanceWhitePointCountError> {
+        if self.observed != self.expected.get() {
+            return Err(LuminanceWhitePointCountError {
+                expected: self.expected.get(),
+                observed: self.observed,
+                backtrace: Backtrace::capture(),
+            });
+        }
+
+        Ok(self
+            .luminances
             .peek()
-            .and_then(|luminance| LuminanceWhitePoint::new(luminance.0.0))
+            .and_then(|luminance| LuminanceWhitePoint::new(luminance.0.0).ok()))
+    }
+}
+
+/// Reports a mismatch between declared and observed luminance white point pixel counts.
+#[derive(Debug, Error)]
+#[error("luminance white point estimator expected {expected} pixels but observed {observed}")]
+pub struct LuminanceWhitePointCountError {
+    expected: usize,
+    observed: usize,
+    backtrace: Backtrace,
+}
+
+impl LuminanceWhitePointCountError {
+    /// Returns the pixel count declared when the estimator was created.
+    #[must_use]
+    pub const fn expected(&self) -> usize {
+        self.expected
+    }
+
+    /// Returns the number of colors passed to the estimator.
+    #[must_use]
+    pub const fn observed(&self) -> usize {
+        self.observed
+    }
+
+    /// Returns the backtrace captured when the mismatch was detected.
+    #[must_use]
+    pub const fn backtrace(&self) -> &Backtrace {
+        &self.backtrace
     }
 }
 
@@ -371,11 +455,23 @@ pub struct Mobius {
 
 impl Mobius {
     /// Creates an operator with the supplied white point and `transition`.
-    #[must_use]
-    pub const fn new(white_point: LuminanceWhitePoint, transition: f32) -> Self {
-        Self {
-            white_point,
-            transition,
+    ///
+    /// `transition` is the scene level below which input passes through unchanged; the curve
+    /// compresses everything above it up to `white_point`. It must therefore be positive, finite,
+    /// and strictly less than `white_point`'s luminance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WhitePointError`] when `transition` is zero, negative, non-finite, or not less
+    /// than `white_point`'s luminance.
+    pub fn new(white_point: LuminanceWhitePoint, transition: f32) -> Result<Self, WhitePointError> {
+        if transition.is_finite() && transition > 0.0 && transition < white_point.luminance() {
+            Ok(Self {
+                white_point,
+                transition,
+            })
+        } else {
+            Err(WhitePointError(transition))
         }
     }
 
@@ -396,7 +492,11 @@ impl ToneMapper for Mobius {
     #[inline]
     fn map(&self, color: LinearRGB) -> LinearRGB {
         let components = color.components();
-        let signal = components.iter().copied().fold(1e-6, f32::max);
+        let signal = components
+            .iter()
+            .copied()
+            .fold(MOBIUS_SIGNAL_FLOOR, f32::max);
+
         let mapped = mobius_signal(signal, self.transition, self.white_point.luminance());
         let scale = mapped.algebraic_div(signal);
 
@@ -416,6 +516,19 @@ impl ToneMapper for Mobius {
     }
 }
 
+/// The minimum per-pixel signal fed into the Mobius curve.
+///
+/// `mobius_signal` and `mobius_batch` divide by the input signal to preserve hue. Flooring it here
+/// avoids dividing by zero for a fully black pixel; `1e-6` is far enough below any representable
+/// display level that the resulting scale is indistinguishable from the true (undefined) limit.
+const MOBIUS_SIGNAL_FLOOR: f32 = 1e-6;
+
+/// The minimum denominator when computing the Mobius curve's `b` coefficient.
+///
+/// `peak - 1.0` is that denominator. It reaches zero only when the resolved white point maps
+/// exactly to display white, which would otherwise divide by zero.
+const MOBIUS_COEFFICIENT_FLOOR: f32 = 1e-6;
+
 #[inline]
 fn mobius_signal(signal: f32, transition: f32, peak: f32) -> f32 {
     if signal <= transition {
@@ -423,6 +536,7 @@ fn mobius_signal(signal: f32, transition: f32, peak: f32) -> f32 {
     }
 
     let (a, b, scale) = mobius_coefficients(transition, peak);
+
     scale
         .algebraic_mul(signal.algebraic_add(a))
         .algebraic_div(signal.algebraic_add(b))
@@ -443,7 +557,7 @@ fn mobius_coefficients(transition: f32, peak: f32) -> (f32, f32, f32) {
     let b = transition_squared
         .algebraic_sub(doubled_transition.algebraic_mul(peak))
         .algebraic_add(peak)
-        .algebraic_div(peak.algebraic_sub(1.0).max(1e-6));
+        .algebraic_div(peak.algebraic_sub(1.0).max(MOBIUS_COEFFICIENT_FLOOR));
     let b_plus_transition = b.algebraic_add(transition);
     let scale = b_plus_transition
         .algebraic_mul(b_plus_transition)
@@ -464,7 +578,7 @@ fn mobius_batch(colors: &mut LinearRGBPlanes, transition: f32, peak: f32) {
         let signal = components[0]
             .simd_max(components[1])
             .simd_max(components[2])
-            .simd_max(F32x8::splat(1e-6));
+            .simd_max(F32x8::splat(MOBIUS_SIGNAL_FLOOR));
 
         let curved = curve_scale * (signal + a) / (signal + b);
         let mapped = signal.simd_le(transition).select(signal, curved);

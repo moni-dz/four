@@ -1,25 +1,48 @@
 //! Defines JPEG XR parser and decoder errors.
 
+use std::backtrace::Backtrace;
+use std::sync::Arc;
+
 /// Result returned by JPEG XR operations.
-pub type Result<T> = std::result::Result<T, Error>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// A JPEG XR failure with its byte position.
-#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 #[error("JPEG XR error at byte {offset}: {kind}")]
 pub struct Error {
     kind: ErrorKind,
     offset: usize,
+    // `Backtrace` implements neither `Clone` nor `PartialEq`/`Eq`, so it is kept behind an `Arc`
+    // (cloning shares the captured frames instead of re-unwinding) and excluded from equality,
+    // which compares only the classification and byte position below.
+    backtrace: Arc<Backtrace>,
 }
 
-impl Error {
-    pub(crate) const fn new(kind: ErrorKind, offset: usize) -> Self {
-        Self { kind, offset }
+impl Clone for Error {
+    fn clone(&self) -> Self {
+        Self {
+            kind: self.kind.clone(),
+            offset: self.offset,
+            backtrace: Arc::clone(&self.backtrace),
+        }
     }
+}
 
-    /// Returns the failure category.
-    #[must_use]
-    pub const fn kind(&self) -> &ErrorKind {
-        &self.kind
+impl PartialEq for Error {
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.offset == other.offset
+    }
+}
+
+impl Eq for Error {}
+
+impl Error {
+    pub(crate) fn new(kind: ErrorKind, offset: usize) -> Self {
+        Self {
+            kind,
+            offset,
+            backtrace: Arc::new(Backtrace::capture()),
+        }
     }
 
     /// Returns the byte position where decoding failed.
@@ -27,11 +50,93 @@ impl Error {
     pub const fn offset(&self) -> usize {
         self.offset
     }
+
+    /// Returns the backtrace captured when this error was created.
+    #[must_use]
+    pub fn backtrace(&self) -> &Backtrace {
+        &self.backtrace
+    }
+
+    /// Returns whether input ended before a complete syntax element was available.
+    #[must_use]
+    pub const fn is_unexpected_eof(&self) -> bool {
+        matches!(self.kind, ErrorKind::UnexpectedEof)
+    }
+
+    /// Returns whether the file header or codestream is missing its required signature.
+    #[must_use]
+    pub const fn is_invalid_signature(&self) -> bool {
+        matches!(self.kind, ErrorKind::InvalidSignature)
+    }
+
+    /// Returns whether the codestream uses a feature this decoder does not implement, or the
+    /// pixel format is not one this decoder supports.
+    #[must_use]
+    pub const fn is_unsupported(&self) -> bool {
+        matches!(
+            self.kind,
+            ErrorKind::Unsupported(_) | ErrorKind::UnsupportedPixelFormat(_)
+        )
+    }
+
+    /// Returns whether a declared image dimension (width or height) exceeds a decoder bound.
+    #[must_use]
+    pub fn is_dimension_limit_exceeded(&self) -> bool {
+        matches!(
+            self.kind,
+            ErrorKind::LimitExceeded("image dimension" | "image width" | "image height")
+        )
+    }
+
+    /// Returns whether the declared pixel count exceeds a decoder bound.
+    #[must_use]
+    pub fn is_pixel_count_limit_exceeded(&self) -> bool {
+        matches!(self.kind, ErrorKind::LimitExceeded("pixel count"))
+    }
+
+    /// Returns whether any declared resource size exceeds a decoder bound.
+    ///
+    /// This is a superset of [`Error::is_dimension_limit_exceeded`] and
+    /// [`Error::is_pixel_count_limit_exceeded`], which narrow to those two common cases; other
+    /// bounded resources (tag payloads, tile counts, output buffers, ...) are only reported here.
+    #[must_use]
+    pub const fn is_limit_exceeded(&self) -> bool {
+        matches!(self.kind, ErrorKind::LimitExceeded(_))
+    }
+
+    /// Returns whether the tag container and the embedded codestream disagree about the image
+    /// they describe.
+    #[must_use]
+    pub const fn is_container_mismatch(&self) -> bool {
+        matches!(self.kind, ErrorKind::ContainerMismatch(_))
+    }
+
+    /// Returns whether a tag container entry is malformed: an invalid offset, element type, or
+    /// tag value, an unsorted or missing tag, or too many directory entries.
+    #[must_use]
+    pub const fn is_invalid_tag_container(&self) -> bool {
+        matches!(
+            self.kind,
+            ErrorKind::InvalidOffset(_)
+                | ErrorKind::TooManyEntries
+                | ErrorKind::UnsortedTags
+                | ErrorKind::InvalidElementType(_)
+                | ErrorKind::MissingTag(_)
+                | ErrorKind::InvalidTag(_, _)
+        )
+    }
+
+    /// Returns whether the codestream violates a T.832 syntax requirement not covered by a more
+    /// specific classification above.
+    #[must_use]
+    pub const fn is_invalid_codestream(&self) -> bool {
+        matches!(self.kind, ErrorKind::InvalidCodestream(_))
+    }
 }
 
 /// Category of a JPEG XR failure.
 #[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
-pub enum ErrorKind {
+pub(crate) enum ErrorKind {
     /// Input ended before a complete syntax element was available.
     #[error("unexpected end of input")]
     UnexpectedEof,
@@ -39,9 +144,6 @@ pub enum ErrorKind {
     /// File header does not contain the JPEG XR signature.
     #[error("invalid JPEG XR signature")]
     InvalidSignature,
-    /// File uses an unsupported tag-container version.
-    #[error("unsupported container version {0}")]
-    UnsupportedVersion(u8),
 
     /// An offset is odd, out of range, or overlaps required header data.
     #[error("invalid {0} offset")]

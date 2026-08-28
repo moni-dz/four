@@ -66,15 +66,40 @@ pub enum JPEGError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JPEGLimit {
     /// Maximum accepted width or height in pixels.
-    Dimensions(u32),
+    Dimensions {
+        /// The width or height that exceeded `max`.
+        actual: u32,
+        /// Maximum accepted width or height in pixels.
+        max: u32,
+    },
     /// Maximum accepted number of data units in one MCU.
-    FrameDataUnits(u8),
+    FrameDataUnits {
+        /// The number of data units computed for the frame's MCU.
+        actual: u32,
+        /// Maximum accepted number of data units in one MCU.
+        max: u32,
+    },
     /// Maximum accepted decoded pixel count.
-    Pixels(u64),
+    Pixels {
+        /// The decoded pixel count that exceeded `max`.
+        actual: u64,
+        /// Maximum accepted decoded pixel count.
+        max: u64,
+    },
     /// Maximum accepted progressive coefficient storage in bytes.
-    ProgressiveCoefficientBytes(u64),
+    ProgressiveCoefficientBytes {
+        /// The computed storage size, in bytes, that exceeded `max`.
+        actual: u64,
+        /// Maximum accepted progressive coefficient storage in bytes.
+        max: u64,
+    },
     /// Maximum accepted number of scans.
-    Scans(u32),
+    Scans {
+        /// The scan count that exceeded `max`.
+        actual: u32,
+        /// Maximum accepted number of scans.
+        max: u32,
+    },
 }
 
 /// Identifies the decoder table associated with a [`JPEGError::Table`] failure.
@@ -135,32 +160,33 @@ impl std::error::Error for JPEGError {}
 /// Raises a leaf error at its validation site so `exn` records the useful source location.
 #[track_caller]
 pub(super) fn error(error: JPEGError) -> Error {
-    invariant!(
-        !error.to_string().is_empty(),
-        "a JPEG error must have a useful display message"
-    );
     error.raise()
 }
 
 fn write_limit_error(formatter: &mut fmt::Formatter<'_>, limit: JPEGLimit) -> fmt::Result {
     match limit {
-        JPEGLimit::Dimensions(max) => {
-            write!(formatter, "JPEG dimensions exceed the {max}-pixel limit")
-        }
-        JPEGLimit::FrameDataUnits(max) => {
-            write!(formatter, "frame has more than {max} data units per MCU")
-        }
-        JPEGLimit::Pixels(max) => write!(
+        JPEGLimit::Dimensions { actual, max } => write!(
             formatter,
-            "JPEG pixel count exceeds the {}-megapixel limit",
+            "JPEG dimension {actual} exceeds the {max}-pixel limit"
+        ),
+        JPEGLimit::FrameDataUnits { actual, max } => write!(
+            formatter,
+            "frame has {actual} data units per MCU, more than the {max} limit"
+        ),
+        JPEGLimit::Pixels { actual, max } => write!(
+            formatter,
+            "JPEG pixel count {actual} exceeds the {}-megapixel limit",
             max / 1024 / 1024
         ),
-        JPEGLimit::ProgressiveCoefficientBytes(max) => write!(
+        JPEGLimit::ProgressiveCoefficientBytes { actual, max } => write!(
             formatter,
-            "progressive coefficient storage exceeds the {} MiB limit",
+            "progressive coefficient storage of {actual} bytes exceeds the {} MiB limit",
             max / 1024 / 1024
         ),
-        JPEGLimit::Scans(max) => write!(formatter, "JPEG contains more than {max} scans"),
+        JPEGLimit::Scans { actual, max } => write!(
+            formatter,
+            "JPEG contains {actual} scans, more than the {max} limit"
+        ),
     }
 }
 
@@ -187,5 +213,62 @@ fn write_unsupported_error(
             formatter,
             "JPEG sample precision {precision} is unsupported; expected 8"
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_error_variant_has_a_useful_display_message() {
+        let limits = [
+            JPEGLimit::Dimensions { actual: 1, max: 1 },
+            JPEGLimit::FrameDataUnits { actual: 1, max: 1 },
+            JPEGLimit::Pixels { actual: 1, max: 1 },
+            JPEGLimit::ProgressiveCoefficientBytes { actual: 1, max: 1 },
+            JPEGLimit::Scans { actual: 1, max: 1 },
+        ];
+        for limit in limits {
+            assert_ne!(JPEGError::LimitExceeded(limit).to_string(), "");
+        }
+
+        let unsupported = [
+            UnsupportedJPEG::AdobeColorTransform(0),
+            UnsupportedJPEG::ComponentCount(0),
+            UnsupportedJPEG::FrameType(0),
+            UnsupportedJPEG::Marker(0),
+            UnsupportedJPEG::SamplePrecision(0),
+        ];
+        for feature in unsupported {
+            assert_ne!(JPEGError::Unsupported(feature).to_string(), "");
+        }
+
+        let variants = [
+            JPEGError::ArithmeticOverflow("detail"),
+            JPEGError::Codec("detail".to_string()),
+            JPEGError::Entropy("detail"),
+            JPEGError::ExpectedMarkerPrefix {
+                context: "context",
+                found: 0,
+            },
+            JPEGError::Frame("detail"),
+            JPEGError::Marker("detail"),
+            JPEGError::RestartMarkerMismatch {
+                expected: 0,
+                found: 0,
+            },
+            JPEGError::Scan("detail"),
+            JPEGError::Segment("detail"),
+            JPEGError::Table(JPEGTableKind::Quantization, "detail"),
+            JPEGError::UnexpectedEnd("detail"),
+            JPEGError::UnexpectedMarker {
+                context: "context",
+                found: 0,
+            },
+        ];
+        for variant in variants {
+            assert_ne!(variant.to_string(), "");
+        }
     }
 }

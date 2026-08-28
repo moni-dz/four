@@ -1,8 +1,8 @@
 mod decoder;
 
 use super::{
-    COMPONENTS_MAX, Frame, FrameComponent, JPEGError, Result, ScanHeader, ZIGZAG_TO_NATURAL,
-    dequantize_block, error, idct, write_block,
+    COMPONENTS_MAX, Frame, FrameComponent, JPEGError, JPEGTableKind, Result, ScanHeader,
+    ZIGZAG_TO_NATURAL, dequantize_block, error, idct, write_block,
 };
 use decoder::Decoder;
 use exn::OptionExt;
@@ -12,10 +12,43 @@ const DC_STATISTICS_COUNT: usize = 64;
 const AC_STATISTICS_COUNT: usize = 256;
 const FIXED_STATE_INDEX: u8 = 113;
 
+// ITU-T T.81 Annex F assigns AC magnitude-category decoding the "X1" context 189 when the
+// coefficient's spectral position is within the scan's conditioning bound, and 217 otherwise.
+const AC_MAGNITUDE_CATEGORY_CONTEXT_LOW: usize = 189;
+const AC_MAGNITUDE_CATEGORY_CONTEXT_HIGH: usize = 217;
+
+// ITU-T T.81 Annex F reserves DC statistics index 20 as the "X1" context that starts
+// magnitude-category decoding once a DC difference's first magnitude bit is set.
+const DC_MAGNITUDE_CATEGORY_CONTEXT: usize = 20;
+
+// Both the DC and AC magnitude-category loops walk forward through a run of context indices;
+// decoding the coefficient's individual magnitude bits resumes this many indices past wherever
+// that loop stopped (ITU-T T.81 Annex F magnitude-bit decoding follows the category contexts).
+const MAGNITUDE_BITS_CONTEXT_OFFSET: usize = 14;
+
 #[derive(Clone, Copy)]
 pub(super) struct DCConditioning {
-    pub(super) lower: u8,
-    pub(super) upper: u8,
+    lower: u8,
+    upper: u8,
+}
+
+impl DCConditioning {
+    /// Constructs conditioning bounds already known to satisfy `lower <= upper`.
+    const fn new_unchecked(lower: u8, upper: u8) -> Self {
+        Self { lower, upper }
+    }
+
+    /// Parses DC conditioning bounds from a DAC segment, validating the JPEG-spec `L <= U`
+    /// ordering once instead of at every call site.
+    pub(super) fn parse(lower: u8, upper: u8) -> Result<Self> {
+        if lower > upper {
+            return Err(error(JPEGError::Table(
+                JPEGTableKind::ArithmeticConditioning,
+                "DC arithmetic conditioning requires L <= U",
+            )));
+        }
+        Ok(Self { lower, upper })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -27,7 +60,7 @@ pub(super) struct ConditioningTables {
 impl ConditioningTables {
     pub(super) const fn defaults() -> Self {
         let tables = Self {
-            dc: [DCConditioning { lower: 0, upper: 1 }; TABLES_MAX],
+            dc: [DCConditioning::new_unchecked(0, 1); TABLES_MAX],
             ac: [5; TABLES_MAX],
         };
         invariant!(tables.dc[0].lower <= tables.dc[0].upper);
@@ -64,6 +97,7 @@ pub(super) fn decode_sequential(
     invariant!(plans.len() <= COMPONENTS_MAX);
 
     let (mcu_columns, mcu_rows) = sequential_scan_dimensions(frame, plans);
+
     let mcu_count = mcu_columns
         .checked_mul(mcu_rows)
         .ok_or_raise(|| JPEGError::ArithmeticOverflow("arithmetic MCU count overflowed"))?;
@@ -113,7 +147,9 @@ fn decode_sequential_mcu(
         let plan = &plans[0];
         let samples = decode_sequential_block(state, plan, conditioning, 0)?;
         let component = &mut frame.components[plan.frame_index];
+
         write_block(component, mcu_x, mcu_y, &samples);
+
         return Ok(());
     }
 
@@ -122,8 +158,10 @@ fn decode_sequential_mcu(
             for block_x in 0..plan.horizontal_sampling {
                 let samples = decode_sequential_block(state, plan, conditioning, predictor_index)?;
                 let component = &mut frame.components[plan.frame_index];
+
                 let x = mcu_x * u32::from(plan.horizontal_sampling) + u32::from(block_x);
                 let y = mcu_y * u32::from(plan.vertical_sampling) + u32::from(block_y);
+
                 write_block(component, x, y, &samples);
             }
         }
@@ -530,14 +568,19 @@ fn decode_ac_value(
     if magnitude != 0 && state.decode_ac(table, context)? != 0 {
         magnitude <<= 1;
         context = if spectral <= conditioning_index {
-            189
+            AC_MAGNITUDE_CATEGORY_CONTEXT_LOW
         } else {
-            217
+            AC_MAGNITUDE_CATEGORY_CONTEXT_HIGH
         };
         (magnitude, context) = decode_magnitude_category_ac(state, table, context, magnitude)?;
     }
 
-    let value = decode_magnitude_bits_ac(state, table, context + 14, magnitude)?;
+    let value = decode_magnitude_bits_ac(
+        state,
+        table,
+        context + MAGNITUDE_BITS_CONTEXT_OFFSET,
+        magnitude,
+    )?;
     let signed = i32::from(value) + 1;
 
     if sign == 0 { Ok(signed) } else { Ok(-signed) }
@@ -550,7 +593,10 @@ fn decode_magnitude_category_ac(
     mut magnitude: u16,
 ) -> Result<(u16, usize)> {
     invariant_eq!(magnitude, 2);
-    invariant!(context == 189 || context == 217);
+    invariant!(
+        context == AC_MAGNITUDE_CATEGORY_CONTEXT_LOW
+            || context == AC_MAGNITUDE_CATEGORY_CONTEXT_HIGH
+    );
 
     let mut decisions = 0_u8;
 
@@ -672,15 +718,22 @@ impl<'a> ScanState<'a> {
             self.dc_contexts[predictor_index] = 0;
             return Ok(0);
         }
+
         let sign = self.decode_dc(table, context_base + 1)?;
         let mut context = context_base + 2 + usize::from(sign);
         let mut magnitude = u16::from(self.decode_dc(table, context)?);
         if magnitude != 0 {
-            context = 20;
+            context = DC_MAGNITUDE_CATEGORY_CONTEXT;
             (magnitude, context) = self.decode_dc_magnitude_category(table, context, magnitude)?;
         }
+
         self.dc_contexts[predictor_index] = dc_context(magnitude, sign, conditioning);
-        let value = self.decode_dc_magnitude_bits(table, context + 14, magnitude)?;
+
+        let value = self.decode_dc_magnitude_bits(
+            table,
+            context + MAGNITUDE_BITS_CONTEXT_OFFSET,
+            magnitude,
+        )?;
         let signed = i32::from(value) + 1;
         if sign == 0 { Ok(signed) } else { Ok(-signed) }
     }
@@ -692,7 +745,7 @@ impl<'a> ScanState<'a> {
         mut magnitude: u16,
     ) -> Result<(u16, usize)> {
         invariant_eq!(magnitude, 1);
-        invariant_eq!(context, 20);
+        invariant_eq!(context, DC_MAGNITUDE_CATEGORY_CONTEXT);
 
         let mut decisions = 0_u8;
         while self.decode_dc(table, context)? != 0 {

@@ -50,7 +50,7 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
     let mut image = JxlImage::builder()
         .alloc_tracker(tracker)
         .read(Cursor::new(bytes))
-        .map_err(|source| codec_error(source.as_ref()))?;
+        .map_err(codec_error)?;
 
     let width = image.width();
     let height = image.height();
@@ -64,9 +64,7 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
     image.request_color_encoding(EnumColourEncoding::srgb(RenderingIntent::Perceptual));
 
     let pixel_format = image.pixel_format();
-    let render = image
-        .render_frame(0)
-        .map_err(|source| codec_error(source.as_ref()))?;
+    let render = image.render_frame(0).map_err(codec_error)?;
 
     let mut stream = render.stream();
     if stream.width() != width || stream.height() != height {
@@ -109,15 +107,18 @@ fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     }
 
     if width > DIMENSION_MAX || height > DIMENSION_MAX {
-        return Err(error(JPEGXLError::LimitExceeded(JPEGXLLimit::Dimensions(
-            DIMENSION_MAX,
-        ))));
+        return Err(error(JPEGXLError::LimitExceeded(JPEGXLLimit::Dimensions {
+            actual_width: width,
+            actual_height: height,
+            max: DIMENSION_MAX,
+        })));
     }
 
     if u64::from(width) * u64::from(height) > PIXELS_MAX {
-        return Err(error(JPEGXLError::LimitExceeded(JPEGXLLimit::Pixels(
-            PIXELS_MAX,
-        ))));
+        return Err(error(JPEGXLError::LimitExceeded(JPEGXLLimit::Pixels {
+            actual: u64::from(width) * u64::from(height),
+            max: PIXELS_MAX,
+        })));
     }
 
     Ok(())
@@ -175,15 +176,24 @@ fn normalize_rgba(
     }
 }
 
-fn codec_error(source: &(dyn std::error::Error + Send + Sync + 'static)) -> Error {
+fn codec_error(source: Box<dyn std::error::Error + Send + Sync + 'static>) -> Error {
     let detail = source.to_string();
     let lowercase_detail = detail.to_ascii_lowercase();
 
-    if lowercase_detail.contains("memory limit") || lowercase_detail.contains("out of memory") {
+    // `jxl-oxide` never exposes a structured "out of memory" signal through its public API:
+    // the concrete allocation-tracker error (`jxl_grid::OutOfMemory`, which does carry the
+    // failed allocation's byte count) is reachable only by adding `jxl_grid` as a direct
+    // dependency, since `jxl-oxide` re-exports `AllocTracker` but not the error type it raises.
+    // Every allocation-limit failure in the dependency chain renders through one of two literal
+    // phrases: `jxl_grid::OutOfMemory`'s "failed to allocate N byte(s)" or
+    // `jxl_frame::Error::OutOfMemory`'s "out of memory"; "memory limit" is never actually
+    // emitted anywhere in the chain, so it is dropped from the match below.
+    if lowercase_detail.contains("failed to allocate") || lowercase_detail.contains("out of memory")
+    {
         error(JPEGXLError::LimitExceeded(JPEGXLLimit::DecoderMemory(
             DECODER_MEMORY_MAX,
         )))
     } else {
-        error(JPEGXLError::Codec(detail))
+        error(JPEGXLError::Codec(source))
     }
 }

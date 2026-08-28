@@ -30,7 +30,7 @@ pub(super) struct LoadError {
 impl LoadError {
     pub(super) fn new(message: impl Into<String>) -> Self {
         let message = message.into();
-        assert_ne!(message.len(), 0);
+        assert_ne!(message.len(), 0, "load error message must not be blank");
         Self { message }
     }
 }
@@ -54,7 +54,7 @@ pub(super) fn format_load_error(error: &LoadException) -> String {
 
     for _ in 0..ERROR_FRAMES_MAX {
         let Some(child) = frame.children().first() else {
-            assert_ne!(message.len(), 0);
+            assert_ne!(message.len(), 0, "formatted load error must not be blank");
             return message;
         };
 
@@ -66,7 +66,7 @@ pub(super) fn format_load_error(error: &LoadException) -> String {
         message.push_str(": additional error context omitted");
     }
 
-    assert_ne!(message.len(), 0);
+    assert_ne!(message.len(), 0, "formatted load error must not be blank");
     message
 }
 
@@ -131,14 +131,22 @@ pub(super) struct ImageMetadata {
 impl ImageMetadata {
     fn new(path: &Path, decoded: &DecodedImageState) -> Self {
         let (width, height) = decoded.image.dimensions();
-        assert!(width > 0);
-        assert!(height > 0);
-        assert!(decoded.byte_count <= IMAGE_FILE_BYTES_MAX);
+        assert!(width > 0, "decoded image width must be nonzero");
+        assert!(height > 0, "decoded image height must be nonzero");
+        assert!(
+            decoded.byte_count <= IMAGE_FILE_BYTES_MAX,
+            "decoded byte count {} exceeds the configured {IMAGE_FILE_BYTES_MAX}-byte limit",
+            decoded.byte_count
+        );
 
         let divisor = greatest_common_divisor(width, height);
         let pixel_count = u64::from(width) * u64::from(height);
         let (pixels, remainder) = decoded.image.rgba8().as_chunks::<4>();
-        assert_eq!(remainder.len(), 0);
+        assert_eq!(
+            remainder.len(),
+            0,
+            "decoded RGBA8 buffer length must be a multiple of 4"
+        );
         let transparency = pixels.iter().any(|pixel| pixel[3] != u8::MAX);
 
         let mut fields = vec![
@@ -168,7 +176,10 @@ impl ImageMetadata {
             if transparency { "Present" } else { "None" },
         ));
 
-        assert!(fields.iter().all(|field| !field.value.is_empty()));
+        assert!(
+            fields.iter().all(|field| !field.value.is_empty()),
+            "every metadata field value must be nonempty"
+        );
         Self {
             fields,
             has_hdr_metrics,
@@ -186,8 +197,12 @@ pub(super) struct MetadataField {
 impl MetadataField {
     fn new(label: &'static str, value: impl Into<SharedString>) -> Self {
         let value = value.into();
-        assert_ne!(label.len(), 0);
-        assert_ne!(value.len(), 0);
+        assert_ne!(label.len(), 0, "metadata field label must not be blank");
+        assert_ne!(
+            value.len(),
+            0,
+            "metadata field value for {label:?} must not be blank"
+        );
         Self {
             label,
             value,
@@ -423,7 +438,7 @@ fn jpeg_xr_hdr_fields(metadata: jpeg_xr::JPEGXRMetadata) -> [MetadataField; 6] {
             format!("{max_cll:.3} ({})", max_cll_channel.symbol()),
         ),
         MetadataField::new("Max Luminance", format!("{max_luminance:.3} cd / m²")),
-        MetadataField::new("Avg Luminance", format!("{average_luminance:.3} cd / m²")),
+        MetadataField::new("Avg. Luminance", format!("{average_luminance:.3} cd / m²")),
         MetadataField::new("Min Luminance", format!("{min_luminance:.3} cd / m²")),
         MetadataField::section("Rec. 709", format!("{rec709:.4} %")),
         MetadataField::new("DCI-P3", format!("{dci_p3:.4} %")),
@@ -431,14 +446,23 @@ fn jpeg_xr_hdr_fields(metadata: jpeg_xr::JPEGXRMetadata) -> [MetadataField; 6] {
 }
 
 fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
-    assert!(left > 0);
-    assert!(right > 0);
+    assert!(
+        left > 0,
+        "greatest_common_divisor requires a nonzero left operand"
+    );
+    assert!(
+        right > 0,
+        "greatest_common_divisor requires a nonzero right operand"
+    );
 
     while right != 0 {
         (left, right) = (right, left % right);
     }
 
-    assert!(left > 0);
+    assert!(
+        left > 0,
+        "greatest common divisor of two positive integers must be positive"
+    );
     left
 }
 
@@ -465,8 +489,15 @@ fn format_pixel_count(pixels: u64) -> String {
 }
 
 fn format_hundredths(value: u64, unit: u64, suffix: &str) -> String {
-    assert!(unit > 0);
-    assert_ne!(suffix.len(), 0);
+    assert!(
+        unit > 0,
+        "format_hundredths requires a nonzero unit divisor"
+    );
+    assert_ne!(
+        suffix.len(),
+        0,
+        "format_hundredths requires a nonblank suffix"
+    );
 
     let scaled = value
         .checked_mul(100)
@@ -495,10 +526,10 @@ fn display_image(source_format: SourceFormat, bytes: Vec<u8>, decoded: &DecodedI
 }
 
 pub(super) fn load_image(path: &Path) -> LoadResult<LoadedImage> {
-    load_image_with_options_and_hdr_metrics(path, HDROptions::default(), false)
+    load_image_with(path, HDROptions::default(), false)
 }
 
-pub(super) fn load_image_with_options_and_hdr_metrics(
+pub(super) fn load_image_with(
     path: &Path,
     hdr_options: HDROptions,
     include_hdr_metrics: bool,
@@ -554,7 +585,11 @@ pub(super) fn load_image_with_options_and_hdr_metrics(
         status: format!("{} — {width} × {height}", display_file_name(path)).into(),
     };
 
-    assert_ne!(loaded.status.len(), 0);
+    assert_ne!(
+        loaded.status.len(),
+        0,
+        "loaded image status must not be blank"
+    );
     Ok(loaded)
 }
 

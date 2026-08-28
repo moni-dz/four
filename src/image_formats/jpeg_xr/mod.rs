@@ -27,9 +27,7 @@ mod error;
 use std::num::NonZeroUsize;
 use std::simd::{Select, Simd, StdFloat, cmp::SimdPartialOrd, num::SimdFloat};
 
-use ::jpegxr::{
-    Decoder as JXRDecoder, ErrorKind as CodecErrorKind, PixelFormat as CodecPixelFormat,
-};
+use ::jpegxr::{Decoder as JXRDecoder, PixelFormat as CodecPixelFormat};
 use multiversion::multiversion;
 use rayon::prelude::*;
 use tonemapping::{
@@ -366,16 +364,8 @@ pub fn decode_with_metadata_and_options(
     let width = decoder.info().width();
     let height = decoder.info().height();
     let (width, height) = validate_dimensions(
-        i32::try_from(width).map_err(|_error| {
-            error(JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions(
-                DIMENSION_MAX,
-            )))
-        })?,
-        i32::try_from(height).map_err(|_error| {
-            error(JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions(
-                DIMENSION_MAX,
-            )))
-        })?,
+        i32::try_from(width).map_err(|_error| dimension_overflow_error(width))?,
+        i32::try_from(height).map_err(|_error| dimension_overflow_error(height))?,
     )?;
 
     let pixel_format = decoder.info().pixel_format();
@@ -402,7 +392,10 @@ pub fn decode_with_metadata_and_options(
 
     if source_len > SOURCE_BUFFER_MAX {
         return Err(error(JPEGXRError::LimitExceeded(
-            JPEGXRLimit::SourceBufferBytes(SOURCE_BUFFER_MAX),
+            JPEGXRLimit::SourceBufferBytes {
+                actual: Some(source_len),
+                max: SOURCE_BUFFER_MAX,
+            },
         )));
     }
 
@@ -642,9 +635,11 @@ fn normalize(
             row_stride,
             layout,
             options.max_cll_mode(),
-            options.includes_hdr_metrics() || method.uses_white_point(),
-            method.uses_luminance_white_point(),
-            options.includes_hdr_metrics(),
+            AnalysisScope {
+                estimate_max_cll: options.includes_hdr_metrics() || method.uses_white_point(),
+                estimate_luminance_white_point: method.uses_luminance_white_point(),
+                collect_hdr_metrics: options.includes_hdr_metrics(),
+            },
         )?)
     } else {
         None
@@ -778,6 +773,7 @@ fn write_hdr_pixels_scalar(
             target.copy_from_slice(&[color[0], color[1], color[2], normalized_to_u8(alpha)]);
         }
     }
+
     Ok(has_nonzero_alpha)
 }
 
@@ -989,7 +985,9 @@ impl HDRPixelSelection {
         } else {
             source_pixel_count
         };
+
         let exclude_fully_transparent = layout.has_alpha && visible_alpha_pixels > 0;
+
         let count = if exclude_fully_transparent {
             visible_alpha_pixels
         } else {
@@ -998,6 +996,7 @@ impl HDRPixelSelection {
 
         invariant!(count > 0);
         invariant!(count <= source_pixel_count);
+
         Ok(Self {
             count,
             exclude_fully_transparent,
@@ -1019,9 +1018,11 @@ impl HDRMetrics {
             row_stride,
             layout,
             max_cll_mode,
-            true,
-            estimate_luminance_white_point,
-            true,
+            AnalysisScope {
+                estimate_max_cll: true,
+                estimate_luminance_white_point,
+                collect_hdr_metrics: true,
+            },
         )
         .map(|analysis| {
             analysis
@@ -1029,6 +1030,14 @@ impl HDRMetrics {
                 .expect("full HDR analysis produces display metrics")
         })
     }
+}
+
+/// Which measurements an HDR analysis pass collects.
+#[derive(Clone, Copy, Debug)]
+struct AnalysisScope {
+    estimate_max_cll: bool,
+    estimate_luminance_white_point: bool,
+    collect_hdr_metrics: bool,
 }
 
 /// The parameters that decide which measurements an analysis pass collects.
@@ -1068,9 +1077,12 @@ impl AnalysisTotals {
                     request.max_cll_mode,
                 )
             }),
-            luminance_white_point_estimator: request
-                .estimate_luminance_white_point
-                .then(|| LuminanceWhitePointEstimator::new(request.pixel_count)),
+            luminance_white_point_estimator: request.estimate_luminance_white_point.then(|| {
+                LuminanceWhitePointEstimator::new(
+                    NonZeroUsize::new(request.pixel_count)
+                        .expect("HDR analysis includes at least one pixel"),
+                )
+            }),
             max_cll_batch: request
                 .estimate_max_cll
                 .then(|| Vec::with_capacity(HDR_BATCH_PIXELS.min(request.pixel_count))),
@@ -1088,13 +1100,16 @@ impl AnalysisTotals {
             if request.selection.exclude_fully_transparent && alpha == 0.0 {
                 return;
             }
+
             if let Some(accumulator) = &mut self.accumulator {
                 accumulator.observe(color);
             }
+
             let color = LinearRGB::new(color);
             if let Some(estimator) = &mut self.luminance_white_point_estimator {
                 estimator.observe(color);
             }
+
             if let Some(batch) = &mut self.max_cll_batch {
                 batch.push(color);
                 if batch.len() == HDR_BATCH_PIXELS {
@@ -1140,13 +1155,11 @@ impl HDRAnalysis {
         row_stride: usize,
         layout: PixelLayout,
         max_cll_mode: MaxCLLMode,
-        estimate_max_cll: bool,
-        estimate_luminance_white_point: bool,
-        collect_hdr_metrics: bool,
+        scope: AnalysisScope,
     ) -> Result<Self> {
         invariant!(layout.encoding.is_hdr());
         invariant!(row_stride >= layout.bytes_per_pixel);
-        invariant!(!collect_hdr_metrics || estimate_max_cll);
+        invariant!(!scope.collect_hdr_metrics || scope.estimate_max_cll);
 
         let selection = HDRPixelSelection::new(source, row_stride, layout)?;
         let pixel_count = selection.count;
@@ -1155,40 +1168,12 @@ impl HDRAnalysis {
             selection,
             pixel_count,
             max_cll_mode,
-            estimate_max_cll,
-            estimate_luminance_white_point,
-            collect_hdr_metrics,
+            estimate_max_cll: scope.estimate_max_cll,
+            estimate_luminance_white_point: scope.estimate_luminance_white_point,
+            collect_hdr_metrics: scope.collect_hdr_metrics,
         };
 
-        // This pass used to run on one thread while the write pass that follows it was already
-        // parallel, which made it the largest serial block in an HDR decode. All three
-        // accumulators merge associatively, so the image can be split by row groups.
-        //
-        // Job size is computed in pixels, not row-stride bytes: `write_pixel_slabs` below uses the
-        // same `width`-based formula, and BGR101010/RGBA32F have very different bytes-per-pixel, so
-        // sizing off `row_stride` alone produced wildly different job counts per format.
-        let width = row_stride / layout.bytes_per_pixel;
-        let rows_per_job = PARALLEL_PIXELS_PER_JOB.div_ceil(width);
-        let totals = if pixel_count < PARALLEL_PIXELS_MIN {
-            let mut totals = AnalysisTotals::new(&request);
-            totals.observe_slab(source, row_stride, layout, &request)?;
-            totals
-        } else {
-            source
-                .par_chunks(rows_per_job * row_stride)
-                .map(|slab| {
-                    let mut totals = AnalysisTotals::new(&request);
-                    totals.observe_slab(slab, row_stride, layout, &request)?;
-                    Ok(totals)
-                })
-                .try_reduce(
-                    || AnalysisTotals::new(&request),
-                    |mut left, right| {
-                        left.merge(right);
-                        Ok::<AnalysisTotals, Error>(left)
-                    },
-                )?
-        };
+        let totals = compute_totals(source, row_stride, layout, &request)?;
 
         let AnalysisTotals {
             accumulator,
@@ -1213,8 +1198,11 @@ impl HDRAnalysis {
         }
 
         let max_cll = max_cll_estimator.map(finish_max_cll);
-        let luminance_white_point =
-            luminance_white_point_estimator.and_then(LuminanceWhitePointEstimator::finish);
+        let luminance_white_point = luminance_white_point_estimator.and_then(|estimator| {
+            estimator
+                .finish()
+                .expect("HDR analysis observes exactly its declared pixel count")
+        });
         let hdr_metrics = accumulator.map(|accumulator| {
             accumulator.finish(
                 max_cll.expect("display HDR metrics include MaxCLL"),
@@ -1229,6 +1217,47 @@ impl HDRAnalysis {
             hdr_metrics,
         })
     }
+}
+
+/// Gathers analysis measurements over `source`, splitting the work by row group when the image is
+/// large enough for the split to pay for itself.
+///
+/// This pass used to run on one thread while the write pass that follows it was already parallel,
+/// which made it the largest serial block in an HDR decode. All three accumulators merge
+/// associatively, so the image can be split by row groups.
+///
+/// Job size is computed in pixels, not row-stride bytes: `write_pixel_slabs` below uses the same
+/// `width`-based formula, and BGR101010/RGBA32F have very different bytes-per-pixel, so sizing off
+/// `row_stride` alone produced wildly different job counts per format.
+fn compute_totals(
+    source: &[u8],
+    row_stride: usize,
+    layout: PixelLayout,
+    request: &AnalysisRequest,
+) -> Result<AnalysisTotals> {
+    let width = row_stride / layout.bytes_per_pixel;
+    let rows_per_job = PARALLEL_PIXELS_PER_JOB.div_ceil(width);
+
+    if request.pixel_count < PARALLEL_PIXELS_MIN {
+        let mut totals = AnalysisTotals::new(request);
+        totals.observe_slab(source, row_stride, layout, request)?;
+        return Ok(totals);
+    }
+
+    source
+        .par_chunks(rows_per_job * row_stride)
+        .map(|slab| {
+            let mut totals = AnalysisTotals::new(request);
+            totals.observe_slab(slab, row_stride, layout, request)?;
+            Ok(totals)
+        })
+        .try_reduce(
+            || AnalysisTotals::new(request),
+            |mut left, right| {
+                left.merge(right);
+                Ok::<AnalysisTotals, Error>(left)
+            },
+        )
 }
 
 fn finish_max_cll(estimator: MaxCLLEstimator) -> MaxCll {
@@ -1303,6 +1332,9 @@ impl HDRMetricAccumulator {
 
     fn observe(&mut self, color: [f32; 3]) {
         let color = color.map(sanitize_metric_sample);
+
+        // Rec. 709 luma weights (ITU-R BT.709-6 section 3.2), applied to linear scRGB components
+        // to get relative luminance, then scaled to absolute nits by the scRGB reference white.
         let luminance = (0.212_6 * color[0] + 0.715_2 * color[1] + 0.072_2 * color[2]).max(0.0)
             * f64::from(SC_RGB_REFERENCE_WHITE_NITS);
 
@@ -1375,6 +1407,10 @@ fn gamut_membership(color: [f64; 3]) -> GamutMembership {
         return GamutMembership::Rec709;
     }
 
+    // Converts Rec. 709 linear RGB (already established as out-of-gamut above) to Display-P3
+    // linear RGB via the direct Rec. 709 -> Display-P3 primaries matrix (both D65 white points,
+    // so no chromatic adaptation step is needed). Nonnegative components here mean the color is
+    // representable in Display-P3 even though it fell outside Rec. 709.
     let display_p3 = [
         0.822_592_87 * color[0] + 0.177_533_95 * color[1],
         0.033_199_51 * color[0] + 0.966_783_50 * color[1],
@@ -1487,6 +1523,14 @@ fn visible_alpha_pixel_count(
     Ok(visible_pixels)
 }
 
+/// Builds the error for a decoder-reported dimension too large to convert to `i32`.
+fn dimension_overflow_error(value: u32) -> Error {
+    error(JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions {
+        actual: Some(value),
+        max: DIMENSION_MAX,
+    }))
+}
+
 fn validate_dimensions(width: i32, height: i32) -> Result<(u32, u32)> {
     let width = u32::try_from(width).map_err(|_conversion_error| {
         error(JPEGXRError::Output("JPEG XR width must be positive"))
@@ -1503,15 +1547,17 @@ fn validate_dimensions(width: i32, height: i32) -> Result<(u32, u32)> {
     }
 
     if width > DIMENSION_MAX || height > DIMENSION_MAX {
-        return Err(error(JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions(
-            DIMENSION_MAX,
-        ))));
+        return Err(error(JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions {
+            actual: Some(width.max(height)),
+            max: DIMENSION_MAX,
+        })));
     }
 
     if u64::from(width) * u64::from(height) > PIXELS_MAX {
-        return Err(error(JPEGXRError::LimitExceeded(JPEGXRLimit::Pixels(
-            PIXELS_MAX,
-        ))));
+        return Err(error(JPEGXRError::LimitExceeded(JPEGXRLimit::Pixels {
+            actual: Some(u64::from(width) * u64::from(height)),
+            max: PIXELS_MAX,
+        })));
     }
 
     Ok((width, height))
@@ -1682,20 +1728,25 @@ fn normalized_to_u8(value: f32) -> u8 {
 }
 
 fn codec_error(source: &jpegxr::Error) -> Error {
-    match source.kind() {
-        CodecErrorKind::Unsupported(_) | CodecErrorKind::UnsupportedPixelFormat(_) => {
-            error(JPEGXRError::Unsupported(source.to_string()))
-        }
-        CodecErrorKind::LimitExceeded("image dimension" | "image width" | "image height") => error(
-            JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions(DIMENSION_MAX)),
-        ),
-        CodecErrorKind::LimitExceeded("pixel count") => {
-            error(JPEGXRError::LimitExceeded(JPEGXRLimit::Pixels(PIXELS_MAX)))
-        }
-        CodecErrorKind::LimitExceeded(_) => error(JPEGXRError::LimitExceeded(
-            JPEGXRLimit::SourceBufferBytes(SOURCE_BUFFER_MAX),
-        )),
-        _ => error(JPEGXRError::Codec(source.to_string())),
+    if source.is_unsupported() {
+        error(JPEGXRError::Unsupported(source.to_string()))
+    } else if source.is_dimension_limit_exceeded() {
+        error(JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions {
+            actual: None,
+            max: DIMENSION_MAX,
+        }))
+    } else if source.is_pixel_count_limit_exceeded() {
+        error(JPEGXRError::LimitExceeded(JPEGXRLimit::Pixels {
+            actual: None,
+            max: PIXELS_MAX,
+        }))
+    } else if source.is_limit_exceeded() {
+        error(JPEGXRError::LimitExceeded(JPEGXRLimit::SourceBufferBytes {
+            actual: None,
+            max: SOURCE_BUFFER_MAX,
+        }))
+    } else {
+        error(JPEGXRError::Codec(source.clone()))
     }
 }
 
@@ -1765,9 +1816,11 @@ mod tests {
             row_stride,
             float_rgb_layout(),
             MaxCLLMode::Percentile99_99,
-            true,
-            true,
-            true,
+            AnalysisScope {
+                estimate_max_cll: true,
+                estimate_luminance_white_point: true,
+                collect_hdr_metrics: true,
+            },
         )
         .unwrap();
 
@@ -1793,6 +1846,7 @@ mod tests {
             .luminance_white_point_estimator
             .unwrap()
             .finish()
+            .unwrap()
             .unwrap();
 
         assert_eq!(

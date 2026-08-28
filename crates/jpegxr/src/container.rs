@@ -32,8 +32,10 @@ pub(crate) struct Container<'a> {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) pixel_format: PixelFormat,
+
     pub(crate) spatial_transform: u8,
     pub(crate) resolution: Option<Resolution>,
+
     pub(crate) primary: Codestream<'a>,
     pub(crate) alpha: Option<Codestream<'a>>,
 }
@@ -261,10 +263,22 @@ impl fmt::Display for PixelFormat {
 /// Horizontal and vertical resolution in dots per inch.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Resolution {
-    /// Horizontal resolution.
-    pub horizontal: Option<f32>,
-    /// Vertical resolution.
-    pub vertical: Option<f32>,
+    horizontal: Option<f32>,
+    vertical: Option<f32>,
+}
+
+impl Resolution {
+    /// Returns the horizontal resolution, if the file declared one.
+    #[must_use]
+    pub const fn horizontal(&self) -> Option<f32> {
+        self.horizontal
+    }
+
+    /// Returns the vertical resolution, if the file declared one.
+    #[must_use]
+    pub const fn vertical(&self) -> Option<f32> {
+        self.vertical
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -300,6 +314,7 @@ impl ElementType {
             12 => Self::Double,
             _ => return Err(Error::new(ErrorKind::InvalidElementType(value), offset)),
         };
+
         Ok(element_type)
     }
 
@@ -401,12 +416,15 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Container<'_>> {
     }
 
     let mut previous_tag = None;
+
     let mut pixel_format = None;
     let mut width = None;
     let mut height = None;
     let mut spatial_transform = 0;
+
     let mut horizontal_resolution = None;
     let mut vertical_resolution = None;
+
     let mut image_offset = None;
     let mut image_byte_count = None;
     let mut alpha_offset = None;
@@ -435,7 +453,15 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Container<'_>> {
                 spatial_transform = u8::try_from(value)
                     .ok()
                     .filter(|value| *value <= 7)
-                    .unwrap_or(0);
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::InvalidTag(
+                                TAG_SPATIAL_TRANSFORM,
+                                "spatial transform must be 0-7",
+                            ),
+                            entry.offset,
+                        )
+                    })?;
             }
             TAG_IMAGE_WIDTH => width = Some(entry.unsigned_scalar()?),
             TAG_IMAGE_HEIGHT => height = Some(entry.unsigned_scalar()?),

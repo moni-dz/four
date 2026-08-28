@@ -88,7 +88,7 @@ impl<'a> BitReader<'a> {
         self.base_offset + self.bit_position / 8
     }
 
-    pub(crate) const fn error(&self, kind: ErrorKind) -> Error {
+    pub(crate) fn error(&self, kind: ErrorKind) -> Error {
         Error::new(kind, self.absolute_offset())
     }
 }
