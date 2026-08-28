@@ -1,5 +1,6 @@
 //! Decodes transform coefficients and reconstructs image samples.
 
+use std::cmp::Ordering;
 use crate::bitstream::BitReader;
 use crate::codestream::{
     Bands, InternalColorFormat, OutputBitDepth, OutputColorFormat, OverlapMode, ParsedCodestream,
@@ -17,6 +18,9 @@ const LOWPASS_BLOCKS_PER_JOB: usize = 512;
 const MIN_PARALLEL_LOWPASS_BLOCKS: usize = LOWPASS_BLOCKS_PER_JOB * 4;
 const MIN_PARALLEL_MACROBLOCKS: usize = 512;
 const MIN_PARALLEL_PIXELS: usize = 256 * 1024;
+// Below two tile rows there is nothing to split, so the serial path skips rayon dispatch
+// entirely rather than spin up a scope for one item.
+const MIN_PARALLEL_TILE_ROWS: usize = 2;
 const PIXEL_LANES: usize = 8;
 
 type I32x8 = Simd<i32, PIXEL_LANES>;
@@ -472,8 +476,10 @@ pub(crate) fn decode_dc(stream: &ParsedCodestream<'_>) -> Result<DcImage> {
         values: vec![0; value_count],
     };
 
-    let mut top = 0_usize;
-    for (tile_y, tile_height) in stream.header.tile_heights.iter().copied().enumerate() {
+    let row_stride = macroblock_width * components;
+    let bands = split_tile_row_bands(&mut image.values, &stream.header.tile_heights, row_stride);
+
+    let decode_row = |tile_y: usize, tile_height: u16, band: &mut [i32]| -> Result<()> {
         let mut left = 0_usize;
         for (tile_x, tile_width) in stream.header.tile_widths.iter().copied().enumerate() {
             let tile = tile_y * stream.header.tile_widths.len() + tile_x;
@@ -485,14 +491,36 @@ pub(crate) fn decode_dc(stream: &ParsedCodestream<'_>) -> Result<DcImage> {
                 usize::from(tile_width),
                 usize::from(tile_height),
                 left,
-                top,
-                &mut image,
+                macroblock_width,
+                components,
+                band,
             )?;
 
             left += usize::from(tile_width);
         }
+        Ok(())
+    };
 
-        top += usize::from(tile_height);
+    if stream.header.tile_heights.len() >= MIN_PARALLEL_TILE_ROWS {
+        stream
+            .header
+            .tile_heights
+            .par_iter()
+            .copied()
+            .zip(bands)
+            .enumerate()
+            .try_for_each(|(tile_y, (tile_height, band))| decode_row(tile_y, tile_height, band))?;
+    } else {
+        for (tile_y, (tile_height, band)) in stream
+            .header
+            .tile_heights
+            .iter()
+            .copied()
+            .zip(bands)
+            .enumerate()
+        {
+            decode_row(tile_y, tile_height, band)?;
+        }
     }
 
     Ok(image)
@@ -534,8 +562,10 @@ pub(crate) fn decode_lowpass(stream: &ParsedCodestream<'_>) -> Result<LowpassIma
         values: vec![0; value_count],
     };
 
-    let mut top = 0_usize;
-    for (tile_y, tile_height) in stream.header.tile_heights.iter().copied().enumerate() {
+    let row_stride = macroblock_width * components * 16;
+    let bands = split_tile_row_bands(&mut image.values, &stream.header.tile_heights, row_stride);
+
+    let decode_row = |tile_y: usize, tile_height: u16, band: &mut [i32]| -> Result<()> {
         let mut left = 0_usize;
         for (tile_x, tile_width) in stream.header.tile_widths.iter().copied().enumerate() {
             let tile = tile_y * stream.header.tile_widths.len() + tile_x;
@@ -547,14 +577,36 @@ pub(crate) fn decode_lowpass(stream: &ParsedCodestream<'_>) -> Result<LowpassIma
                 usize::from(tile_width),
                 usize::from(tile_height),
                 left,
-                top,
-                &mut image,
+                macroblock_width,
+                components,
+                band,
             )?;
 
             left += usize::from(tile_width);
         }
+        Ok(())
+    };
 
-        top += usize::from(tile_height);
+    if stream.header.tile_heights.len() >= MIN_PARALLEL_TILE_ROWS {
+        stream
+            .header
+            .tile_heights
+            .par_iter()
+            .copied()
+            .zip(bands)
+            .enumerate()
+            .try_for_each(|(tile_y, (tile_height, band))| decode_row(tile_y, tile_height, band))?;
+    } else {
+        for (tile_y, (tile_height, band)) in stream
+            .header
+            .tile_heights
+            .iter()
+            .copied()
+            .zip(bands)
+            .enumerate()
+        {
+            decode_row(tile_y, tile_height, band)?;
+        }
     }
 
     Ok(image)
@@ -758,8 +810,35 @@ pub(crate) fn decode_highpass(
     };
     let mut cbphp = vec![0_u16; macroblock_count * components];
 
-    let mut top = 0_usize;
-    for (tile_y, tile_height) in stream.header.tile_heights.iter().copied().enumerate() {
+    let value_row_stride = macroblock_width * components * 256;
+    let model_bits_row_stride = macroblock_width;
+    let cbphp_row_stride = macroblock_width * components;
+
+    let value_bands = split_tile_row_bands(
+        &mut image.values,
+        &stream.header.tile_heights,
+        value_row_stride,
+    );
+    let model_bits_bands = split_tile_row_bands(
+        &mut image.model_bits,
+        &stream.header.tile_heights,
+        model_bits_row_stride,
+    );
+    let cbphp_bands =
+        split_tile_row_bands(&mut cbphp, &stream.header.tile_heights, cbphp_row_stride);
+    let highpass_modes_bands = split_tile_row_bands_ref(
+        &lowpass.highpass_modes,
+        &stream.header.tile_heights,
+        macroblock_width,
+    );
+
+    let decode_row = |tile_y: usize,
+                      tile_height: u16,
+                      value_band: &mut [i32],
+                      model_bits_band: &mut [[u8; 2]],
+                      cbphp_band: &mut [u16],
+                      highpass_modes_band: &[u8]|
+     -> Result<()> {
         let mut left = 0_usize;
         for (tile_x, tile_width) in stream.header.tile_widths.iter().copied().enumerate() {
             let tile = tile_y * stream.header.tile_widths.len() + tile_x;
@@ -771,16 +850,63 @@ pub(crate) fn decode_highpass(
                 usize::from(tile_width),
                 usize::from(tile_height),
                 left,
-                top,
-                lowpass,
-                &mut cbphp,
-                &mut image,
+                macroblock_width,
+                components,
+                highpass_modes_band,
+                cbphp_band,
+                value_band,
+                model_bits_band,
             )?;
 
             left += usize::from(tile_width);
         }
+        Ok(())
+    };
 
-        top += usize::from(tile_height);
+    if stream.header.tile_heights.len() >= MIN_PARALLEL_TILE_ROWS {
+        stream
+            .header
+            .tile_heights
+            .par_iter()
+            .copied()
+            .zip(value_bands)
+            .zip(model_bits_bands)
+            .zip(cbphp_bands)
+            .zip(highpass_modes_bands)
+            .enumerate()
+            .try_for_each(
+                |(tile_y, ((((tile_height, value_band), model_bits_band), cbphp_band), modes))| {
+                    decode_row(
+                        tile_y,
+                        tile_height,
+                        value_band,
+                        model_bits_band,
+                        cbphp_band,
+                        modes,
+                    )
+                },
+            )?;
+    } else {
+        for (tile_y, ((((tile_height, value_band), model_bits_band), cbphp_band), modes)) in stream
+            .header
+            .tile_heights
+            .iter()
+            .copied()
+            .zip(value_bands)
+            .zip(model_bits_bands)
+            .zip(cbphp_bands)
+            .zip(highpass_modes_bands)
+            .enumerate()
+        {
+            decode_row(
+                tile_y,
+                tile_height,
+                value_band,
+                model_bits_band,
+                cbphp_band,
+                modes,
+            )?;
+        }
     }
 
     Ok(image)
@@ -804,14 +930,32 @@ pub(crate) fn decode_flexbits(
 
     match stream.primary_plane.bands {
         Bands::All => {
-            let mut top = 0_usize;
-            for (tile_y, tile_height) in stream.header.tile_heights.iter().copied().enumerate() {
+            let value_row_stride = macroblock_width * components * 256;
+            let model_bits_row_stride = macroblock_width;
+
+            let value_bands = split_tile_row_bands(
+                &mut highpass.values,
+                &stream.header.tile_heights,
+                value_row_stride,
+            );
+            let model_bits_bands = split_tile_row_bands_ref(
+                &highpass.model_bits,
+                &stream.header.tile_heights,
+                model_bits_row_stride,
+            );
+
+            let decode_row = |tile_y: usize,
+                              tile_height: u16,
+                              value_band: &mut [i32],
+                              model_bits_band: &[[u8; 2]]|
+             -> Result<()> {
                 let mut left = 0_usize;
                 for (tile_x, tile_width) in stream.header.tile_widths.iter().copied().enumerate() {
                     let tile = tile_y * stream.header.tile_widths.len() + tile_x;
                     let width = usize::from(tile_width);
                     let height = usize::from(tile_height);
-                    if !tile_has_model_bits(highpass, left, top, width, height) {
+                    if !tile_has_model_bits(model_bits_band, left, macroblock_width, width, height)
+                    {
                         left += width;
                         continue;
                     }
@@ -824,14 +968,41 @@ pub(crate) fn decode_flexbits(
                         width,
                         height,
                         left,
-                        top,
-                        highpass,
+                        macroblock_width,
+                        components,
+                        model_bits_band,
+                        value_band,
                     )?;
 
                     left += width;
                 }
+                Ok(())
+            };
 
-                top += usize::from(tile_height);
+            if stream.header.tile_heights.len() >= MIN_PARALLEL_TILE_ROWS {
+                stream
+                    .header
+                    .tile_heights
+                    .par_iter()
+                    .copied()
+                    .zip(value_bands)
+                    .zip(model_bits_bands)
+                    .enumerate()
+                    .try_for_each(|(tile_y, ((tile_height, value_band), model_bits_band))| {
+                        decode_row(tile_y, tile_height, value_band, model_bits_band)
+                    })?;
+            } else {
+                for (tile_y, ((tile_height, value_band), model_bits_band)) in stream
+                    .header
+                    .tile_heights
+                    .iter()
+                    .copied()
+                    .zip(value_bands)
+                    .zip(model_bits_bands)
+                    .enumerate()
+                {
+                    decode_row(tile_y, tile_height, value_band, model_bits_band)?;
+                }
             }
 
             Ok(())
@@ -1433,18 +1604,14 @@ impl FloatFormat {
 }
 
 fn tile_has_model_bits(
-    highpass: &HighpassImage,
+    model_bits_band: &[[u8; 2]],
     left: usize,
-    top: usize,
+    macroblock_width: usize,
     width: usize,
     height: usize,
 ) -> bool {
-    (top..top + height).any(|y| {
-        (left..left + width).any(|x| {
-            highpass.model_bits[y * highpass.macroblock_width + x]
-                .into_iter()
-                .any(|bits| bits != 0)
-        })
+    (0..height).any(|local_y| {
+        (left..left + width).any(|x| model_bits_band[local_y * macroblock_width + x] != [0, 0])
     })
 }
 
@@ -1732,14 +1899,53 @@ fn packet<'a>(stream: &ParsedCodestream<'a>, tile: usize, band: usize) -> Result
     })
 }
 
+/// Splits `values` into per-tile-row bands, in tile order.
+///
+/// Band `i` covers `row_heights[i]` macroblock rows of `row_stride` elements each — the layout
+/// `packet` boundaries assume, and the same layout every `decode_*_packet` writes with a
+/// band-relative row index in place of a `top` offset.
+fn split_tile_row_bands<'a, T>(
+    values: &'a mut [T],
+    row_heights: &[u16],
+    row_stride: usize,
+) -> Vec<&'a mut [T]> {
+    let mut remaining = values;
+    let mut bands = Vec::with_capacity(row_heights.len());
+    for height in row_heights.iter().copied() {
+        let band_len = usize::from(height) * row_stride;
+        let (band, rest) = remaining.split_at_mut(band_len);
+        bands.push(band);
+        remaining = rest;
+    }
+    bands
+}
+
+/// The shared-reference counterpart of [`split_tile_row_bands`], for read-only per-row data.
+fn split_tile_row_bands_ref<'a, T>(
+    values: &'a [T],
+    row_heights: &[u16],
+    row_stride: usize,
+) -> Vec<&'a [T]> {
+    let mut remaining = values;
+    let mut bands = Vec::with_capacity(row_heights.len());
+    for height in row_heights.iter().copied() {
+        let band_len = usize::from(height) * row_stride;
+        let (band, rest) = remaining.split_at(band_len);
+        bands.push(band);
+        remaining = rest;
+    }
+    bands
+}
+
 fn decode_dc_packet(
     packet: Packet<'_>,
     plane: &PlaneHeader,
     width: usize,
     height: usize,
     left: usize,
-    top: usize,
-    image: &mut DcImage,
+    macroblock_width: usize,
+    components: usize,
+    band: &mut [i32],
 ) -> Result<()> {
     let mut reader = BitReader::new(packet.bytes, packet.offset);
 
@@ -1755,10 +1961,9 @@ fn decode_dc_packet(
     for local_y in 0..height {
         for local_x in 0..width {
             let values = decode_dc_macroblock(&mut reader, plane, &mut context)?;
-            let macroblock = (top + local_y) * image.macroblock_width + left + local_x;
-            let start = macroblock * image.components;
-            image.values[start..start + image.components]
-                .copy_from_slice(&values[..image.components]);
+            let macroblock = local_y * macroblock_width + left + local_x;
+            let start = macroblock * components;
+            band[start..start + components].copy_from_slice(&values[..components]);
 
             if local_x.is_multiple_of(16) || local_x + 1 == width {
                 context.adapt();
@@ -1783,8 +1988,9 @@ fn decode_lowpass_packet(
     width: usize,
     height: usize,
     left: usize,
-    top: usize,
-    image: &mut LowpassImage,
+    macroblock_width: usize,
+    components: usize,
+    band: &mut [i32],
 ) -> Result<()> {
     let mut reader = BitReader::new(packet.bytes, packet.offset);
 
@@ -1804,10 +2010,9 @@ fn decode_lowpass_packet(
             }
 
             let values = decode_lowpass_macroblock(&mut reader, plane, &mut context)?;
-            let macroblock = (top + local_y) * image.macroblock_width + left + local_x;
-            let start = macroblock * image.components * 16;
-            image.values[start..start + image.components * 16]
-                .copy_from_slice(&values[..image.components * 16]);
+            let macroblock = local_y * macroblock_width + left + local_x;
+            let start = macroblock * components * 16;
+            band[start..start + components * 16].copy_from_slice(&values[..components * 16]);
 
             if local_x.is_multiple_of(16) || local_x + 1 == width {
                 context.adapt();
@@ -1836,10 +2041,12 @@ fn decode_highpass_packet(
     width: usize,
     height: usize,
     left: usize,
-    top: usize,
-    lowpass: &PredictedLowpass,
-    cbphp: &mut [u16],
-    image: &mut HighpassImage,
+    macroblock_width: usize,
+    components: usize,
+    highpass_modes: &[u8],
+    cbphp_band: &mut [u16],
+    value_band: &mut [i32],
+    model_bits_band: &mut [[u8; 2]],
 ) -> Result<()> {
     let mut reader = BitReader::new(packet.bytes, packet.offset);
 
@@ -1859,29 +2066,31 @@ fn decode_highpass_packet(
                 context.vertical_scan.reset_totals();
             }
 
-            let macroblock = (top + local_y) * image.macroblock_width + left + local_x;
+            let macroblock = local_y * macroblock_width + left + local_x;
 
             let patterns = decode_cbphp(
                 &mut reader,
                 plane,
                 &mut context,
-                cbphp,
-                image.macroblock_width,
+                cbphp_band,
+                macroblock_width,
                 macroblock,
                 local_x == 0,
                 local_y == 0,
             )?;
-            cbphp[macroblock * image.components..(macroblock + 1) * image.components]
-                .copy_from_slice(&patterns[..image.components]);
+            cbphp_band[macroblock * components..(macroblock + 1) * components]
+                .copy_from_slice(&patterns[..components]);
 
             decode_highpass_macroblock(
                 &mut reader,
                 plane,
                 &mut context,
                 macroblock,
-                lowpass.highpass_modes[macroblock],
-                &patterns[..image.components],
-                image,
+                highpass_modes[macroblock],
+                &patterns[..components],
+                components,
+                value_band,
+                model_bits_band,
             )?;
 
             if local_x.is_multiple_of(16) || local_x + 1 == width {
@@ -1907,8 +2116,10 @@ fn decode_flexbits_packet(
     width: usize,
     height: usize,
     left: usize,
-    top: usize,
-    highpass: &mut HighpassImage,
+    macroblock_width: usize,
+    components: usize,
+    model_bits_band: &[[u8; 2]],
+    value_band: &mut [i32],
 ) -> Result<()> {
     const HIERARCHICAL_ORDER: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
     const TRANSPOSE: [usize; 16] = [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
@@ -1926,16 +2137,16 @@ fn decode_flexbits_packet(
 
     for local_y in 0..height {
         for local_x in 0..width {
-            let macroblock = (top + local_y) * highpass.macroblock_width + left + local_x;
-            for component in 0..highpass.components {
+            let macroblock = local_y * macroblock_width + left + local_x;
+            for component in 0..components {
                 let model = usize::from(component != 0);
-                let model_bits = highpass.model_bits[macroblock][model];
+                let model_bits = model_bits_band[macroblock][model];
                 let flex_bits = model_bits.saturating_sub(trim);
 
                 for block in HIERARCHICAL_ORDER {
-                    let start = (macroblock * highpass.components + component) * 256 + block * 16;
+                    let start = (macroblock * components + component) * 256 + block * 16;
                     for coefficient in TRANSPOSE.into_iter().skip(1) {
-                        let vlc = highpass.values[start + coefficient];
+                        let vlc = value_band[start + coefficient];
                         let refinement = if flex_bits == 0 {
                             0
                         } else {
@@ -1943,14 +2154,14 @@ fn decode_flexbits_packet(
                                 .expect("at most 15 flexbits fit i32")
                         };
                         let flex = match vlc.cmp(&0) {
-                            std::cmp::Ordering::Greater => refinement,
-                            std::cmp::Ordering::Less => -refinement,
-                            std::cmp::Ordering::Equal
+                            Ordering::Greater => refinement,
+                            Ordering::Less => -refinement,
+                            Ordering::Equal
                                 if refinement != 0 && reader.read_bool()? =>
                             {
                                 -refinement
                             }
-                            std::cmp::Ordering::Equal => refinement,
+                            Ordering::Equal => refinement,
                         };
 
                         let flex = flex.checked_shl(u32::from(trim)).ok_or_else(|| {
@@ -1958,7 +2169,7 @@ fn decode_flexbits_packet(
                                 "flexbits coefficient overflow",
                             ))
                         })?;
-                        highpass.values[start + coefficient] = vlc
+                        value_band[start + coefficient] = vlc
                             .checked_shl(u32::from(model_bits))
                             .and_then(|value| value.checked_add(flex))
                             .ok_or_else(|| {
@@ -1989,7 +2200,7 @@ fn decode_flexbits_packet(
 /// the same tables and the same adaptation schedule. Holding them in one place keeps that schedule
 /// from drifting between the two.
 #[derive(Clone, Debug)]
-struct BandVlc {
+struct BandVLC {
     first_luma: AdaptiveVLC,
     index_luma_zero: AdaptiveVLC,
     index_luma_one: AdaptiveVLC,
@@ -2000,7 +2211,7 @@ struct BandVlc {
     level_one: AdaptiveVLC,
 }
 
-impl BandVlc {
+impl BandVLC {
     const fn new() -> Self {
         Self {
             first_luma: AdaptiveVLC::many_tables(),
@@ -2100,7 +2311,7 @@ const HIGHPASS_MESSAGES: BandMessages = BandMessages {
 /// can borrow the two disjoint fields of its own context.
 fn decode_band_block(
     reader: &mut BitReader<'_>,
-    vlc: &mut BandVlc,
+    vlc: &mut BandVLC,
     scan: &mut AdaptiveScan,
     chroma: bool,
     coefficients: &mut [i32; 16],
@@ -2167,7 +2378,7 @@ fn decode_band_block(
 
 #[derive(Clone, Debug)]
 struct HighpassContext {
-    vlc: BandVlc,
+    vlc: BandVLC,
 
     num_cbphp: AdaptiveVLC,
     num_block_cbphp: AdaptiveVLC,
@@ -2185,7 +2396,7 @@ struct HighpassContext {
 impl HighpassContext {
     const fn new() -> Self {
         Self {
-            vlc: BandVlc::new(),
+            vlc: BandVLC::new(),
 
             num_cbphp: AdaptiveVLC::two_tables(),
             num_block_cbphp: AdaptiveVLC::two_tables(),
@@ -2361,11 +2572,13 @@ fn decode_highpass_macroblock(
     macroblock: usize,
     mode: u8,
     patterns: &[u16],
-    image: &mut HighpassImage,
+    components: usize,
+    value_band: &mut [i32],
+    model_bits_band: &mut [[u8; 2]],
 ) -> Result<()> {
     const HIERARCHICAL_ORDER: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
 
-    image.model_bits[macroblock] = context.model_bits;
+    model_bits_band[macroblock] = context.model_bits;
     let mut laplacian = [0_i32; 2];
 
     for (component, pattern) in patterns.iter().copied().enumerate() {
@@ -2373,8 +2586,8 @@ fn decode_highpass_macroblock(
         let mut pattern = pattern;
         for block in HIERARCHICAL_ORDER {
             if pattern & 1 != 0 {
-                let start = (macroblock * image.components + component) * 256 + block * 16;
-                let coefficients: &mut [i32; 16] = (&mut image.values[start..start + 16])
+                let start = (macroblock * components + component) * 256 + block * 16;
+                let coefficients: &mut [i32; 16] = (&mut value_band[start..start + 16])
                     .try_into()
                     .expect("highpass block has 16 coefficients");
                 // Split-borrow the context: the shared tables and the chosen scan are disjoint
@@ -2404,7 +2617,7 @@ fn decode_highpass_macroblock(
 
 #[derive(Clone, Debug)]
 struct LowpassContext {
-    vlc: BandVlc,
+    vlc: BandVLC,
 
     count_zero: i8,
     count_maximum: i8,
@@ -2418,7 +2631,7 @@ struct LowpassContext {
 impl LowpassContext {
     const fn new() -> Self {
         Self {
-            vlc: BandVlc::new(),
+            vlc: BandVLC::new(),
 
             count_zero: 1,
             count_maximum: 1,
@@ -2587,16 +2800,16 @@ fn refine_lowpass(
         let refinement = i32::try_from(reader.read_u32(model_bits)?)
             .expect("at most 15 refinement bits fit i32");
         coefficients[coefficient] = match coefficients[coefficient].cmp(&0) {
-            std::cmp::Ordering::Greater => coefficients[coefficient]
+            Ordering::Greater => coefficients[coefficient]
                 .checked_shl(u32::from(model_bits))
                 .and_then(|value| value.checked_add(refinement)),
-            std::cmp::Ordering::Less => coefficients[coefficient]
+            Ordering::Less => coefficients[coefficient]
                 .checked_shl(u32::from(model_bits))
                 .and_then(|value| value.checked_sub(refinement)),
-            std::cmp::Ordering::Equal if refinement != 0 && reader.read_bool()? => {
+            Ordering::Equal if refinement != 0 && reader.read_bool()? => {
                 Some(-refinement)
             }
-            std::cmp::Ordering::Equal => Some(refinement),
+            Ordering::Equal => Some(refinement),
         }
         .ok_or_else(|| {
             reader.error(ErrorKind::InvalidCodestream("lowpass coefficient overflow"))
@@ -2929,11 +3142,12 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires JPEGXR_BGR101010_SAMPLE to name a local conformance image"]
     fn decodes_real_bgr101010_sample_pixels() {
-        let path = std::env::var("JPEGXR_BGR101010_SAMPLE").expect("set JPEGXR_BGR101010_SAMPLE");
-        let bytes = std::fs::read(path).expect("read sample");
-        let decoder = Decoder::new(&bytes).expect("parse sample headers");
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/screenshot.jxr");
+        let bytes =
+            std::fs::read(&path).unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let decoder = Decoder::new(&bytes).expect("parse screenshot.jxr headers");
 
         assert_eq!(decoder.info().pixel_format(), PixelFormat::BGR101010);
 

@@ -6,7 +6,7 @@
 //! in cache: this measures per-pixel work, not memory bandwidth.
 
 use divan::{Bencher, counter::BytesCount};
-use four::{DecodedImage, encode_bmp, gif, jpeg, jpeg_xl, png, tiff};
+use four::{DecodedImage, encode_bmp, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
 use mimalloc::MiMalloc;
 
 #[global_allocator]
@@ -37,7 +37,7 @@ fn bench_decode<E>(
 
 #[divan::bench_group(name = "decode")]
 mod decode {
-    use super::{Bencher, bench_decode, gif, jpeg, jpeg_xl, png, tiff};
+    use super::{Bencher, bench_decode, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
 
     #[divan::bench]
     fn jpeg_baseline(bencher: Bencher<'_, '_>) {
@@ -89,6 +89,15 @@ mod decode {
     #[divan::bench]
     fn jpeg_xl_rgb8(bencher: Bencher<'_, '_>) {
         bench_decode(bencher, "rgb8.jxl", |bytes| jpeg_xl::decode(bytes));
+    }
+
+    /// A real 3840x2160 Windows HDR screenshot, the only realistic-scale fixture in this suite.
+    ///
+    /// Every other fixture is 64x48 by convention; JPEG XR has no encoder anywhere in this
+    /// toolchain (see `tests/fixtures/README.md`), so this is a real capture, not synthetic.
+    #[divan::bench]
+    fn jpeg_xr_bgr101010(bencher: Bencher<'_, '_>) {
+        bench_decode(bencher, "screenshot.jxr", |bytes| jpeg_xr::decode(bytes));
     }
 
     #[divan::bench]
