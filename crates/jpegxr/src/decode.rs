@@ -1757,7 +1757,8 @@ fn decode_dc_packet(
             let values = decode_dc_macroblock(&mut reader, plane, &mut context)?;
             let macroblock = (top + local_y) * image.macroblock_width + left + local_x;
             let start = macroblock * image.components;
-            image.values[start..start + image.components].copy_from_slice(&values);
+            image.values[start..start + image.components]
+                .copy_from_slice(&values[..image.components]);
 
             if local_x.is_multiple_of(16) || local_x + 1 == width {
                 context.adapt();
@@ -1805,7 +1806,8 @@ fn decode_lowpass_packet(
             let values = decode_lowpass_macroblock(&mut reader, plane, &mut context)?;
             let macroblock = (top + local_y) * image.macroblock_width + left + local_x;
             let start = macroblock * image.components * 16;
-            image.values[start..start + image.components * 16].copy_from_slice(&values);
+            image.values[start..start + image.components * 16]
+                .copy_from_slice(&values[..image.components * 16]);
 
             if local_x.is_multiple_of(16) || local_x + 1 == width {
                 context.adapt();
@@ -1870,7 +1872,7 @@ fn decode_highpass_packet(
                 local_y == 0,
             )?;
             cbphp[macroblock * image.components..(macroblock + 1) * image.components]
-                .copy_from_slice(&patterns);
+                .copy_from_slice(&patterns[..image.components]);
 
             decode_highpass_macroblock(
                 &mut reader,
@@ -1878,7 +1880,7 @@ fn decode_highpass_packet(
                 &mut context,
                 macroblock,
                 lowpass.highpass_modes[macroblock],
-                &patterns,
+                &patterns[..image.components],
                 image,
             )?;
 
@@ -2250,7 +2252,7 @@ fn decode_cbphp(
     macroblock: usize,
     left_edge: bool,
     top_edge: bool,
-) -> Result<Vec<u16>> {
+) -> Result<[u16; 3]> {
     const FIXED_LENGTH: [u8; 6] = [0, 2, 1, 2, 2, 0];
     const OFFSET: [u8; 6] = [0, 4, 2, 8, 12, 1];
     const OUTPUT: [u8; 16] = [0, 15, 3, 12, 1, 2, 4, 8, 5, 6, 9, 10, 7, 11, 13, 14];
@@ -2258,7 +2260,7 @@ fn decode_cbphp(
     let components = usize::from(plane.component_count);
     let group_count = entropy::num_cbphp(reader, &mut context.num_cbphp)?;
     let groups = refine_cbphp(reader, group_count)?;
-    let mut residual = vec![0_u16; components];
+    let mut residual = [0_u16; 3];
 
     for group in 0..4 {
         if groups & (1 << group) == 0 {
@@ -2301,7 +2303,7 @@ fn decode_cbphp(
         }
     }
 
-    for (component, value) in residual.iter_mut().enumerate() {
+    for (component, value) in residual[..components].iter_mut().enumerate() {
         let model = usize::from(component != 0);
         let mut pattern = u32::from(*value);
         if context.cbphp_state[model] == 0 {
@@ -2503,7 +2505,7 @@ fn decode_lowpass_macroblock(
     reader: &mut BitReader<'_>,
     plane: &PlaneHeader,
     context: &mut LowpassContext,
-) -> Result<Vec<i32>> {
+) -> Result<[i32; 48]> {
     let components = usize::from(plane.component_count);
     let maximum = if plane.internal_color_format == InternalColorFormat::YUV444 {
         7
@@ -2531,7 +2533,7 @@ fn decode_lowpass_macroblock(
         reader.read_u8(1)?
     };
 
-    let mut output = vec![0_i32; components * 16];
+    let mut output = [0_i32; 48];
     let mut laplacian = [0_i32; 2];
 
     for component in 0..components {
@@ -2694,9 +2696,8 @@ fn decode_dc_macroblock(
     reader: &mut BitReader<'_>,
     plane: &PlaneHeader,
     context: &mut DcContext,
-) -> Result<Vec<i32>> {
-    let components = usize::from(plane.component_count);
-    let mut values = vec![0_i32; components];
+) -> Result<[i32; 3]> {
+    let mut values = [0_i32; 3];
     let mut laplacian = [0_i32; 2];
 
     match plane.internal_color_format {
