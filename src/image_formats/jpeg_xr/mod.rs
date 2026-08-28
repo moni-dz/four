@@ -1163,7 +1163,12 @@ impl HDRAnalysis {
         // This pass used to run on one thread while the write pass that follows it was already
         // parallel, which made it the largest serial block in an HDR decode. All three
         // accumulators merge associatively, so the image can be split by row groups.
-        let rows_per_job = PARALLEL_PIXELS_PER_JOB.div_ceil(row_stride.max(1)).max(1);
+        //
+        // Job size is computed in pixels, not row-stride bytes: `write_pixel_slabs` below uses the
+        // same `width`-based formula, and BGR101010/RGBA32F have very different bytes-per-pixel, so
+        // sizing off `row_stride` alone produced wildly different job counts per format.
+        let width = row_stride / layout.bytes_per_pixel;
+        let rows_per_job = PARALLEL_PIXELS_PER_JOB.div_ceil(width);
         let totals = if pixel_count < PARALLEL_PIXELS_MIN {
             let mut totals = AnalysisTotals::new(&request);
             totals.observe_slab(source, row_stride, layout, &request)?;
