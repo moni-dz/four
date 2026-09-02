@@ -431,7 +431,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Container<'_>> {
     let mut alpha_byte_count = None;
 
     for index in 0..entry_count {
-        let offset = entries_start + index * 12;
+        let offset = entries_start.saturating_add(index.saturating_mul(12));
         let entry = parse_entry(bytes, offset)?;
 
         if previous_tag.is_some_and(|tag| entry.tag <= tag) {
@@ -619,7 +619,7 @@ fn required<T>(value: Option<T>, tag: u16, offset: usize) -> Result<T> {
 
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
     let value = bytes
-        .get(offset..offset + 2)
+        .get(offset..offset.saturating_add(2))
         .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, offset))?;
 
     Ok(U16::read_from_bytes(value)
@@ -629,7 +629,7 @@ fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
 
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
     let value = bytes
-        .get(offset..offset + 4)
+        .get(offset..offset.saturating_add(4))
         .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, offset))?;
 
     Ok(U32::read_from_bytes(value)
