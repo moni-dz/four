@@ -3287,5 +3287,27 @@ mod tests {
         assert_eq!((image.width(), image.height()), (3840, 2160));
         assert_eq!(image.pixels().len(), 3840 * 2160);
         assert!(image.pixels().iter().all(|pixel| pixel >> 30 == 0));
+
+        // Dimensions, length, and the reserved-bits check above all pass for an all-zero buffer or
+        // a row/tile permutation of the correct pixels. Hash the full decoded buffer so the
+        // multi-tile-row parallel decode path has a byte-identical regression oracle.
+        assert_eq!(fnv1a(image.pixels()), 13_953_505_876_719_867_180);
+    }
+
+    /// A fixed, dependency-free 64-bit FNV-1a hash, used to pin decoded pixel buffers as a
+    /// regression oracle. Unlike `std::hash::DefaultHasher`, its algorithm is not an
+    /// unspecified implementation detail that Rust reserves the right to change.
+    fn fnv1a(pixels: &[u32]) -> u64 {
+        const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        let mut hash = OFFSET_BASIS;
+        for pixel in pixels {
+            for byte in pixel.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(PRIME);
+            }
+        }
+        hash
     }
 }

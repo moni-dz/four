@@ -69,7 +69,7 @@ fn polynomial<const N: usize, const DEGREE: usize>(
 /// [`f32::log2`]. Subnormal inputs are scaled into the normal range first, so they are as accurate
 /// as any other value.
 #[inline]
-pub(crate) fn log2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
+pub fn log2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
     // A subnormal has a zero exponent field, so decomposing it directly would read a mantissa
     // without its implicit leading bit. Multiplying by 2^24 makes it normal; the exponent
     // correction comes back out below.
@@ -119,7 +119,7 @@ pub(crate) fn log2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
 ///
 /// Underflows to zero below `-149` and overflows to infinity above `128`, matching [`f32::exp2`].
 #[inline]
-pub(crate) fn exp2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
+pub fn exp2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
     // Clamping first keeps the exponent assembly below in range; the true extremes are restored by
     // the selects at the end.
     let bounded = value.simd_clamp(Simd::splat(-150.0), Simd::splat(129.0));

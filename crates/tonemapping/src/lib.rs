@@ -399,9 +399,9 @@ macro_rules! define_tone_mapping_methods {
             ///
             /// # Panics
             ///
-            /// Never panics: [`Mobius`] is the only method built from a caller-visible parameter
-            /// (a fixed `0.3` transition), and that value is always a valid transition below
-            /// display white.
+            /// Never panics: [`Mobius`] is the only method built from a caller-visible parameter.
+            /// Its white point is floored to [`MOBIUS_MIN_PEAK`], which always exceeds `1.0`, so
+            /// the fixed `0.3` transition is always valid and below display white.
             #[must_use]
             pub fn resolve(
                 self,
@@ -535,14 +535,21 @@ define_tone_mapping_methods! {
     /// Applies a generalized Reinhard based on the Mobius transform.
     Mobius {
         label: "Mobius",
-        mapper: Mobius = |_, luminance_white_point| {
-            Mobius::new(luminance_white_point, 0.3)
-                .expect("0.3 is a positive finite transition below display white")
+        mapper: Mobius = |_, luminance_white_point: LuminanceWhitePoint| {
+            let peak = luminance_white_point.luminance().max(MOBIUS_MIN_PEAK);
+            let peak = LuminanceWhitePoint::new(peak).expect("MOBIUS_MIN_PEAK is positive and finite");
+            Mobius::new(peak, 0.3).expect("peak exceeds 1.0 by construction, so 0.3 < peak")
         },
         uses_white_point: false,
         uses_luminance_white_point: true,
     }
 }
+
+/// The smallest luminance white point [`resolve`](ToneMappingMethod::resolve) will pass to
+/// [`Mobius::new`]. A white point at or below display white (`1.0`) has nothing for the Mobius
+/// curve to compress; flooring it here keeps the fixed `0.3` transition always valid instead of
+/// making the estimated white point's whole positive range a source of construction failure.
+const MOBIUS_MIN_PEAK: f32 = 1.0 + 1e-3;
 
 /// Identifies a positive finite scene level that maps to display white.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -786,12 +793,12 @@ impl MaxCLLEstimator {
     /// retain the same number of samples; the result is then identical to observing every colour
     /// through one estimator. This is what lets a caller split an image across worker threads.
     pub fn merge(&mut self, other: Self) {
-        debug_assert_eq!(
+        assert_eq!(
             self.expected, other.expected,
             "merged MaxCLL estimators must share a declared pixel count: {} vs {}",
             self.expected, other.expected
         );
-        debug_assert_eq!(
+        assert_eq!(
             self.retained, other.retained,
             "merged MaxCLL estimators must retain the same sample count: {} vs {}",
             self.retained, other.retained
@@ -952,8 +959,11 @@ pub use hable::Hable;
 #[doc(inline)]
 pub use reinhard::{
     ExtendedLuminanceReinhard, ExtendedReinhard, LuminanceReinhard, LuminanceWhitePoint,
-    LuminanceWhitePointEstimator, Mobius, Reinhard, ReinhardJodie, estimate_luminance_white_point,
+    LuminanceWhitePointEstimator, Mobius, MobiusError, Reinhard, ReinhardJodie,
+    estimate_luminance_white_point,
 };
+#[doc(inline)]
+pub use transcendental::{exp2, log2};
 
 fn sanitize_component(component: f32) -> f32 {
     if component.is_nan() || component <= 0.0 {

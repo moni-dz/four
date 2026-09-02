@@ -33,6 +33,7 @@ use rayon::prelude::*;
 use tonemapping::{
     Clamp, ColorChannel as ToneColorChannel, LinearRGB, LinearRGBPlanes, LuminanceWhitePoint,
     LuminanceWhitePointEstimator, MaxCLLEstimator, MaxCLLMode, ToneMapper, ToneMappingMethod,
+    exp2, log2,
     WhitePoint,
 };
 use zerocopy::{FromBytes, IntoBytes};
@@ -1238,19 +1239,33 @@ fn compute_totals(
     let width = row_stride / layout.bytes_per_pixel;
     let rows_per_job = PARALLEL_PIXELS_PER_JOB.div_ceil(width);
 
-    if request.pixel_count < PARALLEL_PIXELS_MIN {
+    // `visit_pixels` below scans every source pixel regardless of transparency, so the
+    // serial/parallel split must be sized off the pixels actually scanned, not
+    // `request.pixel_count` (which, for images with transparency, counts only the visible pixels
+    // the estimators retain). Otherwise a large mostly-transparent image runs its full scan
+    // serially.
+    let row_count = source.len() / row_stride;
+    let scanned_pixel_count = width * row_count;
+
+    if scanned_pixel_count < PARALLEL_PIXELS_MIN {
         let mut totals = AnalysisTotals::new(request);
         totals.observe_slab(source, row_stride, layout, request)?;
         return Ok(totals);
     }
 
+    // `try_fold` reuses one `AnalysisTotals` (and its full-image-sized percentile heaps) across
+    // every chunk rayon assigns to the same split, instead of allocating a fresh one per chunk:
+    // a `map` here would size those heaps for the whole image on every one of the ~1000 chunks a
+    // large image produces.
     source
         .par_chunks(rows_per_job * row_stride)
-        .map(|slab| {
-            let mut totals = AnalysisTotals::new(request);
-            totals.observe_slab(slab, row_stride, layout, request)?;
-            Ok(totals)
-        })
+        .try_fold(
+            || AnalysisTotals::new(request),
+            |mut totals, slab| {
+                totals.observe_slab(slab, row_stride, layout, request)?;
+                Ok::<AnalysisTotals, Error>(totals)
+            },
+        )
         .try_reduce(
             || AnalysisTotals::new(request),
             |mut left, right| {
@@ -1504,12 +1519,45 @@ fn visit_pixels(
     Ok(())
 }
 
+/// Counts source pixels with nonzero alpha, splitting the work by row group when the image is
+/// large enough for the split to pay for itself.
+///
+/// This scan runs before `compute_totals` on every RGBA image, so leaving it serial would reinstate
+/// the same single-thread bottleneck `compute_totals` was parallelized to remove.
 fn visible_alpha_pixel_count(
     source: &[u8],
     row_stride: usize,
     layout: PixelLayout,
 ) -> Result<usize> {
     invariant!(layout.has_alpha);
+
+    let width = row_stride / layout.bytes_per_pixel;
+    let row_count = source.len() / row_stride;
+    let scanned_pixel_count = width * row_count;
+
+    if scanned_pixel_count < PARALLEL_PIXELS_MIN {
+        return visible_alpha_pixel_count_slab(source, row_stride, layout);
+    }
+
+    let rows_per_job = PARALLEL_PIXELS_PER_JOB.div_ceil(width);
+    source
+        .par_chunks(rows_per_job * row_stride)
+        .try_fold(
+            || 0_usize,
+            |count, slab| {
+                Ok::<usize, Error>(
+                    count + visible_alpha_pixel_count_slab(slab, row_stride, layout)?,
+                )
+            },
+        )
+        .try_reduce(|| 0_usize, |left, right| Ok(left + right))
+}
+
+fn visible_alpha_pixel_count_slab(
+    source: &[u8],
+    row_stride: usize,
+    layout: PixelLayout,
+) -> Result<usize> {
     let mut visible_pixels = 0_usize;
 
     visit_pixels(source, row_stride, layout, |_color, alpha| {
@@ -1635,10 +1683,10 @@ fn pq_to_linear_simd(encoded: F32x4) -> F32x4 {
     const C2: f32 = 2_413.0 / 128.0;
     const C3: f32 = 2_392.0 / 128.0;
 
-    let powered = (encoded.log2() * F32x4::splat(INVERSE_M2)).exp2();
+    let powered = exp2(log2(encoded) * F32x4::splat(INVERSE_M2));
     let ratio = (powered - F32x4::splat(C1)).simd_max(F32x4::splat(0.0))
         / (F32x4::splat(C2) - F32x4::splat(C3) * powered);
-    (ratio.log2() * F32x4::splat(INVERSE_M1)).exp2()
+    exp2(log2(ratio) * F32x4::splat(INVERSE_M1))
 }
 
 fn read_sample<T: FromBytes + Sized>(bytes: &[u8]) -> T {
@@ -1712,7 +1760,7 @@ fn linear_to_srgb_simd(value: F32x8) -> F32x8 {
     let value = value.simd_clamp(F32x8::splat(0.0), F32x8::splat(1.0));
     let linear = value * F32x8::splat(12.92);
     let nonlinear =
-        (value.log2() * F32x8::splat(1.0 / 2.4)).exp2() * F32x8::splat(1.055) - F32x8::splat(0.055);
+        exp2(log2(value) * F32x8::splat(1.0 / 2.4)) * F32x8::splat(1.055) - F32x8::splat(0.055);
     value
         .simd_le(F32x8::splat(0.003_130_8))
         .select(linear, nonlinear)

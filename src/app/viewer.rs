@@ -1,15 +1,16 @@
 //! Owns viewer state and renders the GPUI interface.
 
+use std::cell::OnceCell;
 use std::path::Path;
 use std::sync::Arc;
 
 use exn::ErrorExt;
 
 use gpui::{
-    Anchor, AnchoredPositionMode, CursorStyle, Image as GPUIImage, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, Role, ScrollWheelEvent,
-    SharedString, Toggled, Window, WindowControlArea, anchored, deferred, div, img, point,
-    prelude::*, px, rgb, rgba,
+    Anchor, AnchoredPositionMode, App, CursorStyle, FocusHandle, Focusable, Image as GPUIImage,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point,
+    Role, ScrollWheelEvent, SharedString, Toggled, Window, WindowControlArea, actions, anchored,
+    deferred, div, img, point, prelude::*, px, rgb, rgba,
 };
 use tonemapping::{MaxCLLMode, ToneMappingMethod};
 
@@ -75,13 +76,17 @@ const COLOR_METADATA_OVERLAY_BACKGROUND: u32 = 0x0020_2020;
 pub(super) const WINDOW_MIN_WIDTH: f32 = 1280.0;
 pub(super) const WINDOW_MIN_HEIGHT: f32 = 720.0;
 
-/// Zoom multiplier on top of the fit-to-window baseline; 1.0 always means "fit".
-const ZOOM_MIN: f32 = 1.0;
+/// Zoom multiplier on top of the fit-to-window baseline; 1.0 means "fit".
+const ZOOM_MIN: f32 = 0.1;
 const ZOOM_MAX: f32 = 16.0;
 /// Multiplier applied per normalized scroll step.
-const ZOOM_STEP_BASE: f32 = 1.1;
+const ZOOM_STEP_BASE: f32 = 1.001;
+/// Multiplier applied per `ZoomIn`/`ZoomOut` action.
+const ZOOM_KEY_STEP: f32 = 1.25;
 /// Assumed line height for normalizing line-based scroll deltas into pixels.
 const SCROLL_LINE_HEIGHT: f32 = 24.0;
+
+actions!(four, [Quit, OpenFile, ZoomIn, ZoomOut, ZoomReset, DismissMenu]);
 
 /// Scale that fits an `image_w`×`image_h` image inside `content_w`×`content_h`, preserving
 /// aspect ratio (matches gpui's `ObjectFit::Contain`, which this replaces).
@@ -319,7 +324,11 @@ pub(super) struct Root {
     /// Mouse position and pan offset at the start of an active left-drag pan; `None` when not
     /// panning.
     drag_anchor: Option<(Point<Pixels>, Point<Pixels>)>,
+    /// Lazily created on first access, since `Root::new` runs in plain unit tests with no `App`
+    /// available to call `cx.focus_handle()`.
+    focus_handle: OnceCell<FocusHandle>,
     hdr_metrics_request: Option<LoadRequest>,
+    last_window_title: Option<SharedString>,
     load_generation: u64,
     metadata_visible: bool,
     /// Pan offset in pixels, relative to the image being centered in the content area.
@@ -328,7 +337,7 @@ pub(super) struct Root {
     preferred_hdr_options: HDROptions,
     tone_mapping_menu_open: bool,
     viewer: ViewerState,
-    /// Zoom multiplier on top of fit-to-window; always >= `ZOOM_MIN`.
+    /// Zoom multiplier on top of fit-to-window; clamped to `[ZOOM_MIN, ZOOM_MAX]`.
     zoom: f32,
 }
 
@@ -343,7 +352,9 @@ impl Root {
             context_menu_position: None,
             decode_coordinator: LatestLoadCoordinator::new(),
             drag_anchor: None,
+            focus_handle: OnceCell::new(),
             hdr_metrics_request: None,
+            last_window_title: None,
             load_generation: 0,
             metadata_visible: false,
             pan: Point::default(),
@@ -351,7 +362,7 @@ impl Root {
             preferred_hdr_options,
             tone_mapping_menu_open: false,
             viewer,
-            zoom: ZOOM_MIN,
+            zoom: 1.0,
         }
     }
 
@@ -378,6 +389,50 @@ impl Root {
 
         self.tone_mapping_menu_open = false;
         self.context_menu_position = Some(position);
+    }
+
+    fn dismiss_menus(&mut self) {
+        self.context_menu_position = None;
+        self.tone_mapping_menu_open = false;
+    }
+
+    fn reset_zoom(&mut self) {
+        self.zoom = 1.0;
+        self.pan = Point::default();
+        self.drag_anchor = None;
+    }
+
+    fn apply_zoom(&mut self, new_zoom: f32, cx: &mut Context<Self>) {
+        let new_zoom = new_zoom.clamp(ZOOM_MIN, ZOOM_MAX);
+        if (new_zoom - self.zoom).abs() > f32::EPSILON {
+            self.pan = zoom_to_cursor_pan(Point::default(), self.pan, self.zoom, new_zoom);
+            self.zoom = new_zoom;
+            cx.notify();
+        }
+    }
+
+    fn zoom_in(&mut self, cx: &mut Context<Self>) {
+        self.apply_zoom(self.zoom * ZOOM_KEY_STEP, cx);
+    }
+
+    fn zoom_out(&mut self, cx: &mut Context<Self>) {
+        self.apply_zoom(self.zoom / ZOOM_KEY_STEP, cx);
+    }
+
+    fn zoom_reset(&mut self, cx: &mut Context<Self>) {
+        self.reset_zoom();
+        cx.notify();
+    }
+
+    /// Sets the window title only when it actually changed, so title bookkeeping isn't tied to
+    /// render frequency (mirrors Zed's `Workspace::apply_window_title`).
+    pub(super) fn sync_window_title(&mut self, window: &mut Window) {
+        let title = self.viewer.status().clone();
+        if self.last_window_title.as_ref() == Some(&title) {
+            return;
+        }
+        window.set_window_title(&title);
+        self.last_window_title = Some(title);
     }
 
     fn begin_load_request(&mut self) -> LoadRequest {
@@ -426,8 +481,7 @@ impl Root {
             "viewer status must never be blank"
         );
 
-        self.context_menu_position = None;
-        self.tone_mapping_menu_open = false;
+        self.dismiss_menus();
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -440,11 +494,11 @@ impl Root {
                 Ok(Ok(Some(mut paths))) => paths.pop(),
                 Ok(Ok(None)) | Err(_) => None,
                 Ok(Err(prompt_error)) => {
-                    let _ = root.update_in(cx, |root, _window, cx| {
-                        root.context_menu_position = None;
-                        root.tone_mapping_menu_open = false;
+                    let _ = root.update_in(cx, |root, window, cx| {
+                        root.dismiss_menus();
                         root.viewer
                             .apply_result(Err(LoadError::new(prompt_error.to_string()).raise()));
+                        root.sync_window_title(window);
                         cx.notify();
                     });
                     return;
@@ -455,8 +509,7 @@ impl Root {
             };
 
             let _ = root.update_in(cx, |root, window, cx| {
-                root.context_menu_position = None;
-                root.tone_mapping_menu_open = false;
+                root.dismiss_menus();
 
                 let request = root.begin_load_request();
                 root.hdr_metrics_request = None;
@@ -527,6 +580,7 @@ impl Root {
                 }
 
                 if applied {
+                    root.sync_window_title(window);
                     cx.notify();
                 }
             });
@@ -550,9 +604,7 @@ impl Root {
         if load_succeeded {
             self.metadata_visible = false;
             self.tone_mapping_menu_open = false;
-            self.zoom = ZOOM_MIN;
-            self.pan = Point::default();
-            self.drag_anchor = None;
+            self.reset_zoom();
         }
 
         assert!(
@@ -630,8 +682,7 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.context_menu_position = None;
-        self.tone_mapping_menu_open = false;
+        self.dismiss_menus();
 
         let Some((active_options, source_path)) = self.viewer.displayed().and_then(|displayed| {
             displayed
@@ -666,8 +717,7 @@ impl Root {
     }
 
     fn toggle_metadata(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.context_menu_position = None;
-        self.tone_mapping_menu_open = false;
+        self.dismiss_menus();
         self.metadata_visible = !self.metadata_visible;
 
         if !self.metadata_visible {
@@ -987,83 +1037,88 @@ impl Root {
             .items_center()
             .justify_center()
             .overflow_hidden()
-            .when_some(image.zip(image_dims), |content, (image, (width, height))| {
-                let viewport_size = window.viewport_size();
-                let content_w = viewport_size.width;
-                let content_h = viewport_size.height - px(DRAG_REGION_HEIGHT);
+            .when_some(
+                image.zip(image_dims),
+                |content, (image, (width, height))| {
+                    let viewport_size = window.viewport_size();
+                    let content_w = viewport_size.width;
+                    let content_h = viewport_size.height - px(DRAG_REGION_HEIGHT);
 
-                let scale = fit_scale(content_w, content_h, width, height) * self.zoom;
-                let display_w = px(width as f32) * scale;
-                let display_h = px(height as f32) * scale;
+                    let scale = fit_scale(content_w, content_h, width, height) * self.zoom;
+                    let display_w = px(width as f32) * scale;
+                    let display_h = px(height as f32) * scale;
 
-                self.pan = clamp_pan(self.pan, display_w, display_h, content_w, content_h);
-                let pan = self.pan;
-                let zoom = self.zoom;
-                let left = (content_w - display_w) * 0.5 + pan.x;
-                let top = (content_h - display_h) * 0.5 + pan.y;
+                    self.pan = clamp_pan(self.pan, display_w, display_h, content_w, content_h);
+                    let pan = self.pan;
+                    let zoom = self.zoom;
+                    let left = (content_w - display_w) * 0.5 + pan.x;
+                    let top = (content_h - display_h) * 0.5 + pan.y;
 
-                content
-                    .on_scroll_wheel(cx.listener(move |root, event: &ScrollWheelEvent, _, cx| {
-                        let delta = event.delta.pixel_delta(px(SCROLL_LINE_HEIGHT));
-                        let step = f32::from(delta.y) / SCROLL_LINE_HEIGHT;
-                        let new_zoom =
-                            (root.zoom * ZOOM_STEP_BASE.powf(step)).clamp(ZOOM_MIN, ZOOM_MAX);
-                        if (new_zoom - root.zoom).abs() > f32::EPSILON {
-                            let base_scale = fit_scale(content_w, content_h, width, height);
-                            let cursor_offset = point(
-                                event.position.x - content_w * 0.5,
-                                event.position.y - px(DRAG_REGION_HEIGHT) - content_h * 0.5,
-                            );
-                            root.pan = zoom_to_cursor_pan(
-                                cursor_offset,
-                                root.pan,
-                                base_scale * root.zoom,
-                                base_scale * new_zoom,
-                            );
-                            root.zoom = new_zoom;
+                    content
+                        .on_scroll_wheel(cx.listener(
+                            move |root, event: &ScrollWheelEvent, _, cx| {
+                                let delta = event.delta.pixel_delta(px(SCROLL_LINE_HEIGHT));
+                                let step = f32::from(delta.y) / SCROLL_LINE_HEIGHT;
+                                let new_zoom = (root.zoom * ZOOM_STEP_BASE.powf(step))
+                                    .clamp(ZOOM_MIN, ZOOM_MAX);
+                                if (new_zoom - root.zoom).abs() > f32::EPSILON {
+                                    let base_scale = fit_scale(content_w, content_h, width, height);
+                                    let cursor_offset = point(
+                                        event.position.x - content_w * 0.5,
+                                        event.position.y - px(DRAG_REGION_HEIGHT) - content_h * 0.5,
+                                    );
+                                    root.pan = zoom_to_cursor_pan(
+                                        cursor_offset,
+                                        root.pan,
+                                        base_scale * root.zoom,
+                                        base_scale * new_zoom,
+                                    );
+                                    root.zoom = new_zoom;
+                                    cx.notify();
+                                }
+                            },
+                        ))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |root, event: &MouseDownEvent, _, cx| {
+                                if (root.zoom - 1.0).abs() > f32::EPSILON {
+                                    root.drag_anchor = Some((event.position, pan));
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .on_mouse_move(cx.listener(move |root, event: &MouseMoveEvent, _, cx| {
+                            let Some((anchor_mouse, anchor_pan)) = root.drag_anchor else {
+                                return;
+                            };
+                            if event.pressed_button != Some(MouseButton::Left) {
+                                return;
+                            }
+                            root.pan = anchor_pan + (event.position - anchor_mouse);
                             cx.notify();
-                        }
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |root, event: &MouseDownEvent, _, cx| {
-                            if root.zoom > ZOOM_MIN {
-                                root.drag_anchor = Some((event.position, pan));
-                                cx.notify();
-                            }
-                        }),
-                    )
-                    .on_mouse_move(cx.listener(move |root, event: &MouseMoveEvent, _, cx| {
-                        let Some((anchor_mouse, anchor_pan)) = root.drag_anchor else {
-                            return;
-                        };
-                        if event.pressed_button != Some(MouseButton::Left) {
-                            return;
-                        }
-                        root.pan = anchor_pan + (event.position - anchor_mouse);
-                        cx.notify();
-                    }))
-                    .on_mouse_up(
-                        MouseButton::Left,
-                        cx.listener(|root, _: &MouseUpEvent, _, cx| {
-                            if root.drag_anchor.take().is_some() {
-                                cx.notify();
-                            }
-                        }),
-                    )
-                    .child(
-                        img(image)
-                            .id("displayed-image")
-                            .absolute()
-                            .left(left)
-                            .top(top)
-                            .w(display_w)
-                            .h(display_h),
-                    )
-                    .when(zoom > ZOOM_MIN, |content| {
-                        content.cursor(CursorStyle::OpenHand)
-                    })
-            })
+                        }))
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|root, _: &MouseUpEvent, _, cx| {
+                                if root.drag_anchor.take().is_some() {
+                                    cx.notify();
+                                }
+                            }),
+                        )
+                        .child(
+                            img(image)
+                                .id("displayed-image")
+                                .absolute()
+                                .left(left)
+                                .top(top)
+                                .w(display_w)
+                                .h(display_h),
+                        )
+                        .when((zoom - 1.0).abs() > f32::EPSILON, |content| {
+                            content.cursor(CursorStyle::OpenHand)
+                        })
+                },
+            )
             .when(!has_image, |content| {
                 content.child(
                     div()
@@ -1119,6 +1174,12 @@ impl Root {
     }
 }
 
+impl Focusable for Root {
+    fn focus_handle(&self, cx: &App) -> FocusHandle {
+        self.focus_handle.get_or_init(|| cx.focus_handle()).clone()
+    }
+}
+
 impl Render for Root {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         assert!(
@@ -1149,15 +1210,25 @@ impl Render for Root {
         let metadata_visible = self.metadata_visible;
         let tone_mapping_menu_open = self.tone_mapping_menu_open;
         let status = self.viewer.status().clone();
-        window.set_window_title(&status);
+        let focus_handle = self.focus_handle(cx);
 
         div()
             .relative()
             .size_full()
             .flex()
             .flex_col()
+            .key_context("Viewer")
+            .track_focus(&focus_handle)
             .bg(rgb(COLOR_APP_BACKGROUND))
             .text_color(rgb(COLOR_TEXT_PRIMARY))
+            .on_action(cx.listener(|root, _: &OpenFile, window, cx| root.open_image(window, cx)))
+            .on_action(cx.listener(|root, _: &ZoomIn, _, cx| root.zoom_in(cx)))
+            .on_action(cx.listener(|root, _: &ZoomOut, _, cx| root.zoom_out(cx)))
+            .on_action(cx.listener(|root, _: &ZoomReset, _, cx| root.zoom_reset(cx)))
+            .on_action(cx.listener(|root, _: &DismissMenu, _, cx| {
+                root.dismiss_menus();
+                cx.notify();
+            }))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|root, event: &MouseDownEvent, window, cx| {

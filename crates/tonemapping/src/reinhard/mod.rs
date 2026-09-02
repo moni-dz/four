@@ -264,13 +264,13 @@ impl LuminanceWhitePointEstimator {
     /// Both estimators must have been created with the same pixel count, so that they retain the
     /// same number of samples. This is what lets a caller split an image across worker threads.
     pub fn merge(&mut self, other: Self) {
-        debug_assert_eq!(
+        assert_eq!(
             self.expected, other.expected,
             "merged luminance white point estimators must share a declared pixel count: {} vs {}",
             self.expected, other.expected
         );
 
-        debug_assert_eq!(
+        assert_eq!(
             self.retained, other.retained,
             "merged luminance white point estimators must retain the same sample count: {} vs {}",
             self.retained, other.retained
@@ -458,20 +458,32 @@ impl Mobius {
     ///
     /// `transition` is the scene level below which input passes through unchanged; the curve
     /// compresses everything above it up to `white_point`. It must therefore be positive, finite,
-    /// and strictly less than `white_point`'s luminance.
+    /// and strictly less than `white_point`'s luminance. `white_point`'s luminance must itself
+    /// exceed display white (`1.0`): the curve compresses scene light down to display white, so a
+    /// white point at or below `1.0` has nothing to compress and is outside this operator's domain.
     ///
     /// # Errors
     ///
-    /// Returns [`WhitePointError`] when `transition` is zero, negative, non-finite, or not less
-    /// than `white_point`'s luminance.
-    pub fn new(white_point: LuminanceWhitePoint, transition: f32) -> Result<Self, WhitePointError> {
+    /// Returns [`MobiusError::WhitePointNotAboveDisplayWhite`] when `white_point`'s luminance does
+    /// not exceed `1.0`. Returns [`MobiusError::InvalidTransition`] when `transition` is zero,
+    /// negative, non-finite, or not less than `white_point`'s luminance.
+    pub fn new(white_point: LuminanceWhitePoint, transition: f32) -> Result<Self, MobiusError> {
+        if white_point.luminance() <= 1.0 {
+            return Err(MobiusError::WhitePointNotAboveDisplayWhite(
+                white_point.luminance(),
+            ));
+        }
+
         if transition.is_finite() && transition > 0.0 && transition < white_point.luminance() {
             Ok(Self {
                 white_point,
                 transition,
             })
         } else {
-            Err(WhitePointError(transition))
+            Err(MobiusError::InvalidTransition {
+                transition,
+                white_point: white_point.luminance(),
+            })
         }
     }
 
@@ -486,6 +498,25 @@ impl Mobius {
     pub const fn transition(self) -> f32 {
         self.transition
     }
+}
+
+/// Reports why a [`Mobius`] operator could not be constructed.
+#[derive(Clone, Copy, Debug, Error, PartialEq)]
+pub enum MobiusError {
+    /// The white point's luminance does not exceed display white (`1.0`), so there is nothing
+    /// above display white for the curve to compress.
+    #[error("Mobius white point must exceed display white (1.0), got {0}")]
+    WhitePointNotAboveDisplayWhite(f32),
+    /// `transition` is zero, negative, non-finite, or not less than the white point's luminance.
+    #[error(
+        "Mobius transition must be positive, finite, and less than the white point ({white_point}), got {transition}"
+    )]
+    InvalidTransition {
+        /// The rejected transition.
+        transition: f32,
+        /// The white point's luminance the transition was checked against.
+        white_point: f32,
+    },
 }
 
 impl ToneMapper for Mobius {
