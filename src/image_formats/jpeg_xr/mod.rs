@@ -49,6 +49,13 @@ pub use error::{Error, JPEGXRError, JPEGXRLimit, Result};
 pub const SIGNATURE: [u8; 4] = [0x49, 0x49, 0xbc, 0x01];
 
 const SC_RGB_REFERENCE_WHITE_NITS: f32 = 80.0;
+
+/// `BT2446A` is calibrated against Report ITU-R BT.2446-1's own fixed convention, where an input
+/// component of `1.0` is 100 cd/m^2 (the SDR target peak). Every other tone mapper here is
+/// white-point relative and works in whatever unit the caller's linear light happens to use, but
+/// BT2446 hardcodes real nits, so scRGB (`1.0` == 80 cd/m^2) must be rescaled before it reaches it.
+const BT2446_INPUT_SCALE: f32 = SC_RGB_REFERENCE_WHITE_NITS / 100.0;
+
 const SOURCE_BUFFER_MAX: usize = 512 * 1024 * 1024;
 // Three f32 channels plus staged alpha occupy roughly 13 KiB, leaving room in common L1 caches.
 const HDR_BATCH_PIXELS: usize = 1_024;
@@ -649,31 +656,9 @@ fn normalize(
     let hdr_metrics = analysis.and_then(|analysis| analysis.hdr_metrics);
     let mut rgba = vec![0; output_len];
 
-    let has_nonzero_alpha = if layout.encoding.is_hdr() {
-        if method == ToneMappingMethod::Clamp {
-            write_pixel_slabs(source, width, row_stride, &mut rgba, |source, rgba| {
-                write_hdr_pixels_scalar(source, width, row_stride, layout, &Clamp, rgba)
-            })?
-        } else {
-            let white_point = analysis
-                .and_then(|analysis| analysis.max_cll)
-                .map_or_else(display_white_point, hdr_white_point);
-
-            let luminance_white_point = analysis
-                .and_then(|analysis| analysis.luminance_white_point)
-                .map_or_else(display_luminance_white_point, hdr_luminance_white_point);
-
-            let mapper = method.resolve(white_point, luminance_white_point);
-
-            write_pixel_slabs(source, width, row_stride, &mut rgba, |source, rgba| {
-                write_hdr_pixels(source, width, row_stride, layout, &mapper, rgba)
-            })?
-        }
-    } else {
-        write_pixel_slabs(source, width, row_stride, &mut rgba, |source, rgba| {
-            write_sdr_pixels(source, width, row_stride, layout, rgba)
-        })?
-    };
+    let has_nonzero_alpha = write_normalized_pixels(
+        source, width, row_stride, layout, method, analysis, &mut rgba,
+    )?;
 
     if layout.encoding.is_hdr()
         && layout.has_alpha
@@ -687,6 +672,58 @@ fn normalize(
 
     invariant_eq!(rgba.len(), output_len);
     Ok(NormalizedImage { rgba, hdr_metrics })
+}
+
+/// Scales scRGB into the fixed unit each tone mapper expects; only `BT2446` needs rescaling.
+fn hdr_color_scale(method: ToneMappingMethod) -> f32 {
+    if method == ToneMappingMethod::BT2446 {
+        BT2446_INPUT_SCALE
+    } else {
+        1.0
+    }
+}
+
+fn write_normalized_pixels(
+    source: &[u8],
+    width: usize,
+    row_stride: usize,
+    layout: PixelLayout,
+    method: ToneMappingMethod,
+    analysis: Option<HDRAnalysis>,
+    rgba: &mut [u8],
+) -> Result<bool> {
+    if !layout.encoding.is_hdr() {
+        return write_pixel_slabs(source, width, row_stride, rgba, |source, rgba| {
+            write_sdr_pixels(source, width, row_stride, layout, rgba)
+        });
+    }
+
+    if method == ToneMappingMethod::Clamp {
+        return write_pixel_slabs(source, width, row_stride, rgba, |source, rgba| {
+            write_hdr_pixels_scalar(source, width, row_stride, layout, &Clamp, 1.0, rgba)
+        });
+    }
+
+    let white_point = analysis
+        .and_then(|analysis| analysis.max_cll)
+        .map_or_else(display_white_point, hdr_white_point);
+    let luminance_white_point = analysis
+        .and_then(|analysis| analysis.luminance_white_point)
+        .map_or_else(display_luminance_white_point, hdr_luminance_white_point);
+    let mapper = method.resolve(white_point, luminance_white_point);
+    let color_scale = hdr_color_scale(method);
+
+    write_pixel_slabs(source, width, row_stride, rgba, |source, rgba| {
+        write_hdr_pixels(
+            source,
+            width,
+            row_stride,
+            layout,
+            &mapper,
+            color_scale,
+            rgba,
+        )
+    })
 }
 
 fn write_pixel_slabs(
@@ -753,6 +790,7 @@ fn write_hdr_pixels_scalar(
     row_stride: usize,
     layout: PixelLayout,
     mapper: &(impl ToneMapper + Sync),
+    color_scale: f32,
     rgba: &mut [u8],
 ) -> Result<bool> {
     let mut has_nonzero_alpha = false;
@@ -770,6 +808,7 @@ fn write_hdr_pixels_scalar(
 
             has_nonzero_alpha |= alpha > 0.0;
 
+            let color = color.map(|component| component * color_scale);
             let color = display_linear_to_srgb8(mapper.map(LinearRGB::new(color)));
             target.copy_from_slice(&[color[0], color[1], color[2], normalized_to_u8(alpha)]);
         }
@@ -784,6 +823,7 @@ fn write_hdr_pixels(
     row_stride: usize,
     layout: PixelLayout,
     mapper: &(impl ToneMapper + Sync),
+    color_scale: f32,
     rgba: &mut [u8],
 ) -> Result<bool> {
     let row_count = source.len() / row_stride;
@@ -805,6 +845,7 @@ fn write_hdr_pixels(
 
             has_nonzero_alpha |= alpha > 0.0;
 
+            let color = color.map(|component| component * color_scale);
             colors.push(LinearRGB::new(color));
             alphas.push(normalized_to_u8(alpha));
 
@@ -919,6 +960,7 @@ fn append_hdr_pixels(
         row_stride,
         layout,
         mapper,
+        1.0,
         &mut rgba[start..],
     )
 }
@@ -2248,7 +2290,9 @@ mod tests {
     fn bt2446_method_dispatches_to_bt2446a() {
         let color = [4.0, 2.0, 1.0];
         let actual = normalize_float_rgb(&[color], 1, ToneMappingMethod::BT2446);
-        let [red, green, blue] = hdr_to_srgb8(color, &BT2446A);
+        // The pipeline rescales scRGB into BT2446A's own fixed nits convention before mapping.
+        let scaled = color.map(|component| component * BT2446_INPUT_SCALE);
+        let [red, green, blue] = hdr_to_srgb8(scaled, &BT2446A);
 
         assert_eq!(actual, [red, green, blue, u8::MAX]);
     }
