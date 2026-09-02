@@ -110,9 +110,10 @@ pub fn log2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
     let result = value
         .simd_lt(Simd::splat(0.0))
         .select(Simd::splat(f32::NAN), result);
-    value
+    let result = value
         .simd_eq(Simd::splat(f32::INFINITY))
-        .select(Simd::splat(f32::INFINITY), result)
+        .select(Simd::splat(f32::INFINITY), result);
+    value.is_nan().select(Simd::splat(f32::NAN), result)
 }
 
 /// Returns two raised to the power of each lane.
@@ -220,6 +221,7 @@ mod tests {
             );
         }
         assert!(log2_scalar(-1.0).is_nan());
+        assert!(log2(Simd::<f32, 1>::splat(f32::NAN))[0].is_nan());
 
         for value in [0.0_f32, 1.0, -1.0, 10.0, -160.0, 200.0, f32::NEG_INFINITY] {
             assert_eq!(
