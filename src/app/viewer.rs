@@ -98,7 +98,13 @@ fn fit_scale(content_w: Pixels, content_h: Pixels, image_w: u32, image_h: u32) -
     assert!(image_w > 0, "image width must be nonzero");
     assert!(image_h > 0, "image height must be nonzero");
 
-    (f32::from(content_w) / image_w as f32).min(f32::from(content_h) / image_h as f32)
+    // Floored so a content area shrunk to zero or negative (viewport smaller than the drag region)
+    // can't return a zero scale: a later zoom would then divide by zero in `zoom_to_cursor_pan` and
+    // get NaN stuck in `self.pan` forever, since `f32::clamp` passes NaN through unchanged.
+    let content_w = f32::from(content_w).max(1.0);
+    let content_h = f32::from(content_h).max(1.0);
+
+    (content_w / image_w as f32).min(content_h / image_h as f32)
 }
 
 /// Clamps a pan offset so a `display`-sized image centered in a `content`-sized container can't
@@ -130,8 +136,14 @@ fn zoom_to_cursor_pan(
 
 #[cfg(test)]
 mod zoom_math_tests {
-    use super::{clamp_pan, zoom_to_cursor_pan};
+    use super::{clamp_pan, fit_scale, zoom_to_cursor_pan};
     use gpui::{point, px};
+
+    #[test]
+    fn fit_scale_stays_positive_when_content_area_collapses() {
+        assert!(fit_scale(px(0.0), px(0.0), 100, 100) > 0.0);
+        assert!(fit_scale(px(-5.0), px(200.0), 100, 100) > 0.0);
+    }
 
     #[test]
     fn zoom_to_cursor_pan_is_identity_when_scale_unchanged() {
@@ -321,9 +333,10 @@ impl<T> LatestLoadCoordinator<T> {
 pub(super) struct Root {
     context_menu_position: Option<Point<Pixels>>,
     decode_coordinator: LatestLoadCoordinator<DecodePayload>,
-    /// Mouse position and pan offset at the start of an active left-drag pan; `None` when not
-    /// panning.
-    drag_anchor: Option<(Point<Pixels>, Point<Pixels>)>,
+    /// Mouse position at the last drag event during an active left-drag pan; `None` when not
+    /// panning. Updated every move so a pan change from another source (e.g. a scroll-wheel zoom)
+    /// in between two drag events is preserved instead of overwritten from a stale anchor.
+    drag_anchor: Option<Point<Pixels>>,
     /// Lazily created on first access, since `Root::new` runs in plain unit tests with no `App`
     /// available to call `cx.focus_handle()`.
     focus_handle: OnceCell<FocusHandle>,
@@ -371,10 +384,13 @@ impl Root {
         let viewport_size = window.viewport_size();
         let menu_height = context_menu_height(self.viewer.has_image());
 
-        position.x = position.x.min(viewport_size.width - px(CONTEXT_MENU_WIDTH));
-        position.y = position.y.min(viewport_size.height - px(menu_height));
-        position.x = position.x.max(px(0.0));
-        position.y = position.y.max(px(DRAG_REGION_HEIGHT));
+        // `.max(min_*)` on each ceiling guarantees min <= max even if the viewport is smaller than
+        // the menu, so clamping to the floor afterward can never push the position back past the
+        // ceiling.
+        let max_x = (viewport_size.width - px(CONTEXT_MENU_WIDTH)).max(px(0.0));
+        let max_y = (viewport_size.height - px(menu_height)).max(px(DRAG_REGION_HEIGHT));
+        position.x = position.x.clamp(px(0.0), max_x);
+        position.y = position.y.clamp(px(DRAG_REGION_HEIGHT), max_y);
 
         assert!(
             position.x >= px(0.0),
@@ -492,8 +508,21 @@ impl Root {
         cx.spawn_in(window, async move |root, cx| {
             let path = match paths.await {
                 Ok(Ok(Some(mut paths))) => paths.pop(),
-                Ok(Ok(None)) | Err(_) => None,
+                Ok(Ok(None)) => None,
+                // `Ok(Err(_))` is the platform reporting the dialog itself failed; `Err(_)` is the
+                // response channel being dropped before it replied. Both are real failures, unlike
+                // `Ok(Ok(None))` (the user just canceled), so both get surfaced the same way.
                 Ok(Err(prompt_error)) => {
+                    let _ = root.update_in(cx, |root, window, cx| {
+                        root.dismiss_menus();
+                        root.viewer
+                            .apply_result(Err(LoadError::new(prompt_error.to_string()).raise()));
+                        root.sync_window_title(window);
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(prompt_error) => {
                     let _ = root.update_in(cx, |root, window, cx| {
                         root.dismiss_menus();
                         root.viewer
@@ -1082,19 +1111,20 @@ impl Root {
                             MouseButton::Left,
                             cx.listener(move |root, event: &MouseDownEvent, _, cx| {
                                 if (root.zoom - 1.0).abs() > f32::EPSILON {
-                                    root.drag_anchor = Some((event.position, pan));
+                                    root.drag_anchor = Some(event.position);
                                     cx.notify();
                                 }
                             }),
                         )
                         .on_mouse_move(cx.listener(move |root, event: &MouseMoveEvent, _, cx| {
-                            let Some((anchor_mouse, anchor_pan)) = root.drag_anchor else {
+                            let Some(anchor_mouse) = root.drag_anchor else {
                                 return;
                             };
                             if event.pressed_button != Some(MouseButton::Left) {
                                 return;
                             }
-                            root.pan = anchor_pan + (event.position - anchor_mouse);
+                            root.pan += event.position - anchor_mouse;
+                            root.drag_anchor = Some(event.position);
                             cx.notify();
                         }))
                         .on_mouse_up(

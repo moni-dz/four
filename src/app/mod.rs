@@ -29,7 +29,9 @@ pub(crate) fn run(initial_path: Option<&Path>) {
             KeyBinding::new("escape", DismissMenu, Some("Viewer")),
         ]);
 
-        let bounds = Bounds::centered(None, size(px(800.0), px(600.0)), cx);
+        // `window_min_size` below is only enforced by the OS on interactive border-drag resizing,
+        // not at creation, so the initial size must already respect it.
+        let bounds = Bounds::centered(None, size(px(WINDOW_MIN_WIDTH), px(WINDOW_MIN_HEIGHT)), cx);
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
