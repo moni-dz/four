@@ -6,9 +6,10 @@ use std::sync::Arc;
 use exn::ErrorExt;
 
 use gpui::{
-    Anchor, AnchoredPositionMode, Image as GPUIImage, MouseButton, MouseDownEvent,
-    PathPromptOptions, Pixels, Point, Role, SharedString, Toggled, Window, WindowControlArea,
-    anchored, deferred, div, img, point, prelude::*, px, rgb, rgba,
+    Anchor, AnchoredPositionMode, CursorStyle, Image as GPUIImage, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point, Role, ScrollWheelEvent,
+    SharedString, Toggled, Window, WindowControlArea, anchored, deferred, div, img, point,
+    prelude::*, px, rgb, rgba,
 };
 use tonemapping::{MaxCLLMode, ToneMappingMethod};
 
@@ -73,6 +74,92 @@ const COLOR_METADATA_OVERLAY_BACKGROUND: u32 = 0x0020_2020;
 
 pub(super) const WINDOW_MIN_WIDTH: f32 = 1280.0;
 pub(super) const WINDOW_MIN_HEIGHT: f32 = 720.0;
+
+/// Zoom multiplier on top of the fit-to-window baseline; 1.0 always means "fit".
+const ZOOM_MIN: f32 = 1.0;
+const ZOOM_MAX: f32 = 16.0;
+/// Multiplier applied per normalized scroll step.
+const ZOOM_STEP_BASE: f32 = 1.1;
+/// Assumed line height for normalizing line-based scroll deltas into pixels.
+const SCROLL_LINE_HEIGHT: f32 = 24.0;
+
+/// Scale that fits an `image_w`×`image_h` image inside `content_w`×`content_h`, preserving
+/// aspect ratio (matches gpui's `ObjectFit::Contain`, which this replaces).
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "image dimensions stay far below f32's 2^24 exact-integer range"
+)]
+fn fit_scale(content_w: Pixels, content_h: Pixels, image_w: u32, image_h: u32) -> f32 {
+    assert!(image_w > 0, "image width must be nonzero");
+    assert!(image_h > 0, "image height must be nonzero");
+
+    (f32::from(content_w) / image_w as f32).min(f32::from(content_h) / image_h as f32)
+}
+
+/// Clamps a pan offset so a `display`-sized image centered in a `content`-sized container can't
+/// be dragged fully out of view.
+fn clamp_pan(
+    pan: Point<Pixels>,
+    display_w: Pixels,
+    display_h: Pixels,
+    content_w: Pixels,
+    content_h: Pixels,
+) -> Point<Pixels> {
+    let max_x = ((display_w - content_w) * 0.5).max(px(0.0));
+    let max_y = ((display_h - content_h) * 0.5).max(px(0.0));
+
+    point(pan.x.clamp(-max_x, max_x), pan.y.clamp(-max_y, max_y))
+}
+
+/// Pan offset that keeps the image point under `cursor_offset` (relative to the content-area
+/// center) fixed while the effective scale changes from `old_scale` to `new_scale`.
+fn zoom_to_cursor_pan(
+    cursor_offset: Point<Pixels>,
+    old_pan: Point<Pixels>,
+    old_scale: f32,
+    new_scale: f32,
+) -> Point<Pixels> {
+    let image_point = (cursor_offset - old_pan) / old_scale;
+    cursor_offset - image_point * new_scale
+}
+
+#[cfg(test)]
+mod zoom_math_tests {
+    use super::{clamp_pan, zoom_to_cursor_pan};
+    use gpui::{point, px};
+
+    #[test]
+    fn zoom_to_cursor_pan_is_identity_when_scale_unchanged() {
+        let cursor = point(px(50.0), px(-30.0));
+        let pan = point(px(10.0), px(5.0));
+
+        assert_eq!(zoom_to_cursor_pan(cursor, pan, 2.0, 2.0), pan);
+    }
+
+    #[test]
+    fn zoom_to_cursor_pan_leaves_pan_unchanged_when_cursor_is_centered() {
+        let cursor = point(px(0.0), px(0.0));
+        let pan = point(px(0.0), px(0.0));
+
+        assert_eq!(zoom_to_cursor_pan(cursor, pan, 1.0, 4.0), pan);
+    }
+
+    #[test]
+    fn clamp_pan_constrains_oversized_image_pan() {
+        let pan = point(px(1000.0), px(1000.0));
+        let clamped = clamp_pan(pan, px(400.0), px(300.0), px(200.0), px(200.0));
+
+        assert_eq!(clamped, point(px(100.0), px(50.0)));
+    }
+
+    #[test]
+    fn clamp_pan_forces_zero_when_image_fits_within_content() {
+        let pan = point(px(40.0), px(40.0));
+        let clamped = clamp_pan(pan, px(100.0), px(100.0), px(200.0), px(200.0));
+
+        assert_eq!(clamped, point(px(0.0), px(0.0)));
+    }
+}
 
 pub(super) enum ViewerState {
     Empty {
@@ -229,13 +316,20 @@ impl<T> LatestLoadCoordinator<T> {
 pub(super) struct Root {
     context_menu_position: Option<Point<Pixels>>,
     decode_coordinator: LatestLoadCoordinator<DecodePayload>,
+    /// Mouse position and pan offset at the start of an active left-drag pan; `None` when not
+    /// panning.
+    drag_anchor: Option<(Point<Pixels>, Point<Pixels>)>,
     hdr_metrics_request: Option<LoadRequest>,
     load_generation: u64,
     metadata_visible: bool,
+    /// Pan offset in pixels, relative to the image being centered in the content area.
+    pan: Point<Pixels>,
     pending_hdr_options: Option<(LoadRequest, HDROptions)>,
     preferred_hdr_options: HDROptions,
     tone_mapping_menu_open: bool,
     viewer: ViewerState,
+    /// Zoom multiplier on top of fit-to-window; always >= `ZOOM_MIN`.
+    zoom: f32,
 }
 
 impl Root {
@@ -248,13 +342,16 @@ impl Root {
         Self {
             context_menu_position: None,
             decode_coordinator: LatestLoadCoordinator::new(),
+            drag_anchor: None,
             hdr_metrics_request: None,
             load_generation: 0,
             metadata_visible: false,
+            pan: Point::default(),
             pending_hdr_options: None,
             preferred_hdr_options,
             tone_mapping_menu_open: false,
             viewer,
+            zoom: ZOOM_MIN,
         }
     }
 
@@ -453,6 +550,9 @@ impl Root {
         if load_succeeded {
             self.metadata_visible = false;
             self.tone_mapping_menu_open = false;
+            self.zoom = ZOOM_MIN;
+            self.pan = Point::default();
+            self.drag_anchor = None;
         }
 
         assert!(
@@ -861,10 +961,25 @@ impl Root {
         .priority(2)
     }
 
-    fn render_image_content(image: Option<Arc<GPUIImage>>) -> gpui::Div {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "image dimensions stay far below f32's 2^24 exact-integer range"
+    )]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "sizing, pan clamping, and zoom/pan input handling for the image view belong together"
+    )]
+    fn render_image_content(
+        &mut self,
+        image: Option<Arc<GPUIImage>>,
+        image_dims: Option<(u32, u32)>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::Div {
         let has_image = image.is_some();
 
         div()
+            .relative()
             .flex_1()
             .min_h_0()
             .min_w_0()
@@ -872,8 +987,82 @@ impl Root {
             .items_center()
             .justify_center()
             .overflow_hidden()
-            .when_some(image, |content, image| {
-                content.child(img(image).id("displayed-image").size_full())
+            .when_some(image.zip(image_dims), |content, (image, (width, height))| {
+                let viewport_size = window.viewport_size();
+                let content_w = viewport_size.width;
+                let content_h = viewport_size.height - px(DRAG_REGION_HEIGHT);
+
+                let scale = fit_scale(content_w, content_h, width, height) * self.zoom;
+                let display_w = px(width as f32) * scale;
+                let display_h = px(height as f32) * scale;
+
+                self.pan = clamp_pan(self.pan, display_w, display_h, content_w, content_h);
+                let pan = self.pan;
+                let zoom = self.zoom;
+                let left = (content_w - display_w) * 0.5 + pan.x;
+                let top = (content_h - display_h) * 0.5 + pan.y;
+
+                content
+                    .on_scroll_wheel(cx.listener(move |root, event: &ScrollWheelEvent, _, cx| {
+                        let delta = event.delta.pixel_delta(px(SCROLL_LINE_HEIGHT));
+                        let step = f32::from(delta.y) / SCROLL_LINE_HEIGHT;
+                        let new_zoom =
+                            (root.zoom * ZOOM_STEP_BASE.powf(step)).clamp(ZOOM_MIN, ZOOM_MAX);
+                        if (new_zoom - root.zoom).abs() > f32::EPSILON {
+                            let base_scale = fit_scale(content_w, content_h, width, height);
+                            let cursor_offset = point(
+                                event.position.x - content_w * 0.5,
+                                event.position.y - px(DRAG_REGION_HEIGHT) - content_h * 0.5,
+                            );
+                            root.pan = zoom_to_cursor_pan(
+                                cursor_offset,
+                                root.pan,
+                                base_scale * root.zoom,
+                                base_scale * new_zoom,
+                            );
+                            root.zoom = new_zoom;
+                            cx.notify();
+                        }
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |root, event: &MouseDownEvent, _, cx| {
+                            if root.zoom > ZOOM_MIN {
+                                root.drag_anchor = Some((event.position, pan));
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .on_mouse_move(cx.listener(move |root, event: &MouseMoveEvent, _, cx| {
+                        let Some((anchor_mouse, anchor_pan)) = root.drag_anchor else {
+                            return;
+                        };
+                        if event.pressed_button != Some(MouseButton::Left) {
+                            return;
+                        }
+                        root.pan = anchor_pan + (event.position - anchor_mouse);
+                        cx.notify();
+                    }))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|root, _: &MouseUpEvent, _, cx| {
+                            if root.drag_anchor.take().is_some() {
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(
+                        img(image)
+                            .id("displayed-image")
+                            .absolute()
+                            .left(left)
+                            .top(top)
+                            .w(display_w)
+                            .h(display_h),
+                    )
+                    .when(zoom > ZOOM_MIN, |content| {
+                        content.cursor(CursorStyle::OpenHand)
+                    })
             })
             .when(!has_image, |content| {
                 content.child(
@@ -931,7 +1120,7 @@ impl Root {
 }
 
 impl Render for Root {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         assert!(
             !self.viewer.status().is_empty(),
             "viewer status must never be blank"
@@ -948,6 +1137,7 @@ impl Render for Root {
         let has_image = displayed.is_some();
 
         let image = displayed.map(|displayed| Arc::clone(&displayed.image));
+        let image_dims = displayed.map(|displayed| (displayed.width, displayed.height));
         let metadata = displayed.map(|displayed| Arc::clone(&displayed.metadata));
         let active_hdr_options = displayed.and_then(|displayed| displayed.hdr_options);
 
@@ -980,7 +1170,7 @@ impl Render for Root {
                 tone_mapping_menu_open,
                 cx,
             ))
-            .child(Self::render_image_content(image))
+            .child(self.render_image_content(image, image_dims, window, cx))
             .when_some(metadata.filter(|_| metadata_visible), |root, metadata| {
                 root.child(Self::render_metadata_overlay(&metadata, hdr_options, cx))
             })
@@ -1112,6 +1302,8 @@ mod tests {
         ViewerState::Loaded(LoadedImage {
             displayed: DisplayedImage {
                 image: Arc::new(GPUIImage::empty()),
+                width: 1,
+                height: 1,
                 metadata: Arc::new(ImageMetadata {
                     fields: Vec::new(),
                     has_hdr_metrics: false,

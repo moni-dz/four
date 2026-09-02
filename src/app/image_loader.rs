@@ -73,6 +73,8 @@ pub(super) fn format_load_error(error: &LoadException) -> String {
 #[derive(Clone)]
 pub(super) struct DisplayedImage {
     pub(super) image: Arc<GPUIImage>,
+    pub(super) width: u32,
+    pub(super) height: u32,
     pub(super) metadata: Arc<ImageMetadata>,
     pub(super) source_path: Arc<Path>,
     pub(super) hdr_options: Option<HDROptions>,
@@ -578,6 +580,8 @@ pub(super) fn load_image_with(
     let loaded = LoadedImage {
         displayed: DisplayedImage {
             image,
+            width,
+            height,
             metadata,
             source_path: Arc::from(path),
             hdr_options: active_hdr_options,
