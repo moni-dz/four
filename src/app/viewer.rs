@@ -1149,6 +1149,7 @@ impl Render for Root {
         let metadata_visible = self.metadata_visible;
         let tone_mapping_menu_open = self.tone_mapping_menu_open;
         let status = self.viewer.status().clone();
+        window.set_window_title(&status);
 
         div()
             .relative()
