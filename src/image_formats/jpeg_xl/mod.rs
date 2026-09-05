@@ -178,14 +178,7 @@ fn codec_error(source: Box<dyn std::error::Error + Send + Sync + 'static>) -> Er
     let detail = source.to_string();
     let lowercase_detail = detail.to_ascii_lowercase();
 
-    // `jxl-oxide` never exposes a structured "out of memory" signal through its public API:
-    // the concrete allocation-tracker error (`jxl_grid::OutOfMemory`, which does carry the
-    // failed allocation's byte count) is reachable only by adding `jxl_grid` as a direct
-    // dependency, since `jxl-oxide` re-exports `AllocTracker` but not the error type it raises.
-    // Every allocation-limit failure in the dependency chain renders through one of two literal
-    // phrases: `jxl_grid::OutOfMemory`'s "failed to allocate N byte(s)" or
-    // `jxl_frame::Error::OutOfMemory`'s "out of memory"; "memory limit" is never actually
-    // emitted anywhere in the chain, so it is dropped from the match below.
+    // jxl-oxide exposes allocation failures only through these display strings.
     if lowercase_detail.contains("failed to allocate") || lowercase_detail.contains("out of memory")
     {
         error(JPEGXLError::LimitExceeded(JPEGXLLimit::DecoderMemory(

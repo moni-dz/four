@@ -906,10 +906,7 @@ fn write_display_pixels(colors: &LinearRGBPlanes, alphas: &[u8], targets: &mut [
         .zip(alpha_chunks)
         .zip(target_chunks)
     {
-        // Quantize in the vector too. Only the transfer function used to be vectorized, leaving
-        // twenty-four scalar clamp-scale-round-convert sequences per eight-pixel group. The
-        // operations mirror `normalized_to_u8` exactly: `Simd::round` is also half-away-from-zero,
-        // and a float-to-integer `cast` saturates the same way `as` does.
+        // Match `normalized_to_u8`: round half away from zero, then saturate the cast.
         let encoded = [*red, *green, *blue].map(|channel| {
             let srgb = linear_to_srgb_simd(F32x8::from_array(channel));
             (srgb.simd_clamp(F32x8::splat(0.0), F32x8::splat(1.0))
@@ -1262,16 +1259,9 @@ impl HDRAnalysis {
     }
 }
 
-/// Gathers analysis measurements over `source`, splitting the work by row group when the image is
-/// large enough for the split to pay for itself.
+/// Gathers mergeable HDR measurements over parallel row groups.
 ///
-/// This pass used to run on one thread while the write pass that follows it was already parallel,
-/// which made it the largest serial block in an HDR decode. All three accumulators merge
-/// associatively, so the image can be split by row groups.
-///
-/// Job size is computed in pixels, not row-stride bytes: `write_pixel_slabs` below uses the same
-/// `width`-based formula, and BGR101010/RGBA32F have very different bytes-per-pixel, so sizing off
-/// `row_stride` alone produced wildly different job counts per format.
+/// Jobs are sized in pixels so formats use comparable row-group sizes.
 fn compute_totals(
     source: &[u8],
     row_stride: usize,
@@ -1561,11 +1551,7 @@ fn visit_pixels(
     Ok(())
 }
 
-/// Counts source pixels with nonzero alpha, splitting the work by row group when the image is
-/// large enough for the split to pay for itself.
-///
-/// This scan runs before `compute_totals` on every RGBA image, so leaving it serial would reinstate
-/// the same single-thread bottleneck `compute_totals` was parallelized to remove.
+/// Counts source pixels with nonzero alpha over parallel row groups.
 fn visible_alpha_pixel_count(
     source: &[u8],
     row_stride: usize,
@@ -1742,10 +1728,6 @@ fn fixed32_to_f32(value: i32) -> f32 {
 }
 
 /// Widens an IEEE 754 binary16 sample to `f32`.
-///
-/// The hand-rolled decomposition this replaced called `powi` — a libm call — once per sample, and
-/// twice on the subnormal path. Widening is a single instruction wherever `f16c` or NEON is
-/// available, and a short branchless sequence where it is not.
 fn half_to_f32(bits: u16) -> f32 {
     f32::from(f16::from_bits(bits))
 }

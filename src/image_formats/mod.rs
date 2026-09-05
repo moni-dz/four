@@ -49,10 +49,7 @@ fn validate_dimensions_pair(&(width, height): &(u32, u32)) -> Result<(), Dimensi
     Ok(())
 }
 
-/// A `(width, height)` pair already known to be nonzero and within [`DIMENSION_MAX`]/[`PIXELS_MAX`].
-///
-/// Collapses the six format decoders' near-identical `validate_dimensions` checks into one
-/// validated construction; each decoder still maps [`DimensionsError`] into its own error type.
+/// A nonzero `(width, height)` pair within the decoder limits.
 #[nutype(
     validate(with = validate_dimensions_pair, error = DimensionsError),
     derive(Clone, Copy, Debug, PartialEq, Eq)
@@ -60,23 +57,12 @@ fn validate_dimensions_pair(&(width, height): &(u32, u32)) -> Result<(), Dimensi
 pub(crate) struct Dimensions((u32, u32));
 
 /// Pixel count below which a decoder normalizes on the calling thread.
-///
-/// Spawning rayon jobs costs more than it saves for a small image, and the viewer opens far more
-/// small images than large ones. A quarter of a megapixel is roughly where the two balance on a
-/// typical desktop; it is a threshold, not a measured optimum, so moving it changes throughput
-/// rather than correctness.
 const PARALLEL_PIXELS_MIN: usize = 256 * 1024;
 
 /// Pixels per rayon job once a decoder does go parallel.
-///
-/// Large enough that per-job overhead is negligible, small enough that a four-megapixel image
-/// still splits into enough jobs to fill a many-core machine.
 const PARALLEL_PIXELS_PER_JOB: usize = 64 * 1024;
 
-/// Owned RGBA8 pixels produced by one of our format parsers.
-///
-/// Keeping this type independent of GPUI makes the parsers usable in tests and keeps the boundary
-/// between decoding and display explicit.
+/// Owns a decoded row-major RGBA8 image.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DecodedImage {
     width: u32,
@@ -125,12 +111,7 @@ impl DecodedImage {
     }
 }
 
-/// Builds a row-major RGBA8 buffer by calling `pixel(x, y)` for every coordinate, going parallel
-/// (one rayon job per row) once the image is large enough that the dispatch overhead pays for
-/// itself, and running on the calling thread otherwise.
-///
-/// Shared by every decoder that reconstructs pixels from an existing sample buffer by coordinate
-/// (JPEG, TIFF) rather than by walking a source byte buffer directly.
+/// Builds RGBA8 rows in parallel above [`PARALLEL_PIXELS_MIN`].
 pub(crate) fn rgba_pixel_rows<E: Send>(
     width: usize,
     height: usize,
@@ -169,19 +150,11 @@ pub(crate) fn rgba_pixel_rows<E: Send>(
     }
 }
 
-/// GPUI accepts encoded images, so an uncompressed BMP is used only as a pixel carrier.
-///
-/// A V4 header declares explicit BGRA channel masks. Without those masks, BMP readers commonly
-/// interpret the fourth byte of a 32-bit `BI_RGB` pixel as padding and discard image transparency.
-/// The source format has already been fully decoded before this adapter runs. See Microsoft's
-/// [`BITMAPV4HEADER`](https://learn.microsoft.com/en-us/windows/win32/api/wingdi/ns-wingdi-bitmapv4header)
-/// reference for the header and mask fields.
+/// Encodes RGBA8 pixels in an uncompressed BMP V4 carrier for GPUI.
 ///
 /// # Panics
 ///
-/// Panics only if `image` violates internal [`DecodedImage`] invariants: its dimensions or encoded
-/// size do not fit the BMP fields and address space, or its RGBA length does not match its
-/// dimensions.
+/// Panics if `image` violates [`DecodedImage`] size invariants.
 #[must_use]
 pub fn encode_bmp(image: &DecodedImage) -> Vec<u8> {
     let (width, height) = image.dimensions();

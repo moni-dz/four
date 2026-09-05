@@ -172,16 +172,8 @@ fn bt2446a_simd(components: &[F32x16; 3]) -> [[f32; BT2446_LANES]; 3] {
     })
 }
 
-// Measured slower than the libm `log2f`/`exp2f` this replaced: Horner's method is a serial
-// dependency chain, and one scalar color cannot hide its latency the way sixteen lanes do. The
-// batch path is 5x faster for the same reason, and it handles all but the final partial lane group
-// of a 1024-pixel batch, so the trade is strongly positive in aggregate. Both paths must run the
-// same code regardless, or the bit-exact parity test has nothing to assert.
+// Match the SIMD primitive order so batch tails remain bit-identical.
 fn bt2446a(color: LinearRGB) -> LinearRGB {
-    // Spelled as `log2`/`exp2` rather than `powf`, because `bt2446a_simd` has no vector `powf` and
-    // must use that pair. In f64 the ~1 ULP disagreement between the two vanished when the result
-    // narrowed to f32; in f32 it does not, and the bit-exact batch parity test would fail. Both
-    // paths therefore compute the same primitives in the same order.
     let nonlinear = color.components().map(|component| {
         let normalized = (component / HDR_TO_SDR_PEAK_RATIO).clamp(0.0, 1.0);
         exp2_scalar(log2_scalar(normalized) * (1.0 / 2.4))

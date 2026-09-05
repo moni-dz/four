@@ -398,12 +398,11 @@ macro_rules! define_tone_mapping_methods {
             ///
             /// Methods that do not use one or both white points ignore those arguments.
             ///
-            /// # Panics
-            ///
-            /// Never panics: [`Mobius`] is the only method built from a caller-visible parameter.
-            /// Its white point is floored to [`MOBIUS_MIN_PEAK`], which always exceeds `1.0`, so
-            /// the fixed `0.3` transition is always valid and below display white.
             #[must_use]
+            #[expect(
+                clippy::missing_panics_doc,
+                reason = "Mobius construction uses validated types and fixed in-range constants"
+            )]
             pub fn resolve(
                 self,
                 white_point: WhitePoint,
@@ -977,8 +976,8 @@ pub use hable::Hable;
 #[doc(inline)]
 pub use reinhard::{
     ExtendedLuminanceReinhard, ExtendedReinhard, LuminanceReinhard, LuminanceWhitePoint,
-    LuminanceWhitePointEstimator, Mobius, MobiusError, Reinhard, ReinhardJodie,
-    estimate_luminance_white_point,
+    LuminanceWhitePointCountError, LuminanceWhitePointEstimator, Mobius, MobiusError, Reinhard,
+    ReinhardJodie, estimate_luminance_white_point,
 };
 #[doc(inline)]
 pub use transcendental::{exp2, log2};

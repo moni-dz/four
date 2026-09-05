@@ -1,19 +1,6 @@
-//! Vectorized `log2` and `exp2` for `f32` lanes.
+//! Approximates `log2` and `exp2` over SIMD `f32` lanes.
 //!
-//! `std::simd`'s [`StdFloat::log2`] and [`StdFloat::exp2`] lower to one scalar libm call per lane —
-//! rustc links no vector libm — so a sixteen-lane BT.2446 kernel that evaluates fourteen of them
-//! per pixel spends nearly all of its time in scalar code. These polynomial approximations run
-//! entirely in registers.
-//!
-//! Both are written once, over `Simd<f32, N>`. The scalar wrappers evaluate the same functions at
-//! `N == 1`, so a scalar result is bit-identical to the corresponding lane of a wide one by
-//! construction rather than by inspection — which is what the batch parity tests require.
-//!
-//! Accuracy is within a few units in the last place across the normal range; `transcendental`'s own
-//! tests pin that against the standard library.
-//!
-//! [`StdFloat::log2`]: StdFloat::log2
-//! [`StdFloat::exp2`]: StdFloat::exp2
+//! Scalar wrappers share the SIMD implementation for bit parity. Tests enforce four-ULP accuracy.
 
 use std::simd::{
     Select, Simd, StdFloat,

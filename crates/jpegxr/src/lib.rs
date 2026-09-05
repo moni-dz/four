@@ -30,10 +30,13 @@ mod error;
 
 use std::fmt;
 
+#[doc(inline)]
 pub use codestream::{
     Bands, CodestreamInfo, InternalColorFormat, OutputBitDepth, OutputColorFormat, OverlapMode,
 };
+#[doc(inline)]
 pub use container::{PixelFormat, Resolution};
+#[doc(inline)]
 pub use error::{Error, Result};
 
 use error::ErrorKind;

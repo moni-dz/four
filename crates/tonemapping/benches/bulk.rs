@@ -21,12 +21,7 @@ fn main() {
     divan::main();
 }
 
-/// Generates a deterministic pseudorandom HDR scene.
-///
-/// The previous fixed eight-entry palette had a period dividing every SIMD lane count, so each
-/// vector chunk saw an identical value pattern. That let branch prediction and the `select` masks
-/// in BT.2446 and Mobius behave far better than they do on real image data. A xorshift sequence
-/// has no such period.
+/// Generates deterministic HDR values without a SIMD-lane period.
 fn benchmark_colors(pixel_count: usize) -> Vec<LinearRGB> {
     let mut state = 0x2545_F491_4F6C_DD1D_u64;
     let mut next_unit = move || {

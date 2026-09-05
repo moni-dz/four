@@ -51,9 +51,6 @@ const ZIGZAG_TO_NATURAL: [usize; 64] = [
 ];
 
 /// Returns whether `bytes` begins with the JPEG start-of-image marker.
-///
-/// Every other format module exposes this, and its absence here made `SourceFormat::detect`
-/// open-code the check for exactly one format.
 #[must_use]
 pub fn has_signature(bytes: &[u8]) -> bool {
     bytes.starts_with(&SIGNATURE)

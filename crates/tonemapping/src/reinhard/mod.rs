@@ -188,19 +188,14 @@ impl TryFrom<f32> for LuminanceWhitePoint {
 /// This adapts [Smith and Zink]'s per-frame `MaxCLL` outlier percentile to Rec. 709 luminance. It is
 /// an analogous statistic for luminance-based curves, not `MaxCLL`.
 ///
-/// # Panics
-///
-/// Never panics: `colors` is checked non-empty before it sizes the estimator, and every color is
-/// observed exactly once, so the declared and observed pixel counts always agree.
-///
 /// [Smith and Zink]: https://doi.org/10.5594/JMI.2021.3090176
 #[must_use]
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "the estimator observes the exact slice length declared above"
+)]
 pub fn estimate_luminance_white_point(colors: &[LinearRGB]) -> Option<LuminanceWhitePoint> {
-    if colors.is_empty() {
-        return None;
-    }
-
-    let pixel_count = NonZeroUsize::new(colors.len()).expect("checked colors is not empty above");
+    let pixel_count = NonZeroUsize::new(colors.len())?;
     let mut estimator = LuminanceWhitePointEstimator::new(pixel_count);
     for color in colors {
         estimator.observe(*color);
@@ -212,10 +207,6 @@ pub fn estimate_luminance_white_point(colors: &[LinearRGB]) -> Option<LuminanceW
 }
 
 /// Estimates a p99.99 luminance white point from a stream of colors.
-///
-/// The slice form above materializes every color first. A decoder that visits pixels once, as the
-/// JPEG XR HDR analysis pass does, needs to feed them in as it goes; it previously carried its own
-/// copy of this heap, without the parallel-merge support below.
 #[derive(Debug)]
 pub struct LuminanceWhitePointEstimator {
     expected: NonZeroUsize,

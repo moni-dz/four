@@ -423,9 +423,7 @@ fn fill_rgba_row(
     let (pixels, remainder) = row.as_chunks_mut::<4>();
     debug_assert_eq!(remainder, []);
 
-    // Slice each plane's row once, as `fill_bgr101010_row` does. Recomputing a flat index per
-    // pixel from `color.width` gave the optimizer no way to prove the accesses were in bounds, so
-    // every sample carried its own bounds check.
+    // Slice each plane once so the pixel loop needs no flat-index bounds checks.
     let color_component_len = color.width * color.height;
     let color_start = (y + color_top) * color.width + color_left;
     let color_end = color_start + pixels.len();
@@ -438,9 +436,6 @@ fn fill_rgba_row(
     let alpha_start = (y + alpha_top) * alpha.width + alpha_left;
     let alphas = &alpha.values[alpha_start..alpha_start + pixels.len()];
 
-    // The lifting is six integer operations against roughly thirty in `FloatFormat::convert`, and
-    // `convert` is fallible and data-dependent, so it stays scalar and vectorizing the transform
-    // alone would not pay. Removing the bounds checks is the win here.
     let color_samples = luma.iter().zip(chroma_u).zip(chroma_v);
     for ((pixel, ((luma, chroma_u), chroma_v)), alpha) in
         pixels.iter_mut().zip(color_samples).zip(alphas)
@@ -3111,9 +3106,7 @@ mod tests {
         assert_eq!(fnv1a(image.pixels()), 13_953_505_876_719_867_180);
     }
 
-    /// A fixed, dependency-free 64-bit FNV-1a hash, used to pin decoded pixel buffers as a
-    /// regression oracle. Unlike `std::hash::DefaultHasher`, its algorithm is not an
-    /// unspecified implementation detail that Rust reserves the right to change.
+    /// Hashes decoded pixels with stable FNV-1a.
     fn fnv1a(pixels: &[u32]) -> u64 {
         const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
         const PRIME: u64 = 0x0000_0100_0000_01b3;
