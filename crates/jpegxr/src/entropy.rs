@@ -20,6 +20,55 @@ macro_rules! code {
     };
 }
 
+#[derive(Clone, Copy)]
+struct Entry {
+    value: u8,
+    len: u8,
+}
+
+/// Direct-indexed decoding table: eight peeked bits map to a value and its code length.
+struct Lut {
+    max_len: u8,
+    entries: [Entry; 256],
+}
+
+impl Lut {
+    const fn new(codes: &[Code]) -> Self {
+        let mut entries = [Entry { value: 0, len: 0 }; 256];
+        let mut max_len = 0;
+        let mut index = 0;
+
+        while index < codes.len() {
+            let code = codes[index];
+            assert!(
+                1 <= code.len && code.len <= 8,
+                "code lengths must fit the eight-bit lookup"
+            );
+
+            if code.len > max_len {
+                max_len = code.len;
+            }
+
+            // A code of `len` bits owns the whole 8-bit range sharing its prefix.
+            let base = (code.bits as usize) << (8 - code.len);
+            let count = 1_usize << (8 - code.len);
+            let mut offset = 0;
+            while offset < count {
+                assert!(entries[base + offset].len == 0, "codes must be prefix-free");
+                entries[base + offset] = Entry {
+                    value: code.value,
+                    len: code.len,
+                };
+                offset += 1;
+            }
+
+            index += 1;
+        }
+
+        Self { max_len, entries }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct AdaptiveVLC {
     table: usize,
@@ -112,7 +161,8 @@ pub(crate) fn val_dc_yuv(reader: &mut BitReader<'_>) -> Result<u8> {
         code!(0b00000, 5, 6),
         code!(0b011, 3, 7),
     ];
-    decode(reader, &CODES)
+    static LUT: Lut = Lut::new(&CODES);
+    decode(reader, &LUT)
 }
 
 pub(crate) fn abs_level_index(
@@ -138,9 +188,9 @@ pub(crate) fn abs_level_index(
         code!(0b000001, 6, 6),
     ];
     const DELTA: [i8; 7] = [1, 0, -1, -1, -1, -1, -1];
+    static LUTS: [Lut; 2] = [Lut::new(&TABLE_0), Lut::new(&TABLE_1)];
 
-    let tables: [&[Code]; 2] = [&TABLE_0, &TABLE_1];
-    let value = decode(reader, tables[adaptive.table])?;
+    let value = decode(reader, &LUTS[adaptive.table])?;
 
     adaptive.record(value, &[&DELTA]);
 
@@ -222,9 +272,15 @@ pub(crate) fn first_index(reader: &mut BitReader<'_>, adaptive: &mut AdaptiveVLC
     const DELTA_1: [i8; 12] = [2, 2, -1, -1, -1, 0, -2, -1, 0, 0, -2, -1];
     const DELTA_2: [i8; 12] = [-1, 1, 0, 2, 0, 0, 0, 0, -2, 0, 1, 1];
     const DELTA_3: [i8; 12] = [0, 1, 0, 1, -2, 0, -1, -1, -2, -1, -2, -2];
+    static LUTS: [Lut; 5] = [
+        Lut::new(&TABLE_0),
+        Lut::new(&TABLE_1),
+        Lut::new(&TABLE_2),
+        Lut::new(&TABLE_3),
+        Lut::new(&TABLE_4),
+    ];
 
-    let tables: [&[Code]; 5] = [&TABLE_0, &TABLE_1, &TABLE_2, &TABLE_3, &TABLE_4];
-    let value = decode(reader, tables[adaptive.table])?;
+    let value = decode(reader, &LUTS[adaptive.table])?;
 
     adaptive.record(value, &[&DELTA_0, &DELTA_1, &DELTA_2, &DELTA_3]);
 
@@ -267,9 +323,14 @@ pub(crate) fn index_a(reader: &mut BitReader<'_>, adaptive: &mut AdaptiveVLC) ->
     const DELTA_0: [i8; 6] = [-1, 1, 1, 1, 0, 1];
     const DELTA_1: [i8; 6] = [-2, 0, 0, 2, 0, 0];
     const DELTA_2: [i8; 6] = [-1, -1, 0, 1, -2, 0];
+    static LUTS: [Lut; 4] = [
+        Lut::new(&TABLE_0),
+        Lut::new(&TABLE_1),
+        Lut::new(&TABLE_2),
+        Lut::new(&TABLE_3),
+    ];
 
-    let tables: [&[Code]; 4] = [&TABLE_0, &TABLE_1, &TABLE_2, &TABLE_3];
-    let value = decode(reader, tables[adaptive.table])?;
+    let value = decode(reader, &LUTS[adaptive.table])?;
 
     adaptive.record(value, &[&DELTA_0, &DELTA_1, &DELTA_2]);
 
@@ -307,8 +368,9 @@ pub(crate) fn run(reader: &mut BitReader<'_>, maximum: u8) -> Result<u8> {
     const REMAP: [u8; 15] = [1, 2, 3, 5, 7, 1, 2, 3, 5, 7, 1, 2, 3, 4, 5];
     const BIN: [i8; 15] = [-1, -1, -1, -1, 2, 2, 2, 1, 1, 1, 1, 0, 0, 0, 0];
     const FIXED: [u8; 15] = [0, 0, 1, 1, 3, 0, 0, 1, 1, 2, 0, 0, 0, 0, 1];
+    static LUT: Lut = Lut::new(&RUN_INDEX);
 
-    let symbol = i16::from(decode(reader, &RUN_INDEX)?);
+    let symbol = i16::from(decode(reader, &LUT)?);
     let index = usize::try_from(symbol + 5 * i16::from(BIN[usize::from(maximum)])).map_err(
         |_conversion_error| reader.error(ErrorKind::InvalidCodestream("invalid coefficient run")),
     )?;
@@ -336,7 +398,8 @@ pub(crate) fn cbp_lowpass_yuv444(reader: &mut BitReader<'_>) -> Result<u8> {
         code!(0b1110, 4, 6),
         code!(0b1111, 4, 7),
     ];
-    decode(reader, &CODES)
+    static LUT: Lut = Lut::new(&CODES);
+    decode(reader, &LUT)
 }
 
 pub(crate) fn num_cbphp(reader: &mut BitReader<'_>, adaptive: &mut AdaptiveVLC) -> Result<u8> {
@@ -355,8 +418,9 @@ pub(crate) fn num_cbphp(reader: &mut BitReader<'_>, adaptive: &mut AdaptiveVLC) 
         code!(0b011, 3, 4),
     ];
     const DELTA: [i8; 5] = [0, -1, 0, 1, 1];
-    let tables: [&[Code]; 2] = [&TABLE_0, &TABLE_1];
-    let value = decode(reader, tables[adaptive.table])?;
+    static LUTS: [Lut; 2] = [Lut::new(&TABLE_0), Lut::new(&TABLE_1)];
+
+    let value = decode(reader, &LUTS[adaptive.table])?;
 
     adaptive.record(value, &[&DELTA]);
 
@@ -390,8 +454,9 @@ pub(crate) fn num_block_cbphp_yuv(
         code!(0b0000001, 7, 8),
     ];
     const DELTA: [i8; 9] = [2, 2, 1, 1, -1, -2, -2, -2, -3];
-    let tables: [&[Code]; 2] = [&TABLE_0, &TABLE_1];
-    let value = decode(reader, tables[adaptive.table])?;
+    static LUTS: [Lut; 2] = [Lut::new(&TABLE_0), Lut::new(&TABLE_1)];
+
+    let value = decode(reader, &LUTS[adaptive.table])?;
 
     adaptive.record(value, &[&DELTA]);
 
@@ -434,22 +499,23 @@ pub(crate) fn refine_cbphp_one(reader: &mut BitReader<'_>) -> Result<u8> {
         code!(0b110, 3, 10),
         code!(0b111, 3, 12),
     ];
-    decode(reader, &CODES)
+    static LUT: Lut = Lut::new(&CODES);
+    decode(reader, &LUT)
 }
 
-fn decode(reader: &mut BitReader<'_>, codes: &[Code]) -> Result<u8> {
-    let maximum = codes.iter().map(|code| code.len).max().unwrap_or(0);
-    let mut bits = 0_u8;
-    for len in 1..=maximum {
-        bits = (bits << 1) | reader.read_u8(1)?;
-        if let Some(code) = codes
-            .iter()
-            .find(|code| code.len == len && code.bits == bits)
-        {
-            return Ok(code.value);
+fn decode(reader: &mut BitReader<'_>, lut: &Lut) -> Result<u8> {
+    let entry = lut.entries[usize::from(reader.peek8())];
+
+    if entry.len == 0 {
+        if reader.remaining_bits() < usize::from(lut.max_len) {
+            return Err(reader.error(ErrorKind::UnexpectedEof));
         }
+
+        return Err(reader.error(ErrorKind::InvalidCodestream("invalid variable-length code")));
     }
-    Err(reader.error(ErrorKind::InvalidCodestream("invalid variable-length code")))
+
+    reader.consume(entry.len)?;
+    Ok(entry.value)
 }
 
 #[cfg(test)]
