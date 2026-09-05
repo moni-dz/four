@@ -50,9 +50,6 @@ const MIN_PARALLEL_MACROBLOCKS: usize = 512;
 ///
 /// Below this many pixels, per-thread dispatch overhead is not worth paying.
 const MIN_PARALLEL_PIXELS: usize = 256 * 1024;
-// Below two tile rows there is nothing to split, so the serial path skips rayon dispatch
-// entirely rather than spin up a scope for one item.
-const MIN_PARALLEL_TILE_ROWS: usize = 2;
 const PIXEL_LANES: usize = 8;
 
 type I32x8 = Simd<i32, PIXEL_LANES>;
@@ -117,7 +114,10 @@ fn validated_dimensions(header: &ImageHeader, offset: usize) -> Result<(usize, u
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded("pixel count"), offset))?;
 
     if width > MAX_DIMENSION || height > MAX_DIMENSION {
-        return Err(Error::new(ErrorKind::LimitExceeded("image dimension"), offset));
+        return Err(Error::new(
+            ErrorKind::LimitExceeded("image dimension"),
+            offset,
+        ));
     }
 
     if pixel_count > MAX_PIXELS {
@@ -520,52 +520,22 @@ pub(crate) fn decode_dc(stream: &ParsedCodestream<'_>) -> Result<DCImage> {
         values: vec![0; value_count],
     };
 
-    let row_stride = macroblock_width * components;
-    let bands = split_tile_row_bands(&mut image.values, &stream.header.tile_heights, row_stride);
-
-    let decode_row = |tile_y: usize, tile_height: u16, band: &mut [i32]| -> Result<()> {
-        let mut left = 0_usize;
-
-        for (tile_x, tile_width) in stream.header.tile_widths.iter().copied().enumerate() {
-            let tile = tile_y * stream.header.tile_widths.len() + tile_x;
-            let packet = packet(stream, tile, 0)?;
-
+    decode_tiles_into(
+        stream,
+        &mut image.values,
+        macroblock_width,
+        components,
+        |tile, values| {
             decode_dc_packet(
-                packet,
+                packet(stream, tile.index, 0)?,
                 &stream.primary_plane,
-                usize::from(tile_width),
-                usize::from(tile_height),
-                left,
-                macroblock_width,
+                tile.width,
+                tile.height,
                 components,
-                band,
-            )?;
-
-            left += usize::from(tile_width);
-        }
-
-        Ok(())
-    };
-
-    if stream.header.tile_heights.len() >= MIN_PARALLEL_TILE_ROWS {
-        stream
-            .header
-            .tile_heights
-            .par_iter()
-            .copied()
-            .zip(bands)
-            .enumerate()
-            .try_for_each(|(tile_y, (tile_height, band))| decode_row(tile_y, tile_height, band))?;
-    } else {
-        stream
-            .header
-            .tile_heights
-            .iter()
-            .copied()
-            .zip(bands)
-            .enumerate()
-            .try_for_each(|(tile_y, (tile_height, band))| decode_row(tile_y, tile_height, band))?;
-    }
+                values,
+            )
+        },
+    )?;
 
     Ok(image)
 }
@@ -607,54 +577,98 @@ pub(crate) fn decode_lowpass(stream: &ParsedCodestream<'_>) -> Result<LowpassIma
         values: vec![0; value_count],
     };
 
-    let row_stride = macroblock_width * components * 16;
-    let bands = split_tile_row_bands(&mut image.values, &stream.header.tile_heights, row_stride);
-
-    let decode_row = |tile_y: usize, tile_height: u16, band: &mut [i32]| -> Result<()> {
-        let mut left = 0_usize;
-
-        for (tile_x, tile_width) in stream.header.tile_widths.iter().copied().enumerate() {
-            let tile = tile_y * stream.header.tile_widths.len() + tile_x;
-            let packet = packet(stream, tile, 1)?;
-
+    decode_tiles_into(
+        stream,
+        &mut image.values,
+        macroblock_width,
+        components * 16,
+        |tile, values| {
             decode_lowpass_packet(
-                packet,
+                packet(stream, tile.index, 1)?,
                 &stream.primary_plane,
-                usize::from(tile_width),
-                usize::from(tile_height),
-                left,
-                macroblock_width,
+                tile.width,
+                tile.height,
                 components,
-                band,
-            )?;
+                values,
+            )
+        },
+    )?;
 
+    Ok(image)
+}
+
+/// One tile of the tile grid, in macroblock units.
+struct Tile {
+    index: usize,
+    left: usize,
+    top: usize,
+    width: usize,
+    height: usize,
+}
+
+fn tile_grid(stream: &ParsedCodestream<'_>) -> Vec<Tile> {
+    let mut tiles =
+        Vec::with_capacity(stream.header.tile_widths.len() * stream.header.tile_heights.len());
+
+    let mut top = 0_usize;
+    for tile_height in stream.header.tile_heights.iter().copied() {
+        let mut left = 0_usize;
+        for tile_width in stream.header.tile_widths.iter().copied() {
+            tiles.push(Tile {
+                index: tiles.len(),
+                left,
+                top,
+                width: usize::from(tile_width),
+                height: usize::from(tile_height),
+            });
             left += usize::from(tile_width);
         }
 
-        Ok(())
-    };
-
-    if stream.header.tile_heights.len() >= MIN_PARALLEL_TILE_ROWS {
-        stream
-            .header
-            .tile_heights
-            .par_iter()
-            .copied()
-            .zip(bands)
-            .enumerate()
-            .try_for_each(|(tile_y, (tile_height, band))| decode_row(tile_y, tile_height, band))?;
-    } else {
-        stream
-            .header
-            .tile_heights
-            .iter()
-            .copied()
-            .zip(bands)
-            .enumerate()
-            .try_for_each(|(tile_y, (tile_height, band))| decode_row(tile_y, tile_height, band))?;
+        top += usize::from(tile_height);
     }
 
-    Ok(image)
+    tiles
+}
+
+/// Decodes every tile packet into a tile-local buffer, in parallel for large images, then
+/// scatters the rows into `values` (`stride` values per macroblock).
+///
+/// Tile packets are independent bitstreams whose prediction resets at tile edges, so tiles can
+/// decode in any order; only the scatter needs the global macroblock layout.
+fn decode_tiles_into(
+    stream: &ParsedCodestream<'_>,
+    values: &mut [i32],
+    macroblock_width: usize,
+    stride: usize,
+    decode_packet: impl Fn(&Tile, &mut [i32]) -> Result<()> + Sync,
+) -> Result<()> {
+    let tiles = tile_grid(stream);
+    let decode_tile = |tile: &Tile| {
+        let mut local = vec![0_i32; tile.width * tile.height * stride];
+        decode_packet(tile, &mut local)?;
+        Ok(local)
+    };
+
+    let macroblock_count = values.len() / stride.max(1);
+    let tile_values = if macroblock_count >= MIN_PARALLEL_MACROBLOCKS && tiles.len() > 1 {
+        tiles
+            .par_iter()
+            .map(decode_tile)
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        tiles.iter().map(decode_tile).collect::<Result<Vec<_>>>()?
+    };
+
+    for (tile, local) in tiles.iter().zip(&tile_values) {
+        let row_len = tile.width * stride;
+        for local_y in 0..tile.height {
+            let global_row = (tile.top + local_y) * macroblock_width + tile.left;
+            values[global_row * stride..][..row_len]
+                .copy_from_slice(&local[local_y * row_len..][..row_len]);
+        }
+    }
+
+    Ok(())
 }
 
 pub(crate) fn predict_lowpass(
@@ -854,6 +868,27 @@ pub(crate) fn decode_highpass(
             )
         })?;
 
+    // Highpass tiles also decode their flexbits refinement while the tile is local, so the
+    // scatter below runs once over finished coefficients.
+    let tiles = tile_grid(stream);
+    let decode_tile = |tile: &Tile| decode_highpass_tile(stream, tile, components, lowpass);
+    let mut tile_images = if macroblock_count >= MIN_PARALLEL_MACROBLOCKS && tiles.len() > 1 {
+        tiles
+            .par_iter()
+            .map(decode_tile)
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        tiles.iter().map(decode_tile).collect::<Result<Vec<_>>>()?
+    };
+
+    if tile_images.len() == 1 {
+        // Parsing guarantees the tile grid exactly covers the macroblock grid.
+        let only = tile_images.pop().expect("one tile image per tile");
+        debug_assert_eq!(only.macroblock_width, macroblock_width);
+        debug_assert_eq!(only.macroblock_height, macroblock_height);
+        return Ok(only);
+    }
+
     let mut image = HighpassImage {
         macroblock_width,
         macroblock_height,
@@ -862,220 +897,71 @@ pub(crate) fn decode_highpass(
         model_bits: vec![[0; 2]; macroblock_count],
     };
 
-    let mut cbphp = vec![0_u16; macroblock_count * components];
+    for (tile, tile_image) in tiles.iter().zip(&tile_images) {
+        let row_len = tile.width * components * 256;
+        for local_y in 0..tile.height {
+            let global_row = (tile.top + local_y) * macroblock_width + tile.left;
+            let local_row = local_y * tile.width;
 
-    let value_row_stride = macroblock_width * components * 256;
-    let model_bits_row_stride = macroblock_width;
-    let cbphp_row_stride = macroblock_width * components;
-
-    let value_bands = split_tile_row_bands(
-        &mut image.values,
-        &stream.header.tile_heights,
-        value_row_stride,
-    );
-
-    let model_bits_bands = split_tile_row_bands(
-        &mut image.model_bits,
-        &stream.header.tile_heights,
-        model_bits_row_stride,
-    );
-
-    let cbphp_bands =
-        split_tile_row_bands(&mut cbphp, &stream.header.tile_heights, cbphp_row_stride);
-
-    let highpass_modes_bands = split_tile_row_bands_ref(
-        &lowpass.highpass_modes,
-        &stream.header.tile_heights,
-        macroblock_width,
-    );
-
-    let decode_row = |tile_y: usize,
-                      tile_height: u16,
-                      value_band: &mut [i32],
-                      model_bits_band: &mut [[u8; 2]],
-                      cbphp_band: &mut [u16],
-                      highpass_modes_band: &[u8]|
-     -> Result<()> {
-        let mut left = 0_usize;
-
-        for (tile_x, tile_width) in stream.header.tile_widths.iter().copied().enumerate() {
-            let tile = tile_y * stream.header.tile_widths.len() + tile_x;
-            let packet = packet(stream, tile, 2)?;
-
-            decode_highpass_packet(
-                packet,
-                &stream.primary_plane,
-                usize::from(tile_width),
-                usize::from(tile_height),
-                left,
-                macroblock_width,
-                components,
-                highpass_modes_band,
-                cbphp_band,
-                value_band,
-                model_bits_band,
-            )?;
-
-            left += usize::from(tile_width);
+            image.values[global_row * components * 256..][..row_len]
+                .copy_from_slice(&tile_image.values[local_row * components * 256..][..row_len]);
+            image.model_bits[global_row..][..tile.width]
+                .copy_from_slice(&tile_image.model_bits[local_row..][..tile.width]);
         }
-
-        Ok(())
-    };
-
-    if stream.header.tile_heights.len() >= MIN_PARALLEL_TILE_ROWS {
-        stream
-            .header
-            .tile_heights
-            .par_iter()
-            .copied()
-            .zip(value_bands)
-            .zip(model_bits_bands)
-            .zip(cbphp_bands)
-            .zip(highpass_modes_bands)
-            .enumerate()
-            .try_for_each(
-                |(tile_y, ((((tile_height, value_band), model_bits_band), cbphp_band), modes))| {
-                    decode_row(
-                        tile_y,
-                        tile_height,
-                        value_band,
-                        model_bits_band,
-                        cbphp_band,
-                        modes,
-                    )
-                },
-            )?;
-    } else {
-        stream
-            .header
-            .tile_heights
-            .iter()
-            .copied()
-            .zip(value_bands)
-            .zip(model_bits_bands)
-            .zip(cbphp_bands)
-            .zip(highpass_modes_bands)
-            .enumerate()
-            .try_for_each(
-                |(tile_y, ((((tile_height, value_band), model_bits_band), cbphp_band), modes))| {
-                    decode_row(
-                        tile_y,
-                        tile_height,
-                        value_band,
-                        model_bits_band,
-                        cbphp_band,
-                        modes,
-                    )
-                },
-            )?;
     }
 
     Ok(image)
 }
 
-pub(crate) fn decode_flexbits(
+/// Decodes one tile's highpass packet and its flexbits refinement into a tile-local image.
+fn decode_highpass_tile(
     stream: &ParsedCodestream<'_>,
-    highpass: &mut HighpassImage,
-) -> Result<()> {
-    let (macroblock_width, macroblock_height, components) = image_shape(stream)?;
-
-    if macroblock_width != highpass.macroblock_width
-        || macroblock_height != highpass.macroblock_height
-        || components != highpass.components
-    {
-        return Err(Error::new(
-            ErrorKind::InvalidCodestream("highpass and flexbits dimensions disagree"),
-            stream.offset,
-        ));
+    tile: &Tile,
+    components: usize,
+    lowpass: &PredictedLowpass,
+) -> Result<HighpassImage> {
+    let macroblock_count = tile.width * tile.height;
+    let mut modes = Vec::with_capacity(macroblock_count);
+    for y in tile.top..tile.top + tile.height {
+        let start = y * lowpass.macroblock_width + tile.left;
+        modes.extend_from_slice(&lowpass.highpass_modes[start..start + tile.width]);
     }
+
+    let mut image = HighpassImage {
+        macroblock_width: tile.width,
+        macroblock_height: tile.height,
+        components,
+        values: vec![0; macroblock_count * components * 256],
+        model_bits: vec![[0; 2]; macroblock_count],
+    };
+
+    decode_highpass_packet(
+        packet(stream, tile.index, 2)?,
+        &stream.primary_plane,
+        &modes,
+        &mut image,
+    )?;
 
     match stream.primary_plane.bands {
         Bands::All => {
-            let value_row_stride = macroblock_width * components * 256;
-            let model_bits_row_stride = macroblock_width;
-
-            let value_bands = split_tile_row_bands(
-                &mut highpass.values,
-                &stream.header.tile_heights,
-                value_row_stride,
-            );
-            let model_bits_bands = split_tile_row_bands_ref(
-                &highpass.model_bits,
-                &stream.header.tile_heights,
-                model_bits_row_stride,
-            );
-
-            let decode_row = |tile_y: usize,
-                              tile_height: u16,
-                              value_band: &mut [i32],
-                              model_bits_band: &[[u8; 2]]|
-             -> Result<()> {
-                let mut left = 0_usize;
-
-                for (tile_x, tile_width) in stream.header.tile_widths.iter().copied().enumerate() {
-                    let tile = tile_y * stream.header.tile_widths.len() + tile_x;
-                    let width = usize::from(tile_width);
-                    let height = usize::from(tile_height);
-
-                    if !tile_has_model_bits(model_bits_band, left, macroblock_width, width, height)
-                    {
-                        left += width;
-                        continue;
-                    }
-
-                    let packet = packet(stream, tile, 3)?;
-
-                    decode_flexbits_packet(
-                        packet,
-                        stream.header.trim_flexbits,
-                        width,
-                        height,
-                        left,
-                        macroblock_width,
-                        components,
-                        model_bits_band,
-                        value_band,
-                    )?;
-
-                    left += width;
-                }
-                Ok(())
-            };
-
-            if stream.header.tile_heights.len() >= MIN_PARALLEL_TILE_ROWS {
-                stream
-                    .header
-                    .tile_heights
-                    .par_iter()
-                    .copied()
-                    .zip(value_bands)
-                    .zip(model_bits_bands)
-                    .enumerate()
-                    .try_for_each(|(tile_y, ((tile_height, value_band), model_bits_band))| {
-                        decode_row(tile_y, tile_height, value_band, model_bits_band)
-                    })?;
-            } else {
-                stream
-                    .header
-                    .tile_heights
-                    .iter()
-                    .copied()
-                    .zip(value_bands)
-                    .zip(model_bits_bands)
-                    .enumerate()
-                    .try_for_each(|(tile_y, ((tile_height, value_band), model_bits_band))| {
-                        decode_row(tile_y, tile_height, value_band, model_bits_band)
-                    })?;
+            if image.model_bits.iter().any(|bits| *bits != [0, 0]) {
+                decode_flexbits_packet(
+                    packet(stream, tile.index, 3)?,
+                    stream.header.trim_flexbits,
+                    &mut image,
+                )?;
             }
-
-            Ok(())
         }
-        Bands::NoFlexbits => shift_highpass_without_flexbits(highpass),
-        Bands::NoHighpass | Bands::DCOnly => Err(Error::new(
-            ErrorKind::Unsupported("highpass band is absent"),
-            stream.offset + stream.tiles_offset,
-        )),
+        Bands::NoFlexbits => shift_highpass_without_flexbits(&mut image)?,
+        Bands::NoHighpass | Bands::DCOnly => {
+            return Err(Error::new(
+                ErrorKind::Unsupported("highpass band is absent"),
+                stream.offset + stream.tiles_offset,
+            ));
+        }
     }
+
+    Ok(image)
 }
 
 fn validate_float_rgb_profile(
@@ -1174,7 +1060,6 @@ fn reconstruct(stream: &ParsedCodestream<'_>) -> Result<IntegerImage> {
     let mut lowpass = predict_lowpass(stream, &dc, &lowpass)?;
 
     let mut highpass = decode_highpass(stream, &lowpass)?;
-    decode_flexbits(stream, &mut highpass)?;
     dequantize_and_predict_highpass(stream, &lowpass, &mut highpass)?;
 
     let (blocks, remainder) = lowpass.values.as_chunks_mut::<16>();
@@ -1696,18 +1581,6 @@ impl FloatFormat {
     }
 }
 
-fn tile_has_model_bits(
-    model_bits_band: &[[u8; 2]],
-    left: usize,
-    macroblock_width: usize,
-    width: usize,
-    height: usize,
-) -> bool {
-    (0..height).any(|local_y| {
-        (left..left + width).any(|x| model_bits_band[local_y * macroblock_width + x] != [0, 0])
-    })
-}
-
 fn shift_highpass_without_flexbits(highpass: &mut HighpassImage) -> Result<()> {
     for macroblock in 0..highpass.model_bits.len() {
         for component in 0..highpass.components {
@@ -2004,52 +1877,13 @@ fn packet<'a>(stream: &ParsedCodestream<'a>, tile: usize, band: usize) -> Result
 /// Band `i` covers `row_heights[i]` macroblock rows of `row_stride` elements each — the layout
 /// `packet` boundaries assume, and the same layout every `decode_*_packet` writes with a
 /// band-relative row index in place of a `top` offset.
-fn split_tile_row_bands<'a, T>(
-    values: &'a mut [T],
-    row_heights: &[u16],
-    row_stride: usize,
-) -> Vec<&'a mut [T]> {
-    let mut remaining = values;
-    let mut bands = Vec::with_capacity(row_heights.len());
-
-    for height in row_heights.iter().copied() {
-        let band_len = usize::from(height) * row_stride;
-        let (band, rest) = remaining.split_at_mut(band_len);
-        bands.push(band);
-        remaining = rest;
-    }
-
-    bands
-}
-
-/// The shared-reference counterpart of [`split_tile_row_bands`], for read-only per-row data.
-fn split_tile_row_bands_ref<'a, T>(
-    values: &'a [T],
-    row_heights: &[u16],
-    row_stride: usize,
-) -> Vec<&'a [T]> {
-    let mut remaining = values;
-    let mut bands = Vec::with_capacity(row_heights.len());
-
-    for height in row_heights.iter().copied() {
-        let band_len = usize::from(height) * row_stride;
-        let (band, rest) = remaining.split_at(band_len);
-        bands.push(band);
-        remaining = rest;
-    }
-
-    bands
-}
-
 fn decode_dc_packet(
     packet: Packet<'_>,
     plane: &PlaneHeader,
     width: usize,
     height: usize,
-    left: usize,
-    macroblock_width: usize,
     components: usize,
-    band: &mut [i32],
+    values: &mut [i32],
 ) -> Result<()> {
     let mut reader = BitReader::new(packet.bytes, packet.offset);
 
@@ -2064,10 +1898,9 @@ fn decode_dc_packet(
 
     for local_y in 0..height {
         for local_x in 0..width {
-            let values = decode_dc_macroblock(&mut reader, plane, &mut context)?;
-            let macroblock = local_y * macroblock_width + left + local_x;
-            let start = macroblock * components;
-            band[start..start + components].copy_from_slice(&values[..components]);
+            let macroblock = decode_dc_macroblock(&mut reader, plane, &mut context)?;
+            let start = (local_y * width + local_x) * components;
+            values[start..start + components].copy_from_slice(&macroblock[..components]);
 
             if local_x.is_multiple_of(16) || local_x + 1 == width {
                 context.adapt();
@@ -2091,10 +1924,8 @@ fn decode_lowpass_packet(
     plane: &PlaneHeader,
     width: usize,
     height: usize,
-    left: usize,
-    macroblock_width: usize,
     components: usize,
-    band: &mut [i32],
+    values: &mut [i32],
 ) -> Result<()> {
     let mut reader = BitReader::new(packet.bytes, packet.offset);
 
@@ -2113,10 +1944,9 @@ fn decode_lowpass_packet(
                 context.scan.reset_totals();
             }
 
-            let values = decode_lowpass_macroblock(&mut reader, plane, &mut context)?;
-            let macroblock = local_y * macroblock_width + left + local_x;
-            let start = macroblock * components * 16;
-            band[start..start + components * 16].copy_from_slice(&values[..components * 16]);
+            let macroblock = decode_lowpass_macroblock(&mut reader, plane, &mut context)?;
+            let start = (local_y * width + local_x) * components * 16;
+            values[start..start + components * 16].copy_from_slice(&macroblock[..components * 16]);
 
             if local_x.is_multiple_of(16) || local_x + 1 == width {
                 context.adapt();
@@ -2135,22 +1965,11 @@ fn decode_lowpass_packet(
     Ok(())
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "packet geometry is explicit at the frequency-band boundary"
-)]
 fn decode_highpass_packet(
     packet: Packet<'_>,
     plane: &PlaneHeader,
-    width: usize,
-    height: usize,
-    left: usize,
-    macroblock_width: usize,
-    components: usize,
-    highpass_modes: &[u8],
-    cbphp_band: &mut [u16],
-    value_band: &mut [i32],
-    model_bits_band: &mut [[u8; 2]],
+    modes: &[u8],
+    image: &mut HighpassImage,
 ) -> Result<()> {
     let mut reader = BitReader::new(packet.bytes, packet.offset);
 
@@ -2163,6 +1982,13 @@ fn decode_highpass_packet(
     let _arbitrary_byte = reader.read_u8(8)?;
     let mut context = HighpassContext::new();
 
+    let (width, height, components) = (
+        image.macroblock_width,
+        image.macroblock_height,
+        image.components,
+    );
+    let mut cbphp = vec![0_u16; image.model_bits.len() * components];
+
     for local_y in 0..height {
         for local_x in 0..width {
             if local_x.is_multiple_of(16) {
@@ -2170,20 +1996,20 @@ fn decode_highpass_packet(
                 context.vertical_scan.reset_totals();
             }
 
-            let macroblock = local_y * macroblock_width + left + local_x;
+            let macroblock = local_y * width + local_x;
 
             let patterns = decode_cbphp(
                 &mut reader,
                 plane,
                 &mut context,
-                cbphp_band,
-                macroblock_width,
+                &cbphp,
+                width,
                 macroblock,
                 local_x == 0,
                 local_y == 0,
             )?;
 
-            cbphp_band[macroblock * components..(macroblock + 1) * components]
+            cbphp[macroblock * components..(macroblock + 1) * components]
                 .copy_from_slice(&patterns[..components]);
 
             decode_highpass_macroblock(
@@ -2191,11 +2017,11 @@ fn decode_highpass_packet(
                 plane,
                 &mut context,
                 macroblock,
-                highpass_modes[macroblock],
+                modes[macroblock],
                 &patterns[..components],
                 components,
-                value_band,
-                model_bits_band,
+                &mut image.values,
+                &mut image.model_bits,
             )?;
 
             if local_x.is_multiple_of(16) || local_x + 1 == width {
@@ -2218,13 +2044,7 @@ fn decode_highpass_packet(
 fn decode_flexbits_packet(
     packet: Packet<'_>,
     trim_present: bool,
-    width: usize,
-    height: usize,
-    left: usize,
-    macroblock_width: usize,
-    components: usize,
-    model_bits_band: &[[u8; 2]],
-    value_band: &mut [i32],
+    highpass: &mut HighpassImage,
 ) -> Result<()> {
     const HIERARCHICAL_ORDER: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
     const TRANSPOSE: [usize; 16] = [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
@@ -2239,52 +2059,51 @@ fn decode_flexbits_packet(
 
     let _arbitrary_byte = reader.read_u8(8)?;
     let trim = if trim_present { reader.read_u8(4)? } else { 0 };
+    let components = highpass.components;
 
-    for local_y in 0..height {
-        for local_x in 0..width {
-            let macroblock = local_y * macroblock_width + left + local_x;
+    for macroblock in 0..highpass.model_bits.len() {
+        for component in 0..components {
+            let model = usize::from(component != 0);
+            let model_bits = highpass.model_bits[macroblock][model];
+            let flex_bits = model_bits.saturating_sub(trim);
 
-            for component in 0..components {
-                let model = usize::from(component != 0);
-                let model_bits = model_bits_band[macroblock][model];
-                let flex_bits = model_bits.saturating_sub(trim);
+            for block in HIERARCHICAL_ORDER {
+                let start = (macroblock * components + component) * 256 + block * 16;
+                let values: &mut [i32; 16] = (&mut highpass.values[start..start + 16])
+                    .try_into()
+                    .expect("block slice has length 16");
 
-                for block in HIERARCHICAL_ORDER {
-                    let start = (macroblock * components + component) * 256 + block * 16;
-                    for coefficient in TRANSPOSE.into_iter().skip(1) {
-                        let vlc = value_band[start + coefficient];
+                for coefficient in TRANSPOSE.into_iter().skip(1) {
+                    let vlc = values[coefficient];
 
-                        let refinement = if flex_bits == 0 {
-                            0
-                        } else {
-                            i32::try_from(reader.read_u32(flex_bits)?)
-                                .expect("at most 15 flexbits fit i32")
-                        };
+                    let refinement = if flex_bits == 0 {
+                        0
+                    } else {
+                        i32::try_from(reader.read_u32(flex_bits)?)
+                            .expect("at most 15 flexbits fit i32")
+                    };
 
-                        let flex = match vlc.cmp(&0) {
-                            Ordering::Greater => refinement,
-                            Ordering::Less => -refinement,
-                            Ordering::Equal if refinement != 0 && reader.read_bool()? => {
-                                -refinement
-                            }
-                            Ordering::Equal => refinement,
-                        };
+                    let flex = match vlc.cmp(&0) {
+                        Ordering::Greater => refinement,
+                        Ordering::Less => -refinement,
+                        Ordering::Equal if refinement != 0 && reader.read_bool()? => -refinement,
+                        Ordering::Equal => refinement,
+                    };
 
-                        let flex = flex.checked_shl(u32::from(trim)).ok_or_else(|| {
+                    let flex = flex.checked_shl(u32::from(trim)).ok_or_else(|| {
+                        reader.error(ErrorKind::InvalidCodestream(
+                            "flexbits coefficient overflow",
+                        ))
+                    })?;
+
+                    values[coefficient] = vlc
+                        .checked_shl(u32::from(model_bits))
+                        .and_then(|value| value.checked_add(flex))
+                        .ok_or_else(|| {
                             reader.error(ErrorKind::InvalidCodestream(
-                                "flexbits coefficient overflow",
+                                "highpass coefficient overflow",
                             ))
                         })?;
-
-                        value_band[start + coefficient] = vlc
-                            .checked_shl(u32::from(model_bits))
-                            .and_then(|value| value.checked_add(flex))
-                            .ok_or_else(|| {
-                                reader.error(ErrorKind::InvalidCodestream(
-                                    "highpass coefficient overflow",
-                                ))
-                            })?;
-                    }
                 }
             }
         }
