@@ -2957,6 +2957,7 @@ dependencies = [
 name = "jpegxr"
 version = "0.1.0"
 dependencies = [
+ "divan",
  "mimalloc",
  "multiversion",
  "rayon",
