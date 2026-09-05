@@ -674,7 +674,7 @@ fn decode_tiles_into(
 pub(crate) fn predict_lowpass(
     stream: &ParsedCodestream<'_>,
     dc: &DCImage,
-    lowpass: &LowpassImage,
+    lowpass: LowpassImage,
 ) -> Result<PredictedLowpass> {
     if dc.macroblock_width != lowpass.macroblock_width
         || dc.macroblock_height != lowpass.macroblock_height
@@ -715,7 +715,7 @@ pub(crate) fn predict_lowpass(
         .checked_mul(dc.macroblock_height)
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded("macroblock count"), stream.offset))?;
 
-    let mut raw = vec![0_i32; value_count];
+    let mut raw = lowpass.values;
     let mut output = vec![0_i32; value_count];
     let mut highpass_modes = vec![2_u8; macroblock_count];
 
@@ -747,7 +747,6 @@ pub(crate) fn predict_lowpass(
                     for component in 0..dc.components {
                         let start = (macroblock * dc.components + component) * 16;
 
-                        raw[start..start + 16].copy_from_slice(&lowpass.values[start..start + 16]);
                         raw[start] = dc.values[macroblock * dc.components + component];
 
                         predict_dc(
@@ -1057,7 +1056,7 @@ fn validate_bgr101010_profile(stream: &ParsedCodestream<'_>) -> Result<()> {
 fn reconstruct(stream: &ParsedCodestream<'_>) -> Result<IntegerImage> {
     let dc = decode_dc(stream)?;
     let lowpass = decode_lowpass(stream)?;
-    let mut lowpass = predict_lowpass(stream, &dc, &lowpass)?;
+    let mut lowpass = predict_lowpass(stream, &dc, lowpass)?;
 
     let mut highpass = decode_highpass(stream, &lowpass)?;
     dequantize_and_predict_highpass(stream, &lowpass, &mut highpass)?;
