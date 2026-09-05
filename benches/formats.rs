@@ -30,8 +30,12 @@ fn bench_decode<E>(
     decode: fn(&[u8]) -> Result<DecodedImage, E>,
 ) {
     let bytes = fixture(name);
+    let output_bytes = decode(&bytes)
+        .ok()
+        .map(|image| image.rgba8().len())
+        .expect("benchmark fixture decodes successfully");
     bencher
-        .counter(BytesCount::new(bytes.len()))
+        .counter(BytesCount::new(output_bytes))
         .bench_local(|| decode(&bytes).map(|image| image.rgba8().len()));
 }
 
