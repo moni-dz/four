@@ -25,7 +25,11 @@
 mod error;
 
 use std::num::NonZeroUsize;
-use std::simd::{Select, Simd, StdFloat, cmp::SimdPartialOrd, num::SimdFloat};
+use std::simd::{
+    Select, Simd, StdFloat,
+    cmp::SimdPartialOrd,
+    num::{SimdFloat, SimdUint},
+};
 
 use ::jpegxr::{Decoder as JXRDecoder, PixelFormat as CodecPixelFormat};
 use multiversion::multiversion;
@@ -326,10 +330,7 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
 ///
 /// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
 /// representation that cannot be normalized to RGB.
-pub fn decode_with_options(
-    bytes: &[u8],
-    options: DecodeOptions,
-) -> Result<DecodedImage> {
+pub fn decode_with_options(bytes: &[u8], options: DecodeOptions) -> Result<DecodedImage> {
     Ok(decode_with_metadata_and_options(bytes, options.with_hdr_metrics(false))?.into_image())
 }
 
@@ -825,6 +826,17 @@ fn write_hdr_pixels(
     color_scale: f32,
     rgba: &mut [u8],
 ) -> Result<bool> {
+    if layout.encoding == SampleEncoding::PackedBGR101010 {
+        return Ok(write_bgr101010_hdr_pixels(
+            source,
+            width,
+            row_stride,
+            mapper,
+            color_scale,
+            rgba,
+        ));
+    }
+
     let row_count = source.len() / row_stride;
 
     let pixel_count = width
@@ -857,6 +869,64 @@ fn write_hdr_pixels(
     write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
     invariant_eq!(rgba_offset, rgba.len());
     Ok(has_nonzero_alpha)
+}
+
+#[multiversion(targets = "simd")]
+fn write_bgr101010_hdr_pixels(
+    source: &[u8],
+    width: usize,
+    row_stride: usize,
+    mapper: &(impl ToneMapper + Sync),
+    color_scale: f32,
+    rgba: &mut [u8],
+) -> bool {
+    let row_count = source.len() / row_stride;
+    let pixel_count = width
+        .checked_mul(row_count)
+        .expect("validated JPEG XR pixel count fits usize");
+    let batch_capacity = HDR_BATCH_PIXELS.min(pixel_count);
+    let mut colors = LinearRGBPlanes::with_capacity(batch_capacity);
+    let mut alphas = Vec::with_capacity(batch_capacity);
+    let mut rgba_offset = 0;
+
+    for row in source.chunks_exact(row_stride) {
+        let (pixels, remainder) = row.as_chunks::<4>();
+        invariant!(remainder.is_empty());
+        invariant_eq!(pixels.len(), width);
+
+        let (chunks, tail) = pixels.as_chunks::<SRGB_LANES>();
+        for chunk in chunks {
+            let packed = Simd::<u32, SRGB_LANES>::from_array((*chunk).map(u32::from_ne_bytes));
+            let [red, green, blue] = decode_bgr101010_simd(packed).map(Simd::to_array);
+
+            for ((red, green), blue) in red.into_iter().zip(green).zip(blue) {
+                colors.push(LinearRGB::new([
+                    red * color_scale,
+                    green * color_scale,
+                    blue * color_scale,
+                ]));
+                alphas.push(u8::MAX);
+            }
+
+            if colors.len() >= HDR_BATCH_PIXELS {
+                write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
+            }
+        }
+
+        for pixel in tail {
+            let color = decode_bgr101010(pixel).map(|component| component * color_scale);
+            colors.push(LinearRGB::new(color));
+            alphas.push(u8::MAX);
+
+            if colors.len() == HDR_BATCH_PIXELS {
+                write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
+            }
+        }
+    }
+
+    write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
+    invariant_eq!(rgba_offset, rgba.len());
+    true
 }
 
 fn write_tone_mapped_batch(
@@ -1659,6 +1729,17 @@ fn decode_bgr101010(pixel: &[u8]) -> [f32; 3] {
     rec2100_pq_to_scrgb(unpack_bgr101010(pixel))
 }
 
+#[inline]
+fn decode_bgr101010_simd<const N: usize>(packed: Simd<u32, N>) -> [Simd<f32, N>; 3] {
+    const MASK: u32 = 0x03ff;
+    const SCALE: f32 = 1.0 / 1023.0;
+
+    let encoded = [20, 10, 0].map(|shift| {
+        ((packed >> Simd::splat(shift)) & Simd::splat(MASK)).cast::<f32>() * Simd::splat(SCALE)
+    });
+    rec2100_pq_to_scrgb_simd(encoded)
+}
+
 fn unpack_bgr101010(pixel: &[u8]) -> [f32; 3] {
     const MASK: u32 = 0x03ff;
     const SCALE: f32 = 1.0 / 1023.0;
@@ -1689,6 +1770,26 @@ fn rec2100_pq_to_scrgb(encoded: [f32; 3]) -> [f32; 3] {
     ]
 }
 
+#[inline]
+fn rec2100_pq_to_scrgb_simd<const N: usize>(encoded: [Simd<f32, N>; 3]) -> [Simd<f32, N>; 3] {
+    const REC2100_MAX_NITS: f32 = 10_000.0;
+    const SCALE: f32 = REC2100_MAX_NITS / SC_RGB_REFERENCE_WHITE_NITS;
+
+    let [red, green, blue] = encoded.map(pq_to_linear_simd);
+    [
+        (Simd::splat(1.660_491) * red
+            - Simd::splat(0.587_641) * green
+            - Simd::splat(0.072_850) * blue)
+            * Simd::splat(SCALE),
+        (Simd::splat(-0.124_550) * red + Simd::splat(1.132_9) * green
+            - Simd::splat(0.008_349) * blue)
+            * Simd::splat(SCALE),
+        (Simd::splat(-0.018_151) * red - Simd::splat(0.100_579) * green
+            + Simd::splat(1.118_73) * blue)
+            * Simd::splat(SCALE),
+    ]
+}
+
 #[cfg(test)]
 fn pq_to_linear(encoded: f32) -> f32 {
     const INVERSE_M1: f32 = 16_384.0 / 2_610.0;
@@ -1701,17 +1802,18 @@ fn pq_to_linear(encoded: f32) -> f32 {
     ((powered - C1).max(0.0) / (C2 - C3 * powered)).powf(INVERSE_M1)
 }
 
-fn pq_to_linear_simd(encoded: F32x4) -> F32x4 {
+#[inline]
+fn pq_to_linear_simd<const N: usize>(encoded: Simd<f32, N>) -> Simd<f32, N> {
     const INVERSE_M1: f32 = 16_384.0 / 2_610.0;
     const INVERSE_M2: f32 = 32.0 / 2_523.0;
     const C1: f32 = 3_424.0 / 4_096.0;
     const C2: f32 = 2_413.0 / 128.0;
     const C3: f32 = 2_392.0 / 128.0;
 
-    let powered = exp2(log2(encoded) * F32x4::splat(INVERSE_M2));
-    let ratio = (powered - F32x4::splat(C1)).simd_max(F32x4::splat(0.0))
-        / (F32x4::splat(C2) - F32x4::splat(C3) * powered);
-    exp2(log2(ratio) * F32x4::splat(INVERSE_M1))
+    let powered = exp2(log2(encoded) * Simd::splat(INVERSE_M2));
+    let ratio = (powered - Simd::splat(C1)).simd_max(Simd::splat(0.0))
+        / (Simd::splat(C2) - Simd::splat(C3) * powered);
+    exp2(log2(ratio) * Simd::splat(INVERSE_M1))
 }
 
 fn read_sample<T: FromBytes + Sized>(bytes: &[u8]) -> T {
@@ -1853,6 +1955,44 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn packed_hdr_batches_match_scalar_across_row_boundaries() {
+        const WIDTH: usize = 13;
+        const HEIGHT: usize = HDR_BATCH_PIXELS / WIDTH + 2;
+
+        let source: Vec<u8> = (0..WIDTH * HEIGHT)
+            .flat_map(|index| {
+                let red = u32::try_from(index * 17 % 1_024).expect("test sample fits u32");
+                let green = u32::try_from(index * 31 % 1_024).expect("test sample fits u32");
+                let blue = u32::try_from(index * 47 % 1_024).expect("test sample fits u32");
+                ((red << 20) | (green << 10) | blue).to_ne_bytes()
+            })
+            .collect();
+        let mut scalar = vec![0_u8; WIDTH * HEIGHT * 4];
+        let mut batched = vec![0_u8; scalar.len()];
+
+        write_hdr_pixels_scalar(
+            &source,
+            WIDTH,
+            WIDTH * 4,
+            PixelLayout::bgr101010(),
+            &BT2446A,
+            BT2446_INPUT_SCALE,
+            &mut scalar,
+        )
+        .unwrap();
+        write_bgr101010_hdr_pixels(
+            &source,
+            WIDTH,
+            WIDTH * 4,
+            &BT2446A,
+            BT2446_INPUT_SCALE,
+            &mut batched,
+        );
+
+        assert_eq!(batched, scalar);
     }
 
     #[test]
