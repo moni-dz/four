@@ -1788,21 +1788,17 @@ fn normalize_alpha(value: f32) -> f32 {
 }
 
 fn linear_to_srgb(value: f32) -> f32 {
-    let value = value.clamp(0.0, 1.0);
-    if value <= 0.003_130_8 {
-        12.92 * value
-    } else {
-        1.055 * value.powf(1.0 / 2.4) - 0.055
-    }
+    linear_to_srgb_simd(Simd::<f32, 1>::splat(value))[0]
 }
 
-fn linear_to_srgb_simd(value: F32x8) -> F32x8 {
-    let value = value.simd_clamp(F32x8::splat(0.0), F32x8::splat(1.0));
-    let linear = value * F32x8::splat(12.92);
+#[inline]
+fn linear_to_srgb_simd<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
+    let value = value.simd_clamp(Simd::splat(0.0), Simd::splat(1.0));
+    let linear = value * Simd::splat(12.92);
     let nonlinear =
-        exp2(log2(value) * F32x8::splat(1.0 / 2.4)) * F32x8::splat(1.055) - F32x8::splat(0.055);
+        exp2(log2(value) * Simd::splat(1.0 / 2.4)) * Simd::splat(1.055) - Simd::splat(0.055);
     value
-        .simd_le(F32x8::splat(0.003_130_8))
+        .simd_le(Simd::splat(0.003_130_8))
         .select(linear, nonlinear)
 }
 
