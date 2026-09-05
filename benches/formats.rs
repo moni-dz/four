@@ -1,9 +1,4 @@
-//! Measures the end-to-end decode path for every fixture format.
-//!
-//! These go through the public `decode` entry points rather than reaching into private kernels, so
-//! a win in the IDCT, in a row writer, or in a color conversion shows up here without the benchmark
-//! needing to know those functions exist. Fixtures are tiny by design, which keeps the whole file
-//! in cache: this measures per-pixel work, not memory bandwidth.
+//! Measures cached, end-to-end decoding through each format's public API.
 
 use divan::{Bencher, counter::BytesCount};
 use four::{DecodedImage, encode_bmp, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
@@ -23,7 +18,7 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|error| panic!("read fixture {}: {error}", path.display()))
 }
 
-/// Times `decode` over `name`, counting the compressed bytes consumed.
+/// Times `decode`, counting decoded RGBA bytes produced.
 fn bench_decode<E>(
     bencher: Bencher<'_, '_>,
     name: &str,
@@ -41,17 +36,16 @@ fn bench_decode<E>(
 
 #[divan::bench_group(name = "decode")]
 mod decode {
-    use super::{Bencher, bench_decode, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
+    use super::{
+        Bencher, BytesCount, bench_decode, fixture, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff,
+    };
 
     #[divan::bench]
     fn jpeg_baseline(bencher: Bencher<'_, '_>) {
         bench_decode(bencher, "baseline.jpg", jpeg::decode);
     }
 
-    /// A 384x384 image with high-frequency content in every block.
-    ///
-    /// `baseline.jpg` is too small and too flat to show anything: at that size parsing dominates,
-    /// and most of its blocks take the DC-only path that skips the inverse transform entirely.
+    /// Exercises high-frequency JPEG blocks.
     #[divan::bench]
     fn jpeg_busy(bencher: Bencher<'_, '_>) {
         bench_decode(bencher, "busy.jpg", jpeg::decode);
@@ -82,9 +76,7 @@ mod decode {
         bench_decode(bencher, "rgb8.tiff", tiff::decode);
     }
 
-    /// A 640x480 image, above the threshold where TIFF normalization goes parallel.
-    ///
-    /// `rgb8.tiff` has 3,072 pixels and so only ever exercises the sequential branch.
+    /// Exercises parallel TIFF normalization.
     #[divan::bench]
     fn tiff_large(bencher: Bencher<'_, '_>) {
         bench_decode(bencher, "large.tiff", tiff::decode);
@@ -95,13 +87,27 @@ mod decode {
         bench_decode(bencher, "rgb8.jxl", jpeg_xl::decode);
     }
 
-    /// A real 3840x2160 Windows HDR screenshot, the only realistic-scale fixture in this suite.
-    ///
-    /// Every other fixture is 64x48 by convention; JPEG XR has no encoder anywhere in this
-    /// toolchain (see `tests/fixtures/README.md`), so this is a real capture, not synthetic.
+    /// Decodes a 3840x2160 Windows HDR screenshot without metadata analysis.
     #[divan::bench]
     fn jpeg_xr_bgr101010(bencher: Bencher<'_, '_>) {
         bench_decode(bencher, "screenshot.jxr", jpeg_xr::decode);
+    }
+
+    /// Decodes and analyzes the production JPEG XR path.
+    #[divan::bench]
+    fn jpeg_xr_bgr101010_metadata(bencher: Bencher<'_, '_>) {
+        let bytes = fixture("screenshot.jxr");
+        let output_bytes = jpeg_xr::decode_with_metadata(&bytes)
+            .expect("benchmark fixture decodes successfully")
+            .image()
+            .rgba8()
+            .len();
+
+        bencher
+            .counter(BytesCount::new(output_bytes))
+            .bench_local(|| {
+                jpeg_xr::decode_with_metadata(&bytes).map(|decoded| decoded.image().rgba8().len())
+            });
     }
 
     #[divan::bench]
@@ -110,8 +116,7 @@ mod decode {
     }
 }
 
-/// Every decoded image is re-encoded as a BMP before GPUI will accept it, so the swizzle and the
-/// extra full-buffer copy are part of the cost of displaying any non-GIF image.
+/// Measures the BMP carrier used by GPUI.
 #[divan::bench_group(name = "display")]
 mod display {
     use super::{Bencher, BytesCount, encode_bmp, fixture, png};
