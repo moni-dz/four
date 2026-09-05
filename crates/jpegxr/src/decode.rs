@@ -1449,7 +1449,6 @@ fn t2x2_quad(values: &mut [i64; 16]) {
     [values[15], values[10], values[14], values[11]] = [fourth_a, fourth_b, fourth_c, fourth_d];
 }
 
-#[multiversion(targets = "simd")]
 #[inline]
 fn t2x2(values: &mut [i64; 4], rounding: i64) {
     values[0] += values[3];

@@ -30,7 +30,7 @@ pub(crate) enum DimensionsError {
     TooManyPixels { pixels: u64 },
 }
 
-#[allow(
+#[expect(
     clippy::trivially_copy_pass_by_ref,
     reason = "nutype's validate(with = ...) always invokes the function with a reference to the \
               wrapped value, regardless of whether that value is Copy"

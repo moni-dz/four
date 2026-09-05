@@ -89,7 +89,7 @@ fn aces_fitted_batch(colors: &mut [LinearRGB]) {
     let (chunks, tail) = colors.as_chunks_mut::<COLOR_LANES>();
     debug_assert!(
         tail.is_empty(),
-        "fitted ACES SIMD input must contain complete four-pixel chunks"
+        "fitted ACES SIMD input must contain complete eight-pixel chunks"
     );
 
     for chunk in chunks {

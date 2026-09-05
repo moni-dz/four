@@ -557,7 +557,7 @@ const MOBIUS_MIN_PEAK: f32 = 1.0 + 1e-3;
 #[error("white point level must be positive and finite, got {0}")]
 pub struct WhitePointError(f32);
 
-#[allow(
+#[expect(
     clippy::trivially_copy_pass_by_ref,
     reason = "nutype's validate(with = ...) always invokes the function with a reference to the \
               wrapped value, regardless of whether that value is Copy"
@@ -970,6 +970,7 @@ mod transcendental;
 pub use aces::{ACESApproximate, ACESFitted};
 #[doc(inline)]
 pub use bt2446::BT2446A;
+#[doc(inline)]
 pub use clamp::{Clamp, ScaledClamp};
 #[doc(inline)]
 pub use hable::Hable;
