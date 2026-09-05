@@ -982,6 +982,7 @@ pub use reinhard::{
 #[doc(inline)]
 pub use transcendental::{exp2, log2};
 
+#[inline]
 fn sanitize_component(component: f32) -> f32 {
     if component.is_nan() || component <= 0.0 {
         0.0
