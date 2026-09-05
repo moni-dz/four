@@ -12,10 +12,12 @@ resolver = "3"
 
 [workspace.dependencies]
 divan = "0.1.21"
+jpegxr = { path = "crates/jpegxr" }
 mimalloc = "0.1.48"
 multiversion = "0.8.0"
 rayon = "1.12.0"
 thiserror = "2.0.20"
+tonemapping = { path = "crates/tonemapping" }
 zerocopy = "0.8.56"
 
 [dependencies]
@@ -24,13 +26,13 @@ gif = "0.14.2"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "38ca9106c5306ef93e52c35643df015a27f15b72" }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "38ca9106c5306ef93e52c35643df015a27f15b72", features = ["font-kit", "wayland", "x11"] }
 jxl-oxide = { version = "0.12.6", default-features = false, features = ["moxcms", "rayon"] }
-jpegxr = { path = "crates/jpegxr" }
+jpegxr = { workspace = true }
 multiversion = { workspace = true }
 mimalloc = { workspace = true }
 png = "0.18.1"
 rayon = { workspace = true }
 tiff = "0.11.3"
-tonemapping = { path = "crates/tonemapping" }
+tonemapping = { workspace = true }
 zune-jpeg = "0.5.15"
 zerocopy = { workspace = true, features = ["simd", "simd-nightly", "float-nightly"] }
 
