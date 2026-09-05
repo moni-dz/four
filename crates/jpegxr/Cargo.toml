@@ -12,5 +12,13 @@ thiserror = { workspace = true }
 zerocopy = { workspace = true }
 multiversion = { workspace = true }
 
+[dev-dependencies]
+mimalloc = { workspace = true }
+
 [lints]
 workspace = true
+
+[[bench]]
+name = "decode"
+harness = false
+test = false
