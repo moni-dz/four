@@ -146,7 +146,9 @@ pub(super) fn decode_sequential(
         mcu_columns,
         mcu_rows,
         restart_interval,
-        |state, mcu_x, mcu_y| decode_sequential_mcu(state, frame, plans, conditioning, mcu_x, mcu_y),
+        |state, mcu_x, mcu_y| {
+            decode_sequential_mcu(state, frame, plans, conditioning, mcu_x, mcu_y)
+        },
     )
 }
 
@@ -320,7 +322,11 @@ struct BlockX(u32);
 #[derive(Clone, Copy)]
 struct BlockY(u32);
 
-fn coefficient_index(component: &FrameComponent, block_x: BlockX, block_y: BlockY) -> Result<usize> {
+fn coefficient_index(
+    component: &FrameComponent,
+    block_x: BlockX,
+    block_y: BlockY,
+) -> Result<usize> {
     invariant!(component.block_columns > 0);
     invariant!(component.block_rows > 0);
 

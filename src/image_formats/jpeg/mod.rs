@@ -19,7 +19,9 @@ use model::{
 };
 use scan::{ScanComponent, ScanHeader, parse_frame_components, parse_scan_header};
 
-use super::{DIMENSION_MAX, DecodedImage, Dimensions, DimensionsError, PIXELS_MAX, rgba_pixel_rows};
+use super::{
+    DIMENSION_MAX, DecodedImage, Dimensions, DimensionsError, PIXELS_MAX, rgba_pixel_rows,
+};
 
 use zune_jpeg::JpegDecoder;
 use zune_jpeg::errors::DecodeErrors;

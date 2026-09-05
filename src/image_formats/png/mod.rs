@@ -100,9 +100,7 @@ fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     Dimensions::try_new((width, height))
         .map(|_| ())
         .map_err(|dimensions_error| match dimensions_error {
-            DimensionsError::Zero => error(PNGError::Output(
-                "PNG dimensions must both be nonzero",
-            )),
+            DimensionsError::Zero => error(PNGError::Output("PNG dimensions must both be nonzero")),
             DimensionsError::TooLarge { width, height } => {
                 error(PNGError::LimitExceeded(PNGLimit::Dimensions {
                     actual_width: width,

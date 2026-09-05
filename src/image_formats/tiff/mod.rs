@@ -226,9 +226,9 @@ fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     Dimensions::try_new((width, height))
         .map(|_| ())
         .map_err(|dimensions_error| match dimensions_error {
-            DimensionsError::Zero => error(TIFFError::Output(
-                "TIFF dimensions must both be nonzero",
-            )),
+            DimensionsError::Zero => {
+                error(TIFFError::Output("TIFF dimensions must both be nonzero"))
+            }
             DimensionsError::TooLarge { width, height } => {
                 error(TIFFError::LimitExceeded(TIFFLimit::Dimensions {
                     actual_width: width,

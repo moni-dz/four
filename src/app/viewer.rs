@@ -1139,7 +1139,9 @@ impl Root {
                     content
                         .on_scroll_wheel(cx.listener(
                             move |root, event: &ScrollWheelEvent, _, cx| {
-                                root.on_image_scroll(event, content_w, content_h, width, height, cx);
+                                root.on_image_scroll(
+                                    event, content_w, content_h, width, height, cx,
+                                );
                             },
                         ))
                         .on_mouse_down(

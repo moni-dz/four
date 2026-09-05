@@ -137,8 +137,8 @@ pub(crate) fn rgba_pixel_rows<E: Send>(
     pixel: impl Fn(usize, usize) -> Result<[u8; 4], E> + Sync,
 ) -> Result<Vec<u8>, E> {
     let pixel_count = width * height;
-    let byte_count = pixel_count * usize::try_from(RGBA_BYTES_PER_PIXEL)
-        .expect("four bytes per pixel always fits usize");
+    let byte_count = pixel_count
+        * usize::try_from(RGBA_BYTES_PER_PIXEL).expect("four bytes per pixel always fits usize");
 
     if pixel_count >= PARALLEL_PIXELS_MIN {
         let mut rgba = vec![0; byte_count];
@@ -287,10 +287,10 @@ mod tests {
 
     #[test]
     fn dimensions_accepts_every_in_bounds_pair() {
-        assert!(Dimensions::try_new((1, 1)).is_ok());
+        Dimensions::try_new((1, 1)).unwrap();
         // DIMENSION_MAX on one side alone still fits PIXELS_MAX; DIMENSION_MAX on both sides does
         // not (see `dimensions_rejects_a_pixel_count_above_the_max`).
-        assert!(Dimensions::try_new((DIMENSION_MAX, 1)).is_ok());
+        Dimensions::try_new((DIMENSION_MAX, 1)).unwrap();
     }
 
     #[test]
