@@ -48,8 +48,7 @@ pub fn has_signature(bytes: &[u8]) -> bool {
 ///
 /// Returns [`TIFFError`] when the TIFF is malformed, exceeds a resource bound, uses an unsupported
 /// sample representation, or the codec output is inconsistent with its declared layout.
-pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
-    let bytes = bytes.as_ref();
+pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     if !has_signature(bytes) {
         return Err(error(TIFFError::Signature));
     }

@@ -681,7 +681,7 @@ mod tests {
 
     #[test]
     fn load_error_preserves_the_decoder_error_frame() {
-        let decoder_error = jpeg::decode([0x00]).unwrap_err();
+        let decoder_error = jpeg::decode(&[0x00]).unwrap_err();
         let load_error = decoder_error.raise(LoadError::new("Could not decode test.jpg"));
         let message = format_load_error(&load_error);
 

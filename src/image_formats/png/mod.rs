@@ -36,8 +36,7 @@ pub fn has_signature(bytes: &[u8]) -> bool {
 ///
 /// Returns [`PNGError`] when the PNG is malformed, corrupt, exceeds a resource bound, or cannot be
 /// represented by the shared RGBA8 contract.
-pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
-    let bytes = bytes.as_ref();
+pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     if !has_signature(bytes) {
         return Err(error(PNGError::Signature));
     }

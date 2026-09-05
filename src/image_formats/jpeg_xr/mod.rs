@@ -313,7 +313,7 @@ pub fn has_signature(bytes: &[u8]) -> bool {
 ///
 /// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
 /// representation that cannot be normalized to RGB.
-pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
+pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     decode_with_options(bytes, DecodeOptions::default())
 }
 
@@ -327,7 +327,7 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
 /// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
 /// representation that cannot be normalized to RGB.
 pub fn decode_with_options(
-    bytes: impl AsRef<[u8]>,
+    bytes: &[u8],
     options: DecodeOptions,
 ) -> Result<DecodedImage> {
     Ok(decode_with_metadata_and_options(bytes, options.with_hdr_metrics(false))?.into_image())
@@ -343,7 +343,7 @@ pub fn decode_with_options(
 ///
 /// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
 /// representation that cannot be normalized to RGB.
-pub fn decode_with_metadata(bytes: impl AsRef<[u8]>) -> Result<DecodedJPEGXR> {
+pub fn decode_with_metadata(bytes: &[u8]) -> Result<DecodedJPEGXR> {
     decode_with_metadata_and_options(bytes, DecodeOptions::default())
 }
 
@@ -360,10 +360,9 @@ pub fn decode_with_metadata(bytes: impl AsRef<[u8]>) -> Result<DecodedJPEGXR> {
 /// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
 /// representation that cannot be normalized to RGB.
 pub fn decode_with_metadata_and_options(
-    bytes: impl AsRef<[u8]>,
+    bytes: &[u8],
     options: DecodeOptions,
 ) -> Result<DecodedJPEGXR> {
-    let bytes = bytes.as_ref();
     if !has_signature(bytes) {
         return Err(error(JPEGXRError::Signature));
     }
@@ -2004,7 +2003,7 @@ mod tests {
     fn decodes_real_hdr_sample_with_pure_rust_codec() {
         let path = std::env::var("JPEGXR_SAMPLE").expect("set JPEGXR_SAMPLE");
         let bytes = std::fs::read(path).expect("read sample");
-        let decoded = decode_with_metadata(bytes).expect("decode HDR sample");
+        let decoded = decode_with_metadata(&bytes).expect("decode HDR sample");
 
         assert_eq!(decoded.image().dimensions(), (3440, 1440));
         assert_eq!(decoded.image().rgba8().len(), 3440 * 1440 * 4);
@@ -2017,7 +2016,7 @@ mod tests {
     fn decodes_real_bgr101010_sample_with_pure_rust_codec() {
         let path = std::env::var("JPEGXR_BGR101010_SAMPLE").expect("set JPEGXR_BGR101010_SAMPLE");
         let bytes = std::fs::read(path).expect("read sample");
-        let decoded = decode_with_metadata(bytes).expect("decode BGR101010 HDR sample");
+        let decoded = decode_with_metadata(&bytes).expect("decode BGR101010 HDR sample");
 
         assert_eq!(decoded.image().dimensions(), (3840, 2160));
         assert_eq!(decoded.image().rgba8().len(), 3840 * 2160 * 4);

@@ -40,8 +40,7 @@ pub fn has_signature(bytes: &[u8]) -> bool {
 ///
 /// Returns [`GIFError`] when the GIF is malformed, has no frame, exceeds a resource bound, or a
 /// decoded frame is inconsistent with its descriptor.
-pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
-    let bytes = bytes.as_ref();
+pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     if !has_signature(bytes) {
         return Err(error(GIFError::Signature));
     }
@@ -233,7 +232,7 @@ mod tests {
             }
         }
 
-        let error = decode(bytes).unwrap_err();
+        let error = decode(&bytes).unwrap_err();
 
         assert!(error.to_string().contains("10000-frame limit"));
     }

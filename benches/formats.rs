@@ -45,7 +45,7 @@ mod decode {
 
     #[divan::bench]
     fn jpeg_baseline(bencher: Bencher<'_, '_>) {
-        bench_decode(bencher, "baseline.jpg", |bytes| jpeg::decode(bytes));
+        bench_decode(bencher, "baseline.jpg", jpeg::decode);
     }
 
     /// A 384x384 image with high-frequency content in every block.
@@ -54,32 +54,32 @@ mod decode {
     /// and most of its blocks take the DC-only path that skips the inverse transform entirely.
     #[divan::bench]
     fn jpeg_busy(bencher: Bencher<'_, '_>) {
-        bench_decode(bencher, "busy.jpg", |bytes| jpeg::decode(bytes));
+        bench_decode(bencher, "busy.jpg", jpeg::decode);
     }
 
     #[divan::bench]
     fn png_rgb8(bencher: Bencher<'_, '_>) {
-        bench_decode(bencher, "rgb8.png", |bytes| png::decode(bytes));
+        bench_decode(bencher, "rgb8.png", png::decode);
     }
 
     #[divan::bench]
     fn png_rgb16(bencher: Bencher<'_, '_>) {
-        bench_decode(bencher, "rgb16.png", |bytes| png::decode(bytes));
+        bench_decode(bencher, "rgb16.png", png::decode);
     }
 
     #[divan::bench]
     fn png_rgba8(bencher: Bencher<'_, '_>) {
-        bench_decode(bencher, "rgba8.png", |bytes| png::decode(bytes));
+        bench_decode(bencher, "rgba8.png", png::decode);
     }
 
     #[divan::bench]
     fn png_palette8(bencher: Bencher<'_, '_>) {
-        bench_decode(bencher, "palette8.png", |bytes| png::decode(bytes));
+        bench_decode(bencher, "palette8.png", png::decode);
     }
 
     #[divan::bench]
     fn tiff_rgb8(bencher: Bencher<'_, '_>) {
-        bench_decode(bencher, "rgb8.tiff", |bytes| tiff::decode(bytes));
+        bench_decode(bencher, "rgb8.tiff", tiff::decode);
     }
 
     /// A 640x480 image, above the threshold where TIFF normalization goes parallel.
@@ -87,12 +87,12 @@ mod decode {
     /// `rgb8.tiff` has 3,072 pixels and so only ever exercises the sequential branch.
     #[divan::bench]
     fn tiff_large(bencher: Bencher<'_, '_>) {
-        bench_decode(bencher, "large.tiff", |bytes| tiff::decode(bytes));
+        bench_decode(bencher, "large.tiff", tiff::decode);
     }
 
     #[divan::bench]
     fn jpeg_xl_rgb8(bencher: Bencher<'_, '_>) {
-        bench_decode(bencher, "rgb8.jxl", |bytes| jpeg_xl::decode(bytes));
+        bench_decode(bencher, "rgb8.jxl", jpeg_xl::decode);
     }
 
     /// A real 3840x2160 Windows HDR screenshot, the only realistic-scale fixture in this suite.
@@ -101,12 +101,12 @@ mod decode {
     /// toolchain (see `tests/fixtures/README.md`), so this is a real capture, not synthetic.
     #[divan::bench]
     fn jpeg_xr_bgr101010(bencher: Bencher<'_, '_>) {
-        bench_decode(bencher, "screenshot.jxr", |bytes| jpeg_xr::decode(bytes));
+        bench_decode(bencher, "screenshot.jxr", jpeg_xr::decode);
     }
 
     #[divan::bench]
     fn gif_animated(bencher: Bencher<'_, '_>) {
-        bench_decode(bencher, "animated.gif", |bytes| gif::decode(bytes));
+        bench_decode(bencher, "animated.gif", gif::decode);
     }
 }
 
@@ -118,7 +118,7 @@ mod display {
 
     #[divan::bench]
     fn bmp_carrier(bencher: Bencher<'_, '_>) {
-        let image = png::decode(fixture("rgba8.png")).expect("fixture decodes as PNG");
+        let image = png::decode(&fixture("rgba8.png")).expect("fixture decodes as PNG");
         bencher
             .counter(BytesCount::new(image.rgba8().len()))
             .bench_local(|| encode_bmp(&image).len());

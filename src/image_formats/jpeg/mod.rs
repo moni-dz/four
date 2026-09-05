@@ -58,15 +58,13 @@ pub fn has_signature(bytes: &[u8]) -> bool {
 
 /// Decodes an 8-bit Huffman- or arithmetic-coded sequential or progressive JPEG.
 ///
-/// The decoder performs no I/O. It accepts any byte container that can be viewed as a slice so the
-/// caller retains control over input limits and storage.
+/// The decoder performs no I/O.
 ///
 /// # Errors
 ///
 /// Returns [`JPEGError`] when the input is malformed, exceeds a resource bound, or uses a JPEG
 /// feature that this decoder does not support.
-pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
-    let bytes = bytes.as_ref();
+pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     if uses_arithmetic_coding(bytes) {
         parser::decode(bytes)
     } else {
