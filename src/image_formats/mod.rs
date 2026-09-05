@@ -1,5 +1,8 @@
 //! Defines the shared decoded-image representation and format decoders.
 
+use nutype::nutype;
+use rayon::prelude::*;
+
 pub mod gif;
 pub mod jpeg;
 pub mod jpeg_xl;
@@ -19,6 +22,42 @@ const BMP_SRGB_COLOR_SPACE: u32 = 0x7352_4742;
 const DIMENSION_MAX: u32 = 16_384;
 const PIXELS_MAX: u64 = 64 * 1024 * 1024;
 const RGBA_BYTES_PER_PIXEL: u32 = 4;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DimensionsError {
+    Zero,
+    TooLarge { width: u32, height: u32 },
+    TooManyPixels { pixels: u64 },
+}
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "nutype's validate(with = ...) always invokes the function with a reference to the \
+              wrapped value, regardless of whether that value is Copy"
+)]
+fn validate_dimensions_pair(&(width, height): &(u32, u32)) -> Result<(), DimensionsError> {
+    if width == 0 || height == 0 {
+        return Err(DimensionsError::Zero);
+    }
+    if width > DIMENSION_MAX || height > DIMENSION_MAX {
+        return Err(DimensionsError::TooLarge { width, height });
+    }
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > PIXELS_MAX {
+        return Err(DimensionsError::TooManyPixels { pixels });
+    }
+    Ok(())
+}
+
+/// A `(width, height)` pair already known to be nonzero and within [`DIMENSION_MAX`]/[`PIXELS_MAX`].
+///
+/// Collapses the six format decoders' near-identical `validate_dimensions` checks into one
+/// validated construction; each decoder still maps [`DimensionsError`] into its own error type.
+#[nutype(
+    validate(with = validate_dimensions_pair, error = DimensionsError),
+    derive(Clone, Copy, Debug, PartialEq, Eq)
+)]
+pub(crate) struct Dimensions((u32, u32));
 
 /// Pixel count below which a decoder normalizes on the calling thread.
 ///
@@ -86,6 +125,50 @@ impl DecodedImage {
     }
 }
 
+/// Builds a row-major RGBA8 buffer by calling `pixel(x, y)` for every coordinate, going parallel
+/// (one rayon job per row) once the image is large enough that the dispatch overhead pays for
+/// itself, and running on the calling thread otherwise.
+///
+/// Shared by every decoder that reconstructs pixels from an existing sample buffer by coordinate
+/// (JPEG, TIFF) rather than by walking a source byte buffer directly.
+pub(crate) fn rgba_pixel_rows<E: Send>(
+    width: usize,
+    height: usize,
+    pixel: impl Fn(usize, usize) -> Result<[u8; 4], E> + Sync,
+) -> Result<Vec<u8>, E> {
+    let pixel_count = width * height;
+    let byte_count = pixel_count * usize::try_from(RGBA_BYTES_PER_PIXEL)
+        .expect("four bytes per pixel always fits usize");
+
+    if pixel_count >= PARALLEL_PIXELS_MIN {
+        let mut rgba = vec![0; byte_count];
+        rgba.par_chunks_mut(width * 4)
+            .with_min_len(PARALLEL_PIXELS_PER_JOB / width.max(1))
+            .enumerate()
+            .try_for_each(|(y, row)| {
+                let (targets, remainder) = row.as_chunks_mut::<4>();
+                invariant_eq!(remainder.len(), 0);
+
+                for (x, target) in targets.iter_mut().enumerate() {
+                    *target = pixel(x, y)?;
+                }
+                Ok(())
+            })?;
+
+        Ok(rgba)
+    } else {
+        let mut rgba = Vec::with_capacity(byte_count);
+
+        for y in 0..height {
+            for x in 0..width {
+                rgba.extend_from_slice(&pixel(x, y)?);
+            }
+        }
+
+        Ok(rgba)
+    }
+}
+
 /// GPUI accepts encoded images, so an uncompressed BMP is used only as a pixel carrier.
 ///
 /// A V4 header declares explicit BGRA channel masks. Without those masks, BMP readers commonly
@@ -109,13 +192,17 @@ pub fn encode_bmp(image: &DecodedImage) -> Vec<u8> {
         .checked_mul(height)
         .and_then(|count| count.checked_mul(RGBA_BYTES_PER_PIXEL))
         .expect("decoded image size was validated");
+
     let file_bytes = BMP_HEADER_BYTES
         .checked_add(pixel_bytes)
         .expect("decoded image size was validated");
+
     let pixel_bytes_usize =
         usize::try_from(pixel_bytes).expect("the validated decoded image allocation fits usize");
+
     let file_bytes_usize =
         usize::try_from(file_bytes).expect("the validated BMP allocation fits usize");
+
     assert_eq!(
         image.rgba8().len(),
         pixel_bytes_usize,
@@ -163,7 +250,10 @@ pub fn encode_bmp(image: &DecodedImage) -> Vec<u8> {
 mod tests {
     use std::sync::Arc;
 
-    use super::{BMP_DIB_HEADER_BYTES, BMP_HEADER_BYTES, DecodedImage, encode_bmp};
+    use super::{
+        BMP_DIB_HEADER_BYTES, BMP_HEADER_BYTES, DIMENSION_MAX, DecodedImage, Dimensions,
+        DimensionsError, PIXELS_MAX, encode_bmp,
+    };
 
     #[test]
     fn bmp_encoding_writes_top_down_bgra_pixels() {
@@ -192,6 +282,51 @@ mod tests {
                 .as_bytes(0)
                 .expect("the static BMP carrier has one frame"),
             &[3, 2, 1, 4]
+        );
+    }
+
+    #[test]
+    fn dimensions_accepts_every_in_bounds_pair() {
+        assert!(Dimensions::try_new((1, 1)).is_ok());
+        // DIMENSION_MAX on one side alone still fits PIXELS_MAX; DIMENSION_MAX on both sides does
+        // not (see `dimensions_rejects_a_pixel_count_above_the_max`).
+        assert!(Dimensions::try_new((DIMENSION_MAX, 1)).is_ok());
+    }
+
+    #[test]
+    fn dimensions_rejects_a_zero_width_or_height() {
+        assert_eq!(
+            Dimensions::try_new((0, 1)).unwrap_err(),
+            DimensionsError::Zero
+        );
+        assert_eq!(
+            Dimensions::try_new((1, 0)).unwrap_err(),
+            DimensionsError::Zero
+        );
+    }
+
+    #[test]
+    fn dimensions_rejects_a_dimension_above_the_max() {
+        assert_eq!(
+            Dimensions::try_new((DIMENSION_MAX + 1, 1)).unwrap_err(),
+            DimensionsError::TooLarge {
+                width: DIMENSION_MAX + 1,
+                height: 1
+            }
+        );
+    }
+
+    #[test]
+    fn dimensions_rejects_a_pixel_count_above_the_max() {
+        // Both dimensions individually fit DIMENSION_MAX, but their product does not fit PIXELS_MAX.
+        let side = DIMENSION_MAX;
+        assert!(u64::from(side) * u64::from(side) > PIXELS_MAX);
+
+        assert_eq!(
+            Dimensions::try_new((side, side)).unwrap_err(),
+            DimensionsError::TooManyPixels {
+                pixels: u64::from(side) * u64::from(side)
+            }
         );
     }
 }

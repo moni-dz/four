@@ -40,6 +40,7 @@
 //! [Smith and Zink]: https://doi.org/10.5594/JMI.2021.3090176
 
 use multiversion::multiversion;
+use nutype::nutype;
 use std::backtrace::Backtrace;
 use std::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
@@ -551,8 +552,29 @@ define_tone_mapping_methods! {
 /// making the estimated white point's whole positive range a source of construction failure.
 const MOBIUS_MIN_PEAK: f32 = 1.0 + 1e-3;
 
+/// A scene level that cannot serve as a [`WhitePoint`].
+#[derive(Clone, Copy, Debug, Error, PartialEq)]
+#[error("white point level must be positive and finite, got {0}")]
+pub struct WhitePointError(f32);
+
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "nutype's validate(with = ...) always invokes the function with a reference to the \
+              wrapped value, regardless of whether that value is Copy"
+)]
+fn validate_white_point_level(level: &f32) -> Result<(), WhitePointError> {
+    if level.is_finite() && *level > 0.0 {
+        Ok(())
+    } else {
+        Err(WhitePointError(*level))
+    }
+}
+
 /// Identifies a positive finite scene level that maps to display white.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[nutype(
+    validate(with = validate_white_point_level, error = WhitePointError),
+    derive(Clone, Copy, Debug, PartialEq)
+)]
 pub struct WhitePoint(f32);
 
 impl WhitePoint {
@@ -571,17 +593,13 @@ impl WhitePoint {
     /// assert!(WhitePoint::new(0.0).is_err());
     /// ```
     pub fn new(level: f32) -> Result<Self, WhitePointError> {
-        if level.is_finite() && level > 0.0 {
-            Ok(Self(level))
-        } else {
-            Err(WhitePointError(level))
-        }
+        Self::try_new(level)
     }
 
     /// Returns the relative linear-light level represented by this white point.
     #[must_use]
-    pub const fn level(self) -> f32 {
-        self.0
+    pub fn level(self) -> f32 {
+        self.into_inner()
     }
 }
 
@@ -592,11 +610,6 @@ impl TryFrom<f32> for WhitePoint {
         Self::new(level)
     }
 }
-
-/// A scene level that cannot serve as a [`WhitePoint`].
-#[derive(Clone, Copy, Debug, Error, PartialEq)]
-#[error("white point level must be positive and finite, got {0}")]
-pub struct WhitePointError(f32);
 
 /// Identifies the RGB component that determines a content-light level.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -792,6 +805,10 @@ impl MaxCLLEstimator {
     /// Both estimators must have been created with the same pixel count and mode, so that they
     /// retain the same number of samples; the result is then identical to observing every colour
     /// through one estimator. This is what lets a caller split an image across worker threads.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the estimators declare different pixel counts or retained sample counts.
     pub fn merge(&mut self, other: Self) {
         assert_eq!(
             self.expected, other.expected,

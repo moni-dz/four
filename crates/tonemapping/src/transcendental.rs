@@ -68,6 +68,7 @@ fn polynomial<const N: usize, const DEGREE: usize>(
 /// Zero and negative inputs return negative infinity and `NaN` respectively, matching
 /// [`f32::log2`]. Subnormal inputs are scaled into the normal range first, so they are as accurate
 /// as any other value.
+#[must_use]
 #[inline]
 pub fn log2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
     // A subnormal has a zero exponent field, so decomposing it directly would read a mantissa
@@ -119,6 +120,7 @@ pub fn log2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
 /// Returns two raised to the power of each lane.
 ///
 /// Underflows to zero below `-149` and overflows to infinity above `128`, matching [`f32::exp2`].
+#[must_use]
 #[inline]
 pub fn exp2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
     // Clamping first keeps the exponent assembly below in range; the true extremes are restored by

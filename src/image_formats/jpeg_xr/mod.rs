@@ -33,13 +33,13 @@ use rayon::prelude::*;
 use tonemapping::{
     Clamp, ColorChannel as ToneColorChannel, LinearRGB, LinearRGBPlanes, LuminanceWhitePoint,
     LuminanceWhitePointEstimator, MaxCLLEstimator, MaxCLLMode, ToneMapper, ToneMappingMethod,
-    exp2, log2,
-    WhitePoint,
+    WhitePoint, exp2, log2,
 };
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::{
-    DIMENSION_MAX, DecodedImage, PARALLEL_PIXELS_MIN, PARALLEL_PIXELS_PER_JOB, PIXELS_MAX,
+    DIMENSION_MAX, DecodedImage, Dimensions, DimensionsError, PARALLEL_PIXELS_MIN,
+    PARALLEL_PIXELS_PER_JOB, PIXELS_MAX,
 };
 use error::error;
 
@@ -1630,27 +1630,25 @@ fn validate_dimensions(width: i32, height: i32) -> Result<(u32, u32)> {
         error(JPEGXRError::Output("JPEG XR height must be positive"))
     })?;
 
-    if width == 0 || height == 0 {
-        return Err(error(JPEGXRError::Output(
-            "JPEG XR dimensions must both be nonzero",
-        )));
-    }
-
-    if width > DIMENSION_MAX || height > DIMENSION_MAX {
-        return Err(error(JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions {
-            actual: Some(width.max(height)),
-            max: DIMENSION_MAX,
-        })));
-    }
-
-    if u64::from(width) * u64::from(height) > PIXELS_MAX {
-        return Err(error(JPEGXRError::LimitExceeded(JPEGXRLimit::Pixels {
-            actual: Some(u64::from(width) * u64::from(height)),
-            max: PIXELS_MAX,
-        })));
-    }
-
-    Ok((width, height))
+    Dimensions::try_new((width, height))
+        .map(|_| (width, height))
+        .map_err(|dimensions_error| match dimensions_error {
+            DimensionsError::Zero => error(JPEGXRError::Output(
+                "JPEG XR dimensions must both be nonzero",
+            )),
+            DimensionsError::TooLarge { width, height } => {
+                error(JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions {
+                    actual: Some(width.max(height)),
+                    max: DIMENSION_MAX,
+                }))
+            }
+            DimensionsError::TooManyPixels { pixels } => {
+                error(JPEGXRError::LimitExceeded(JPEGXRLimit::Pixels {
+                    actual: Some(pixels),
+                    max: PIXELS_MAX,
+                }))
+            }
+        })
 }
 
 fn decode_sample(bytes: &[u8], encoding: SampleEncoding) -> f32 {

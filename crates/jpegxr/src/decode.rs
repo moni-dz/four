@@ -2,8 +2,8 @@
 
 use crate::bitstream::BitReader;
 use crate::codestream::{
-    Bands, InternalColorFormat, OutputBitDepth, OutputColorFormat, OverlapMode, ParsedCodestream,
-    PlaneHeader,
+    Bands, ImageHeader, InternalColorFormat, Margins, OutputBitDepth, OutputColorFormat,
+    OverlapMode, ParsedCodestream, PlaneHeader,
 };
 use crate::entropy::{self, AdaptiveVLC};
 use crate::error::{Error, ErrorKind, Result};
@@ -102,35 +102,73 @@ struct IntegerImage {
     values: Vec<i32>,
 }
 
+/// Validates a plane's declared dimensions and returns `(width, height, pixel_count)`.
+///
+/// Shared by every entry point below: each rejects a width/height that doesn't fit `usize`,
+/// exceeds [`MAX_DIMENSION`], or whose product exceeds [`MAX_PIXELS`] or overflows.
+fn validated_dimensions(header: &ImageHeader, offset: usize) -> Result<(usize, usize, usize)> {
+    let width = usize::try_from(header.width)
+        .map_err(|_conversion_error| Error::new(ErrorKind::LimitExceeded("image width"), offset))?;
+    let height = usize::try_from(header.height).map_err(|_conversion_error| {
+        Error::new(ErrorKind::LimitExceeded("image height"), offset)
+    })?;
+    let pixel_count = width
+        .checked_mul(height)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded("pixel count"), offset))?;
+
+    if width > MAX_DIMENSION || height > MAX_DIMENSION {
+        return Err(Error::new(ErrorKind::LimitExceeded("image dimension"), offset));
+    }
+
+    if pixel_count > MAX_PIXELS {
+        return Err(Error::new(ErrorKind::LimitExceeded("pixel count"), offset));
+    }
+
+    Ok((width, height, pixel_count))
+}
+
+struct CropRect {
+    left: usize,
+    top: usize,
+    right: usize,
+    bottom: usize,
+}
+
+/// Computes the crop rectangle a plane's margins carve out of its decoded `width`x`height`,
+/// rejecting an overflowing right/bottom edge. `width_message`/`height_message` let each call
+/// site keep its own `ErrorKind::LimitExceeded` wording (e.g. "alpha image width").
+fn crop_rect(
+    margins: Margins,
+    width: usize,
+    height: usize,
+    offset: usize,
+    width_message: &'static str,
+    height_message: &'static str,
+) -> Result<CropRect> {
+    let left = usize::from(margins.left);
+    let top = usize::from(margins.top);
+    let right = left
+        .checked_add(width)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded(width_message), offset))?;
+    let bottom = top
+        .checked_add(height)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded(height_message), offset))?;
+
+    Ok(CropRect {
+        left,
+        top,
+        right,
+        bottom,
+    })
+}
+
 pub(crate) fn decode_rgba_f32(
     primary: &ParsedCodestream<'_>,
     alpha: &ParsedCodestream<'_>,
 ) -> Result<Vec<f32>> {
     validate_float_rgb_profile(primary, alpha)?;
 
-    let width = usize::try_from(primary.header.width).map_err(|_conversion_error| {
-        Error::new(ErrorKind::LimitExceeded("image width"), primary.offset)
-    })?;
-    let height = usize::try_from(primary.header.height).map_err(|_conversion_error| {
-        Error::new(ErrorKind::LimitExceeded("image height"), primary.offset)
-    })?;
-    let pixel_count = width
-        .checked_mul(height)
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded("pixel count"), primary.offset))?;
-
-    if width > MAX_DIMENSION || height > MAX_DIMENSION {
-        return Err(Error::new(
-            ErrorKind::LimitExceeded("image dimension"),
-            primary.offset,
-        ));
-    }
-
-    if pixel_count > MAX_PIXELS {
-        return Err(Error::new(
-            ErrorKind::LimitExceeded("pixel count"),
-            primary.offset,
-        ));
-    }
+    let (width, height, pixel_count) = validated_dimensions(&primary.header, primary.offset)?;
 
     let (color, alpha_image) = if pixel_count >= MIN_PARALLEL_PIXELS {
         let (color, alpha_image) = rayon::join(|| reconstruct(primary), || reconstruct(alpha));
@@ -150,38 +188,29 @@ pub(crate) fn decode_rgba_f32(
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded("RGBA output row"), primary.offset))?;
     let mut pixels = vec![0.0; output_len];
 
-    let color_left = usize::from(primary.header.margins.left);
-    let color_top = usize::from(primary.header.margins.top);
-    let alpha_left = usize::from(alpha.header.margins.left);
-    let alpha_top = usize::from(alpha.header.margins.top);
-    let color_right = color_left.checked_add(width).ok_or_else(|| {
-        Error::new(
-            ErrorKind::LimitExceeded("cropped image width"),
-            primary.offset,
-        )
-    })?;
-
-    let color_bottom = color_top.checked_add(height).ok_or_else(|| {
-        Error::new(
-            ErrorKind::LimitExceeded("cropped image height"),
-            primary.offset,
-        )
-    })?;
-
-    let alpha_right = alpha_left
-        .checked_add(width)
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded("alpha image width"), alpha.offset))?;
-
-    let alpha_bottom = alpha_top
-        .checked_add(height)
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded("alpha image height"), alpha.offset))?;
+    let color_crop = crop_rect(
+        primary.header.margins,
+        width,
+        height,
+        primary.offset,
+        "cropped image width",
+        "cropped image height",
+    )?;
+    let alpha_crop = crop_rect(
+        alpha.header.margins,
+        width,
+        height,
+        alpha.offset,
+        "alpha image width",
+        "alpha image height",
+    )?;
 
     if color.components != 3
         || alpha_image.components != 1
-        || color_right > color.width
-        || color_bottom > color.height
-        || alpha_right > alpha_image.width
-        || alpha_bottom > alpha_image.height
+        || color_crop.right > color.width
+        || color_crop.bottom > color.height
+        || alpha_crop.right > alpha_image.width
+        || alpha_crop.bottom > alpha_image.height
     {
         return Err(Error::new(
             ErrorKind::InvalidCodestream("decoded component dimensions are inconsistent"),
@@ -196,10 +225,10 @@ pub(crate) fn decode_rgba_f32(
         fill_rgba_row(
             row,
             y,
-            color_left,
-            color_top,
-            alpha_left,
-            alpha_top,
+            color_crop.left,
+            color_crop.top,
+            alpha_crop.left,
+            alpha_crop.top,
             &color,
             &alpha_image,
             color_format,
@@ -226,50 +255,21 @@ pub(crate) fn decode_rgba_f32(
 pub(crate) fn decode_bgr101010(stream: &ParsedCodestream<'_>) -> Result<Vec<u32>> {
     validate_bgr101010_profile(stream)?;
 
-    let width = usize::try_from(stream.header.width).map_err(|_conversion_error| {
-        Error::new(ErrorKind::LimitExceeded("image width"), stream.offset)
-    })?;
-    let height = usize::try_from(stream.header.height).map_err(|_conversion_error| {
-        Error::new(ErrorKind::LimitExceeded("image height"), stream.offset)
-    })?;
-    let pixel_count = width
-        .checked_mul(height)
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded("pixel count"), stream.offset))?;
-
-    if width > MAX_DIMENSION || height > MAX_DIMENSION {
-        return Err(Error::new(
-            ErrorKind::LimitExceeded("image dimension"),
-            stream.offset,
-        ));
-    }
-
-    if pixel_count > MAX_PIXELS {
-        return Err(Error::new(
-            ErrorKind::LimitExceeded("pixel count"),
-            stream.offset,
-        ));
-    }
+    let (width, height, pixel_count) = validated_dimensions(&stream.header, stream.offset)?;
 
     let color = reconstruct(stream)?;
 
-    let left = usize::from(stream.header.margins.left);
-    let top = usize::from(stream.header.margins.top);
+    let crop = crop_rect(
+        stream.header.margins,
+        width,
+        height,
+        stream.offset,
+        "cropped image width",
+        "cropped image height",
+    )?;
+    let (left, top) = (crop.left, crop.top);
 
-    let right = left.checked_add(width).ok_or_else(|| {
-        Error::new(
-            ErrorKind::LimitExceeded("cropped image width"),
-            stream.offset,
-        )
-    })?;
-
-    let bottom = top.checked_add(height).ok_or_else(|| {
-        Error::new(
-            ErrorKind::LimitExceeded("cropped image height"),
-            stream.offset,
-        )
-    })?;
-
-    if color.components != 3 || right > color.width || bottom > color.height {
+    if color.components != 3 || crop.right > color.width || crop.bottom > color.height {
         return Err(Error::new(
             ErrorKind::InvalidCodestream("decoded component dimensions are inconsistent"),
             stream.offset,

@@ -11,7 +11,7 @@ use std::num::NonZeroU64;
 
 use ::gif::{ColorOutput, DecodeOptions, MemoryLimit};
 
-use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
+use super::{DIMENSION_MAX, DecodedImage, Dimensions, DimensionsError, PIXELS_MAX};
 use error::error;
 
 pub use error::{Error, GIFError, GIFLimit, Result};
@@ -174,29 +174,26 @@ fn composite_first_frame(
 }
 
 fn validate_dimensions(width: u32, height: u32) -> Result<()> {
-    if width == 0 || height == 0 {
-        return Err(error(GIFError::Output(
-            "GIF logical-screen dimensions must both be nonzero",
-        )));
-    }
-
-    if width > DIMENSION_MAX || height > DIMENSION_MAX {
-        return Err(error(GIFError::LimitExceeded(GIFLimit::Dimensions {
-            actual_width: width,
-            actual_height: height,
-            max: DIMENSION_MAX,
-        })));
-    }
-
-    let pixels = u64::from(width) * u64::from(height);
-    if pixels > PIXELS_MAX {
-        return Err(error(GIFError::LimitExceeded(GIFLimit::Pixels {
-            actual: pixels,
-            max: PIXELS_MAX,
-        })));
-    }
-
-    Ok(())
+    Dimensions::try_new((width, height))
+        .map(|_| ())
+        .map_err(|dimensions_error| match dimensions_error {
+            DimensionsError::Zero => error(GIFError::Output(
+                "GIF logical-screen dimensions must both be nonzero",
+            )),
+            DimensionsError::TooLarge { width, height } => {
+                error(GIFError::LimitExceeded(GIFLimit::Dimensions {
+                    actual_width: width,
+                    actual_height: height,
+                    max: DIMENSION_MAX,
+                }))
+            }
+            DimensionsError::TooManyPixels { pixels } => {
+                error(GIFError::LimitExceeded(GIFLimit::Pixels {
+                    actual: pixels,
+                    max: PIXELS_MAX,
+                }))
+            }
+        })
 }
 
 fn codec_error(source: ::gif::DecodingError) -> Error {

@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use ::png::{BitDepth, ColorType, Decoder, Limits, Transformations};
 
-use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
+use super::{DIMENSION_MAX, DecodedImage, Dimensions, DimensionsError, PIXELS_MAX};
 use error::error;
 
 pub use error::{Error, PNGError, PNGLimit, Result};
@@ -97,29 +97,26 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
 }
 
 fn validate_dimensions(width: u32, height: u32) -> Result<()> {
-    if width == 0 || height == 0 {
-        return Err(error(PNGError::Output(
-            "PNG dimensions must both be nonzero",
-        )));
-    }
-
-    if width > DIMENSION_MAX || height > DIMENSION_MAX {
-        return Err(error(PNGError::LimitExceeded(PNGLimit::Dimensions {
-            actual_width: width,
-            actual_height: height,
-            max: DIMENSION_MAX,
-        })));
-    }
-
-    let pixels = u64::from(width) * u64::from(height);
-    if pixels > PIXELS_MAX {
-        return Err(error(PNGError::LimitExceeded(PNGLimit::Pixels {
-            actual: pixels,
-            max: PIXELS_MAX,
-        })));
-    }
-
-    Ok(())
+    Dimensions::try_new((width, height))
+        .map(|_| ())
+        .map_err(|dimensions_error| match dimensions_error {
+            DimensionsError::Zero => error(PNGError::Output(
+                "PNG dimensions must both be nonzero",
+            )),
+            DimensionsError::TooLarge { width, height } => {
+                error(PNGError::LimitExceeded(PNGLimit::Dimensions {
+                    actual_width: width,
+                    actual_height: height,
+                    max: DIMENSION_MAX,
+                }))
+            }
+            DimensionsError::TooManyPixels { pixels } => {
+                error(PNGError::LimitExceeded(PNGLimit::Pixels {
+                    actual: pixels,
+                    max: PIXELS_MAX,
+                }))
+            }
+        })
 }
 
 fn rgba_size(width: u32, height: u32) -> Result<usize> {

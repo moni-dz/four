@@ -86,29 +86,37 @@ pub(super) struct ProgressivePlan {
     pub(super) ac_table: usize,
 }
 
-pub(super) fn decode_sequential(
-    entropy: &[u8],
-    frame: &mut Frame,
-    plans: &[SequentialPlan],
-    conditioning: &ConditioningTables,
+// Both the sequential and progressive scan loops walk an MCU grid identically (dimensions,
+// checked-multiply MCU count, restart-marker cadence) and differ only in what happens per MCU.
+fn scan_dimensions(frame: &Frame, plan_count: usize, first_frame_index: usize) -> (u32, u32) {
+    invariant!(plan_count > 0);
+    invariant!(plan_count <= COMPONENTS_MAX);
+
+    if plan_count > 1 {
+        (frame.mcu_columns, frame.mcu_rows)
+    } else {
+        let component = &frame.components[first_frame_index];
+        (component.data_block_columns, component.data_block_rows)
+    }
+}
+
+fn decode_mcu_grid(
+    mut state: ScanState<'_>,
+    mcu_columns: u32,
+    mcu_rows: u32,
     restart_interval: u32,
+    mut decode_mcu: impl FnMut(&mut ScanState<'_>, u32, u32) -> Result<()>,
 ) -> Result<(usize, u8)> {
-    invariant!(!plans.is_empty());
-    invariant!(plans.len() <= COMPONENTS_MAX);
-
-    let (mcu_columns, mcu_rows) = sequential_scan_dimensions(frame, plans);
-
     let mcu_count = mcu_columns
         .checked_mul(mcu_rows)
         .ok_or_raise(|| JPEGError::ArithmeticOverflow("arithmetic MCU count overflowed"))?;
 
-    let mut state = ScanState::new(entropy);
     let mut restart_index = 0_u8;
 
     for mcu_index in 0..mcu_count {
         let mcu_x = mcu_index % mcu_columns;
         let mcu_y = mcu_index / mcu_columns;
-        decode_sequential_mcu(&mut state, frame, plans, conditioning, mcu_x, mcu_y)?;
+        decode_mcu(&mut state, mcu_x, mcu_y)?;
 
         let completed = mcu_index + 1;
         if restart_interval > 0 && completed < mcu_count && completed % restart_interval == 0 {
@@ -120,16 +128,26 @@ pub(super) fn decode_sequential(
     state.decoder.finish()
 }
 
-fn sequential_scan_dimensions(frame: &Frame, plans: &[SequentialPlan]) -> (u32, u32) {
+pub(super) fn decode_sequential(
+    entropy: &[u8],
+    frame: &mut Frame,
+    plans: &[SequentialPlan],
+    conditioning: &ConditioningTables,
+    restart_interval: u32,
+) -> Result<(usize, u8)> {
     invariant!(!plans.is_empty());
     invariant!(plans.len() <= COMPONENTS_MAX);
 
-    if plans.len() > 1 {
-        (frame.mcu_columns, frame.mcu_rows)
-    } else {
-        let component = &frame.components[plans[0].frame_index];
-        (component.data_block_columns, component.data_block_rows)
-    }
+    let (mcu_columns, mcu_rows) = scan_dimensions(frame, plans.len(), plans[0].frame_index);
+    let state = ScanState::new(entropy);
+
+    decode_mcu_grid(
+        state,
+        mcu_columns,
+        mcu_rows,
+        restart_interval,
+        |state, mcu_x, mcu_y| decode_sequential_mcu(state, frame, plans, conditioning, mcu_x, mcu_y),
+    )
 }
 
 fn decode_sequential_mcu(
@@ -218,41 +236,18 @@ pub(super) fn decode_progressive(
     invariant_eq!(plans.len(), scan.components.len());
     invariant!(!plans.is_empty());
 
-    let (mcu_columns, mcu_rows) = progressive_scan_dimensions(frame, plans);
+    let (mcu_columns, mcu_rows) = scan_dimensions(frame, plans.len(), plans[0].frame_index);
+    let state = ScanState::new(entropy);
 
-    let mcu_count = mcu_columns
-        .checked_mul(mcu_rows)
-        .ok_or_raise(|| JPEGError::ArithmeticOverflow("arithmetic MCU count overflowed"))?;
-
-    let mut state = ScanState::new(entropy);
-    let mut restart_index = 0_u8;
-
-    for mcu_index in 0..mcu_count {
-        let mcu_x = mcu_index % mcu_columns;
-        let mcu_y = mcu_index / mcu_columns;
-        decode_progressive_mcu(&mut state, frame, plans, scan, conditioning, mcu_x, mcu_y)?;
-
-        let completed = mcu_index + 1;
-
-        if restart_interval > 0 && completed < mcu_count && completed % restart_interval == 0 {
-            state.restart(0xd0 + restart_index)?;
-            restart_index = (restart_index + 1) & 7;
-        }
-    }
-
-    state.decoder.finish()
-}
-
-fn progressive_scan_dimensions(frame: &Frame, plans: &[ProgressivePlan]) -> (u32, u32) {
-    invariant!(!plans.is_empty());
-    invariant!(plans.len() <= COMPONENTS_MAX);
-
-    if plans.len() > 1 {
-        (frame.mcu_columns, frame.mcu_rows)
-    } else {
-        let component = &frame.components[plans[0].frame_index];
-        (component.data_block_columns, component.data_block_rows)
-    }
+    decode_mcu_grid(
+        state,
+        mcu_columns,
+        mcu_rows,
+        restart_interval,
+        |state, mcu_x, mcu_y| {
+            decode_progressive_mcu(state, frame, plans, scan, conditioning, mcu_x, mcu_y)
+        },
+    )
 }
 
 fn decode_progressive_mcu(
@@ -270,7 +265,7 @@ fn decode_progressive_mcu(
     if plans.len() == 1 {
         let plan = &plans[0];
         let component = &mut frame.components[plan.frame_index];
-        let index = coefficient_index(component, mcu_x, mcu_y)?;
+        let index = coefficient_index(component, BlockX(mcu_x), BlockY(mcu_y))?;
         return decode_progressive_block(
             state,
             &mut component.coefficients[index],
@@ -301,7 +296,7 @@ fn decode_progressive_interleaved(
             for block_x in 0..plan.horizontal_sampling {
                 let x = mcu_x * u32::from(plan.horizontal_sampling) + u32::from(block_x);
                 let y = mcu_y * u32::from(plan.vertical_sampling) + u32::from(block_y);
-                let index = coefficient_index(component, x, y)?;
+                let index = coefficient_index(component, BlockX(x), BlockY(y))?;
                 decode_progressive_block(
                     state,
                     &mut component.coefficients[index],
@@ -316,9 +311,21 @@ fn decode_progressive_interleaved(
     Ok(())
 }
 
-fn coefficient_index(component: &FrameComponent, block_x: u32, block_y: u32) -> Result<usize> {
+/// A block-grid column, distinct from [`BlockY`] so `coefficient_index` cannot receive them
+/// swapped.
+#[derive(Clone, Copy)]
+struct BlockX(u32);
+
+/// A block-grid row, distinct from [`BlockX`] so `coefficient_index` cannot receive them swapped.
+#[derive(Clone, Copy)]
+struct BlockY(u32);
+
+fn coefficient_index(component: &FrameComponent, block_x: BlockX, block_y: BlockY) -> Result<usize> {
     invariant!(component.block_columns > 0);
     invariant!(component.block_rows > 0);
+
+    let block_x = block_x.0;
+    let block_y = block_y.0;
 
     if block_x >= component.block_columns || block_y >= component.block_rows {
         return Err(error(JPEGError::Scan(
@@ -572,11 +579,19 @@ fn decode_ac_value(
         } else {
             AC_MAGNITUDE_CATEGORY_CONTEXT_HIGH
         };
-        (magnitude, context) = decode_magnitude_category_ac(state, table, context, magnitude)?;
+        invariant_eq!(magnitude, 2);
+        (magnitude, context) = state.decode_magnitude_category(
+            ScanState::decode_ac,
+            table,
+            context,
+            magnitude,
+            13,
+            "arithmetic AC coefficient magnitude overflowed",
+        )?;
     }
 
-    let value = decode_magnitude_bits_ac(
-        state,
+    let value = state.decode_magnitude_bits(
+        ScanState::decode_ac,
         table,
         context + MAGNITUDE_BITS_CONTEXT_OFFSET,
         magnitude,
@@ -584,54 +599,6 @@ fn decode_ac_value(
     let signed = i32::from(value) + 1;
 
     if sign == 0 { Ok(signed) } else { Ok(-signed) }
-}
-
-fn decode_magnitude_category_ac(
-    state: &mut ScanState<'_>,
-    table: usize,
-    mut context: usize,
-    mut magnitude: u16,
-) -> Result<(u16, usize)> {
-    invariant_eq!(magnitude, 2);
-    invariant!(
-        context == AC_MAGNITUDE_CATEGORY_CONTEXT_LOW
-            || context == AC_MAGNITUDE_CATEGORY_CONTEXT_HIGH
-    );
-
-    let mut decisions = 0_u8;
-
-    while state.decode_ac(table, context)? != 0 {
-        magnitude <<= 1;
-        decisions += 1;
-        if magnitude == 0x8000 || decisions > 13 {
-            return Err(error(JPEGError::Entropy(
-                "arithmetic AC coefficient magnitude overflowed",
-            )));
-        }
-        context += 1;
-    }
-
-    Ok((magnitude, context))
-}
-
-fn decode_magnitude_bits_ac(
-    state: &mut ScanState<'_>,
-    table: usize,
-    context: usize,
-    mut magnitude: u16,
-) -> Result<u16> {
-    invariant!(context < AC_STATISTICS_COUNT);
-    invariant!(magnitude < 0x8000);
-
-    let mut value = magnitude;
-    while magnitude > 1 {
-        magnitude >>= 1;
-        if state.decode_ac(table, context)? != 0 {
-            value |= magnitude;
-        }
-    }
-
-    Ok(value)
 }
 
 fn scale(value: i32, successive_low: u8) -> Result<i32> {
@@ -724,12 +691,21 @@ impl<'a> ScanState<'a> {
         let mut magnitude = u16::from(self.decode_dc(table, context)?);
         if magnitude != 0 {
             context = DC_MAGNITUDE_CATEGORY_CONTEXT;
-            (magnitude, context) = self.decode_dc_magnitude_category(table, context, magnitude)?;
+            invariant_eq!(magnitude, 1);
+            (magnitude, context) = self.decode_magnitude_category(
+                ScanState::decode_dc,
+                table,
+                context,
+                magnitude,
+                14,
+                "arithmetic DC coefficient magnitude overflowed",
+            )?;
         }
 
         self.dc_contexts[predictor_index] = dc_context(magnitude, sign, conditioning);
 
-        let value = self.decode_dc_magnitude_bits(
+        let value = self.decode_magnitude_bits(
+            ScanState::decode_dc,
             table,
             context + MAGNITUDE_BITS_CONTEXT_OFFSET,
             magnitude,
@@ -738,42 +714,43 @@ impl<'a> ScanState<'a> {
         if sign == 0 { Ok(signed) } else { Ok(-signed) }
     }
 
-    fn decode_dc_magnitude_category(
+    // Shared by both the DC (`decode_dc`) and AC (`decode_ac`) magnitude-decoding paths, which
+    // walk an identical context-run/magnitude-bit shape (ITU-T T.81 Annex F) and differ only in
+    // which statistics table backs the bit decode and how many decisions the run may take.
+    fn decode_magnitude_category(
         &mut self,
+        decode_bit: fn(&mut Self, usize, usize) -> Result<u8>,
         table: usize,
         mut context: usize,
         mut magnitude: u16,
+        max_decisions: u8,
+        overflow_message: &'static str,
     ) -> Result<(u16, usize)> {
-        invariant_eq!(magnitude, 1);
-        invariant_eq!(context, DC_MAGNITUDE_CATEGORY_CONTEXT);
-
         let mut decisions = 0_u8;
-        while self.decode_dc(table, context)? != 0 {
+        while decode_bit(self, table, context)? != 0 {
             magnitude <<= 1;
             decisions += 1;
-            if magnitude == 0x8000 || decisions > 14 {
-                return Err(error(JPEGError::Entropy(
-                    "arithmetic DC coefficient magnitude overflowed",
-                )));
+            if magnitude == 0x8000 || decisions > max_decisions {
+                return Err(error(JPEGError::Entropy(overflow_message)));
             }
             context += 1;
         }
         Ok((magnitude, context))
     }
 
-    fn decode_dc_magnitude_bits(
+    fn decode_magnitude_bits(
         &mut self,
+        decode_bit: fn(&mut Self, usize, usize) -> Result<u8>,
         table: usize,
         context: usize,
         mut magnitude: u16,
     ) -> Result<u16> {
-        invariant!(context < DC_STATISTICS_COUNT);
         invariant!(magnitude < 0x8000);
 
         let mut value = magnitude;
         while magnitude > 1 {
             magnitude >>= 1;
-            if self.decode_dc(table, context)? != 0 {
+            if decode_bit(self, table, context)? != 0 {
                 value |= magnitude;
             }
         }

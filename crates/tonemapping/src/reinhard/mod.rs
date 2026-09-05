@@ -170,7 +170,7 @@ impl LuminanceWhitePoint {
 
     /// Returns the linear luminance represented by this white point.
     #[must_use]
-    pub const fn luminance(self) -> f32 {
+    pub fn luminance(self) -> f32 {
         self.0.level()
     }
 }
@@ -263,6 +263,10 @@ impl LuminanceWhitePointEstimator {
     ///
     /// Both estimators must have been created with the same pixel count, so that they retain the
     /// same number of samples. This is what lets a caller split an image across worker threads.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the estimators declare different pixel counts or retained sample counts.
     pub fn merge(&mut self, other: Self) {
         assert_eq!(
             self.expected, other.expected,

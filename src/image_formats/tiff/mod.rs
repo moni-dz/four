@@ -10,11 +10,10 @@ use std::io::Cursor;
 
 use ::tiff::ColorType;
 use ::tiff::decoder::{BufferLayoutPreference, Decoder, DecodingResult, Limits};
-use rayon::prelude::*;
+use nutype::nutype;
 
 use super::{
-    DIMENSION_MAX, DecodedImage, PARALLEL_PIXELS_MIN, PARALLEL_PIXELS_PER_JOB, PIXELS_MAX,
-    RGBA_BYTES_PER_PIXEL,
+    DIMENSION_MAX, DecodedImage, Dimensions, DimensionsError, PIXELS_MAX, rgba_pixel_rows,
 };
 use error::error;
 
@@ -115,16 +114,24 @@ enum PixelKind {
     CMYKA,
 }
 
+/// A TIFF sample's declared bit depth, already known to be within the `1..=64` range this decoder
+/// scales to eight bits.
+#[nutype(
+    validate(greater_or_equal = 1, less_or_equal = 64),
+    derive(Clone, Copy, Debug, Eq, PartialEq)
+)]
+struct BitDepth(u8);
+
 #[derive(Clone, Copy, Debug)]
 struct PixelFormat {
     kind: PixelKind,
     channels: usize,
-    bit_depth: u8,
+    bit_depth: BitDepth,
 }
 
 impl PixelFormat {
     fn from_color(color: ColorType) -> Result<Self> {
-        let (kind, channels, bit_depth) = match color {
+        let (kind, channels, depth) = match color {
             ColorType::Gray(depth) => (PixelKind::Grayscale, 1, depth),
             ColorType::GrayA(depth) => (PixelKind::GrayscaleAlpha, 2, depth),
             ColorType::RGB(depth) => (PixelKind::RGB, 3, depth),
@@ -138,11 +145,11 @@ impl PixelFormat {
             }
         };
 
-        if !(1..=64).contains(&bit_depth) {
-            return Err(error(TIFFError::Unsupported(format!(
-                "{bit_depth}-bit integer samples are not supported"
-            ))));
-        }
+        let bit_depth = BitDepth::try_new(depth).map_err(|_out_of_range| {
+            error(TIFFError::Unsupported(format!(
+                "{depth}-bit integer samples are not supported"
+            )))
+        })?;
 
         Ok(Self {
             kind,
@@ -216,33 +223,30 @@ impl SampleLayout {
 }
 
 fn validate_dimensions(width: u32, height: u32) -> Result<()> {
-    if width == 0 || height == 0 {
-        return Err(error(TIFFError::Output(
-            "TIFF dimensions must both be nonzero",
-        )));
-    }
-
-    if width > DIMENSION_MAX || height > DIMENSION_MAX {
-        return Err(error(TIFFError::LimitExceeded(TIFFLimit::Dimensions {
-            actual_width: width,
-            actual_height: height,
-            max: DIMENSION_MAX,
-        })));
-    }
-
-    let pixels = u64::from(width) * u64::from(height);
-    if pixels > PIXELS_MAX {
-        return Err(error(TIFFError::LimitExceeded(TIFFLimit::Pixels {
-            actual: pixels,
-            max: PIXELS_MAX,
-        })));
-    }
-
-    Ok(())
+    Dimensions::try_new((width, height))
+        .map(|_| ())
+        .map_err(|dimensions_error| match dimensions_error {
+            DimensionsError::Zero => error(TIFFError::Output(
+                "TIFF dimensions must both be nonzero",
+            )),
+            DimensionsError::TooLarge { width, height } => {
+                error(TIFFError::LimitExceeded(TIFFLimit::Dimensions {
+                    actual_width: width,
+                    actual_height: height,
+                    max: DIMENSION_MAX,
+                }))
+            }
+            DimensionsError::TooManyPixels { pixels } => {
+                error(TIFFError::LimitExceeded(TIFFLimit::Pixels {
+                    actual: pixels,
+                    max: PIXELS_MAX,
+                }))
+            }
+        })
 }
 
 fn validate_raw_size(width: u32, height: u32, format: PixelFormat) -> Result<u64> {
-    let sample_bytes = u64::from(format.bit_depth).div_ceil(8);
+    let sample_bytes = u64::from(format.bit_depth.into_inner()).div_ceil(8);
     let bytes = u64::from(width)
         * u64::from(height)
         * u64::try_from(format.channels).expect("TIFF channel count fits u64")
@@ -282,33 +286,9 @@ fn normalize_unsigned_with_layout<T: Copy + Sync>(
     layout: SampleLayout,
     into_u64: &(impl Fn(T) -> u64 + Sync),
 ) -> Result<Vec<u8>> {
-    if width * height >= PARALLEL_PIXELS_MIN {
-        let mut rgba = vec![0; width * height * 4];
-        // Chunk by row, not by pixel. Chunking by pixel throws the coordinates away and then
-        // recovers them with a division and a remainder per pixel; the row index comes free from
-        // the chunk index, and the column is an induction variable.
-        rgba.par_chunks_mut(width * RGBA_BYTES_PER_PIXEL as usize)
-            .with_min_len(PARALLEL_PIXELS_PER_JOB / width.max(1))
-            .enumerate()
-            .try_for_each(|(y, row)| {
-                let (targets, remainder) = row.as_chunks_mut::<4>();
-                invariant_eq!(remainder.len(), 0);
-
-                for (x, target) in targets.iter_mut().enumerate() {
-                    *target = normalize_pixel(samples, x, y, format, layout, into_u64)?;
-                }
-                Ok::<(), Error>(())
-            })?;
-        Ok(rgba)
-    } else {
-        let mut rgba = Vec::with_capacity(width * height * 4);
-        for y in 0..height {
-            for x in 0..width {
-                rgba.extend_from_slice(&normalize_pixel(samples, x, y, format, layout, into_u64)?);
-            }
-        }
-        Ok(rgba)
-    }
+    rgba_pixel_rows(width, height, |x, y| {
+        normalize_pixel(samples, x, y, format, layout, into_u64)
+    })
 }
 
 fn normalize_pixel<T: Copy>(
@@ -353,7 +333,8 @@ fn normalize_pixel<T: Copy>(
     }
 }
 
-fn scale_sample(value: u64, bit_depth: u8) -> u8 {
+fn scale_sample(value: u64, bit_depth: BitDepth) -> u8 {
+    let bit_depth = bit_depth.into_inner();
     let max = if bit_depth == 64 {
         u64::MAX
     } else {
@@ -398,7 +379,7 @@ mod tests {
         let format = PixelFormat {
             kind: PixelKind::RGBA,
             channels: 4,
-            bit_depth: 8,
+            bit_depth: BitDepth::try_new(8).expect("8 is a valid TIFF bit depth"),
         };
         let layout = SampleLayout {
             row_stride: width * 4,

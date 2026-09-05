@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 multiversion = { workspace = true }
+nutype = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

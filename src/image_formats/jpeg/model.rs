@@ -2,11 +2,12 @@
 
 use exn::OptionExt;
 use rayon::prelude::*;
+use std::convert::Infallible;
 
 use super::{
-    BLOCK_SIDE, COMPONENTS_MAX, DIMENSION_MAX, DecodedImage, Error, JPEGError, JPEGLimit,
-    JPEGTableKind, PARALLEL_PIXELS_MIN, PARALLEL_PIXELS_PER_JOB, PIXELS_MAX,
-    PROGRESSIVE_COEFFICIENT_BYTES_MAX, Result, divide_ceil, error, idct,
+    BLOCK_SIDE, COMPONENTS_MAX, DIMENSION_MAX, DecodedImage, Dimensions, DimensionsError, Error,
+    JPEGError, JPEGLimit, JPEGTableKind, PIXELS_MAX, PROGRESSIVE_COEFFICIENT_BYTES_MAX, Result,
+    divide_ceil, error, idct, rgba_pixel_rows,
 };
 
 const PARALLEL_BLOCKS_MIN: usize = 4 * 1024;
@@ -17,6 +18,14 @@ pub(super) enum ColorTransform {
     YCbCr,
     RGB,
 }
+
+/// A pixel column, distinct from [`PixelY`] so `rgba_pixel`/`sample` cannot receive them swapped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PixelX(u32);
+
+/// A pixel row, distinct from [`PixelX`] so `rgba_pixel`/`sample` cannot receive them swapped.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PixelY(u32);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum CodingProcess {
@@ -150,57 +159,21 @@ impl Frame {
         invariant!(self.components.len() == 1 || self.components.len() == 3);
         invariant!(u64::from(self.width) * u64::from(self.height) <= PIXELS_MAX);
 
-        let byte_count = u64::from(self.width) * u64::from(self.height) * 4;
+        let width = usize::try_from(self.width).expect("validated JPEG width fits usize");
+        let height = usize::try_from(self.height).expect("validated JPEG height fits usize");
 
-        let capacity = usize::try_from(byte_count)
-            .expect("the decoded pixel limit fits every supported pointer width");
+        let rgba: Vec<u8> = rgba_pixel_rows(width, height, |x, y| {
+            let x = PixelX(u32::try_from(x).expect("JPEG pixel x fits u32"));
+            let y = PixelY(u32::try_from(y).expect("JPEG pixel y fits u32"));
+            Ok::<_, Infallible>(self.rgba_pixel(x, y, transform))
+        })
+        .unwrap_or_else(|never| match never {});
 
-        let pixel_count = capacity / 4;
-
-        let rgba = if pixel_count >= PARALLEL_PIXELS_MIN {
-            self.rgba_pixels_parallel(transform, capacity)
-        } else {
-            self.rgba_pixels_sequential(transform, capacity)
-        };
-
-        invariant_eq!(rgba.len(), capacity);
+        invariant_eq!(rgba.len(), width * height * 4);
         DecodedImage::new(self.width, self.height, rgba)
     }
 
-    fn rgba_pixels_sequential(&self, transform: ColorTransform, capacity: usize) -> Vec<u8> {
-        let mut rgba = Vec::with_capacity(capacity);
-        for y in 0..self.height {
-            for x in 0..self.width {
-                rgba.extend_from_slice(&self.rgba_pixel(x, y, transform));
-            }
-        }
-        rgba
-    }
-
-    fn rgba_pixels_parallel(&self, transform: ColorTransform, capacity: usize) -> Vec<u8> {
-        let width = usize::try_from(self.width).expect("validated JPEG width fits usize");
-        let mut rgba = vec![0; capacity];
-
-        // Chunk by row, not by pixel. Chunking by pixel discards the coordinates and then recovers
-        // them with a division and a remainder per pixel; as rows, the row index is the chunk index
-        // and the column is an induction variable.
-        rgba.par_chunks_mut(width * 4)
-            .with_min_len(PARALLEL_PIXELS_PER_JOB / width.max(1))
-            .enumerate()
-            .for_each(|(row_index, row)| {
-                let y = u32::try_from(row_index).expect("JPEG pixel y fits u32");
-                let (targets, remainder) = row.as_chunks_mut::<4>();
-                invariant_eq!(remainder.len(), 0);
-
-                for (column_index, target) in targets.iter_mut().enumerate() {
-                    let x = u32::try_from(column_index).expect("JPEG pixel x fits u32");
-                    *target = self.rgba_pixel(x, y, transform);
-                }
-            });
-        rgba
-    }
-
-    fn rgba_pixel(&self, x: u32, y: u32, transform: ColorTransform) -> [u8; 4] {
+    fn rgba_pixel(&self, x: PixelX, y: PixelY, transform: ColorTransform) -> [u8; 4] {
         let first = self.sample(0, x, y);
         if self.components.len() == 1 {
             [first, first, first, 255]
@@ -211,10 +184,10 @@ impl Frame {
         }
     }
 
-    pub(super) fn sample(&self, component_index: usize, x: u32, y: u32) -> u8 {
+    pub(super) fn sample(&self, component_index: usize, x: PixelX, y: PixelY) -> u8 {
         invariant!(component_index < self.components.len());
-        invariant!(x < self.width);
-        invariant!(y < self.height);
+        invariant!(x.0 < self.width);
+        invariant!(y.0 < self.height);
 
         let component = &self.components[component_index];
 
@@ -223,14 +196,14 @@ impl Frame {
         // divisions out of the per-pixel path, and it predicts perfectly because the sampling
         // factors are fixed for the whole frame.
         let sample_x = if component.horizontal_sampling == self.max_horizontal_sampling {
-            x
+            x.0
         } else {
-            x * u32::from(component.horizontal_sampling) / u32::from(self.max_horizontal_sampling)
+            x.0 * u32::from(component.horizontal_sampling) / u32::from(self.max_horizontal_sampling)
         };
         let sample_y = if component.vertical_sampling == self.max_vertical_sampling {
-            y
+            y.0
         } else {
-            y * u32::from(component.vertical_sampling) / u32::from(self.max_vertical_sampling)
+            y.0 * u32::from(component.vertical_sampling) / u32::from(self.max_vertical_sampling)
         };
 
         let index = u64::from(sample_y) * u64::from(component.plane_width) + u64::from(sample_x);
@@ -491,26 +464,23 @@ fn clamp_color(value: f32) -> u8 {
 }
 
 pub(super) fn validate_dimensions(width: u32, height: u32) -> Result<()> {
-    if width == 0 || height == 0 {
-        return Err(error(JPEGError::Frame("JPEG dimensions must be nonzero")));
-    }
-
-    if width > DIMENSION_MAX || height > DIMENSION_MAX {
-        return Err(error(JPEGError::LimitExceeded(JPEGLimit::Dimensions {
-            actual: width.max(height),
-            max: DIMENSION_MAX,
-        })));
-    }
-
-    let pixel_count = u64::from(width) * u64::from(height);
-    if pixel_count > PIXELS_MAX {
-        return Err(error(JPEGError::LimitExceeded(JPEGLimit::Pixels {
-            actual: pixel_count,
-            max: PIXELS_MAX,
-        })));
-    }
-
-    Ok(())
+    Dimensions::try_new((width, height))
+        .map(|_| ())
+        .map_err(|dimensions_error| match dimensions_error {
+            DimensionsError::Zero => error(JPEGError::Frame("JPEG dimensions must be nonzero")),
+            DimensionsError::TooLarge { width, height } => {
+                error(JPEGError::LimitExceeded(JPEGLimit::Dimensions {
+                    actual: width.max(height),
+                    max: DIMENSION_MAX,
+                }))
+            }
+            DimensionsError::TooManyPixels { pixels } => {
+                error(JPEGError::LimitExceeded(JPEGLimit::Pixels {
+                    actual: pixels,
+                    max: PIXELS_MAX,
+                }))
+            }
+        })
 }
 
 #[cfg(test)]

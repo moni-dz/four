@@ -86,7 +86,10 @@ const ZOOM_KEY_STEP: f32 = 1.25;
 /// Assumed line height for normalizing line-based scroll deltas into pixels.
 const SCROLL_LINE_HEIGHT: f32 = 24.0;
 
-actions!(four, [Quit, OpenFile, ZoomIn, ZoomOut, ZoomReset, DismissMenu]);
+actions!(
+    four,
+    [Quit, OpenFile, ZoomIn, ZoomOut, ZoomReset, DismissMenu]
+);
 
 /// Scale that fits an `image_w`×`image_h` image inside `content_w`×`content_h`, preserving
 /// aspect ratio (matches gpui's `ObjectFit::Contain`, which this replaces).
@@ -1040,13 +1043,63 @@ impl Root {
         .priority(2)
     }
 
+    fn on_image_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        content_w: Pixels,
+        content_h: Pixels,
+        width: u32,
+        height: u32,
+        cx: &mut Context<Self>,
+    ) {
+        let delta = event.delta.pixel_delta(px(SCROLL_LINE_HEIGHT));
+        let step = f32::from(delta.y) / SCROLL_LINE_HEIGHT;
+        let new_zoom = (self.zoom * ZOOM_STEP_BASE.powf(step)).clamp(ZOOM_MIN, ZOOM_MAX);
+        if (new_zoom - self.zoom).abs() > f32::EPSILON {
+            let base_scale = fit_scale(content_w, content_h, width, height);
+            let cursor_offset = point(
+                event.position.x - content_w * 0.5,
+                event.position.y - px(DRAG_REGION_HEIGHT) - content_h * 0.5,
+            );
+            self.pan = zoom_to_cursor_pan(
+                cursor_offset,
+                self.pan,
+                base_scale * self.zoom,
+                base_scale * new_zoom,
+            );
+            self.zoom = new_zoom;
+            cx.notify();
+        }
+    }
+
+    fn on_image_drag_start(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
+        if (self.zoom - 1.0).abs() > f32::EPSILON {
+            self.drag_anchor = Some(event.position);
+            cx.notify();
+        }
+    }
+
+    fn on_image_drag_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
+        let Some(anchor_mouse) = self.drag_anchor else {
+            return;
+        };
+        if event.pressed_button != Some(MouseButton::Left) {
+            return;
+        }
+        self.pan += event.position - anchor_mouse;
+        self.drag_anchor = Some(event.position);
+        cx.notify();
+    }
+
+    fn on_image_drag_end(&mut self, cx: &mut Context<Self>) {
+        if self.drag_anchor.take().is_some() {
+            cx.notify();
+        }
+    }
+
     #[expect(
         clippy::cast_precision_loss,
         reason = "image dimensions stay far below f32's 2^24 exact-integer range"
-    )]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "sizing, pan clamping, and zoom/pan input handling for the image view belong together"
     )]
     fn render_image_content(
         &mut self,
@@ -1086,53 +1139,22 @@ impl Root {
                     content
                         .on_scroll_wheel(cx.listener(
                             move |root, event: &ScrollWheelEvent, _, cx| {
-                                let delta = event.delta.pixel_delta(px(SCROLL_LINE_HEIGHT));
-                                let step = f32::from(delta.y) / SCROLL_LINE_HEIGHT;
-                                let new_zoom = (root.zoom * ZOOM_STEP_BASE.powf(step))
-                                    .clamp(ZOOM_MIN, ZOOM_MAX);
-                                if (new_zoom - root.zoom).abs() > f32::EPSILON {
-                                    let base_scale = fit_scale(content_w, content_h, width, height);
-                                    let cursor_offset = point(
-                                        event.position.x - content_w * 0.5,
-                                        event.position.y - px(DRAG_REGION_HEIGHT) - content_h * 0.5,
-                                    );
-                                    root.pan = zoom_to_cursor_pan(
-                                        cursor_offset,
-                                        root.pan,
-                                        base_scale * root.zoom,
-                                        base_scale * new_zoom,
-                                    );
-                                    root.zoom = new_zoom;
-                                    cx.notify();
-                                }
+                                root.on_image_scroll(event, content_w, content_h, width, height, cx);
                             },
                         ))
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |root, event: &MouseDownEvent, _, cx| {
-                                if (root.zoom - 1.0).abs() > f32::EPSILON {
-                                    root.drag_anchor = Some(event.position);
-                                    cx.notify();
-                                }
+                            cx.listener(|root, event: &MouseDownEvent, _, cx| {
+                                root.on_image_drag_start(event, cx);
                             }),
                         )
                         .on_mouse_move(cx.listener(move |root, event: &MouseMoveEvent, _, cx| {
-                            let Some(anchor_mouse) = root.drag_anchor else {
-                                return;
-                            };
-                            if event.pressed_button != Some(MouseButton::Left) {
-                                return;
-                            }
-                            root.pan += event.position - anchor_mouse;
-                            root.drag_anchor = Some(event.position);
-                            cx.notify();
+                            root.on_image_drag_move(event, cx);
                         }))
                         .on_mouse_up(
                             MouseButton::Left,
                             cx.listener(|root, _: &MouseUpEvent, _, cx| {
-                                if root.drag_anchor.take().is_some() {
-                                    cx.notify();
-                                }
+                                root.on_image_drag_end(cx);
                             }),
                         )
                         .child(

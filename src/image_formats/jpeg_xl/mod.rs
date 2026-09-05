@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use jxl_oxide::{AllocTracker, EnumColourEncoding, JxlImage, PixelFormat, RenderingIntent};
 
-use super::{DIMENSION_MAX, DecodedImage, PIXELS_MAX};
+use super::{DIMENSION_MAX, DecodedImage, Dimensions, DimensionsError, PIXELS_MAX};
 
 use error::error;
 pub use error::{Error, JPEGXLError, JPEGXLLimit, Result};
@@ -100,28 +100,26 @@ pub fn decode(bytes: impl AsRef<[u8]>) -> Result<DecodedImage> {
 }
 
 fn validate_dimensions(width: u32, height: u32) -> Result<()> {
-    if width == 0 || height == 0 {
-        return Err(error(JPEGXLError::Output(
-            "JPEG XL dimensions must both be nonzero",
-        )));
-    }
-
-    if width > DIMENSION_MAX || height > DIMENSION_MAX {
-        return Err(error(JPEGXLError::LimitExceeded(JPEGXLLimit::Dimensions {
-            actual_width: width,
-            actual_height: height,
-            max: DIMENSION_MAX,
-        })));
-    }
-
-    if u64::from(width) * u64::from(height) > PIXELS_MAX {
-        return Err(error(JPEGXLError::LimitExceeded(JPEGXLLimit::Pixels {
-            actual: u64::from(width) * u64::from(height),
-            max: PIXELS_MAX,
-        })));
-    }
-
-    Ok(())
+    Dimensions::try_new((width, height))
+        .map(|_| ())
+        .map_err(|dimensions_error| match dimensions_error {
+            DimensionsError::Zero => error(JPEGXLError::Output(
+                "JPEG XL dimensions must both be nonzero",
+            )),
+            DimensionsError::TooLarge { width, height } => {
+                error(JPEGXLError::LimitExceeded(JPEGXLLimit::Dimensions {
+                    actual_width: width,
+                    actual_height: height,
+                    max: DIMENSION_MAX,
+                }))
+            }
+            DimensionsError::TooManyPixels { pixels } => {
+                error(JPEGXLError::LimitExceeded(JPEGXLLimit::Pixels {
+                    actual: pixels,
+                    max: PIXELS_MAX,
+                }))
+            }
+        })
 }
 
 fn pixel_count(width: u32, height: u32) -> Result<usize> {
