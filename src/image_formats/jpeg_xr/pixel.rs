@@ -3,14 +3,17 @@
 //! twin where the hot pixel-writing loops in `normalize` need it).
 
 use std::simd::{
-    Simd,
+    Simd, StdFloat,
     num::{SimdFloat, SimdUint},
 };
+use std::sync::LazyLock;
 
 use tonemapping::{exp2, log2};
 use zerocopy::FromBytes;
 
-use super::{F32x4, JPEGXRError, Result, SC_RGB_REFERENCE_WHITE_NITS, error};
+#[cfg(test)]
+use super::F32x4;
+use super::{JPEGXRError, Result, SC_RGB_REFERENCE_WHITE_NITS, error};
 
 #[expect(
     dead_code,
@@ -187,7 +190,10 @@ pub(super) fn decode_rgba128_float(pixel: &[u8]) -> ([f32; 3], f32) {
 
     let sample = |channel: usize| read_sample::<f32>(&pixel[channel * 4..channel * 4 + 4]);
 
-    ([sample(0), sample(1), sample(2)], normalize_alpha(sample(3)))
+    (
+        [sample(0), sample(1), sample(2)],
+        normalize_alpha(sample(3)),
+    )
 }
 
 #[inline]
@@ -206,26 +212,85 @@ pub(super) fn decode_rgba128_float_simd<const N: usize>(
     }
 
     (
-        [Simd::from_array(red), Simd::from_array(green), Simd::from_array(blue)],
+        [
+            Simd::from_array(red),
+            Simd::from_array(green),
+            Simd::from_array(blue),
+        ],
         Simd::from_array(alpha),
     )
 }
 
 pub(super) fn decode_bgr101010(pixel: &[u8]) -> [f32; 3] {
-    rec2100_pq_to_scrgb(unpack_bgr101010(pixel))
+    decode_bgr101010_simd(Simd::<u32, 1>::splat(read_sample(pixel))).map(|channel| channel[0])
 }
+
+// All 10-bit PQ inputs fit in 4 KiB. Evaluate the existing transfer function once,
+// preserving its exact f32 results instead of repeating log2/exp2 for every pixel.
+static PQ_10BIT: LazyLock<[f32; 1024]> = LazyLock::new(|| {
+    std::array::from_fn(|code| {
+        let encoded = f32::from(u16::try_from(code).expect("10-bit PQ code")) * (1.0 / 1023.0);
+        pq_to_linear_simd(Simd::<f32, 1>::splat(encoded))[0]
+    })
+});
 
 #[inline]
 pub(super) fn decode_bgr101010_simd<const N: usize>(packed: Simd<u32, N>) -> [Simd<f32, N>; 3] {
     const MASK: u32 = 0x03ff;
-    const SCALE: f32 = 1.0 / 1023.0;
 
-    let encoded = [20, 10, 0].map(|shift| {
-        ((packed >> Simd::splat(shift)) & Simd::splat(MASK)).cast::<f32>() * Simd::splat(SCALE)
-    });
-    rec2100_pq_to_scrgb_simd(encoded)
+    let linear =
+        [20, 10, 0].map(|shift| gather_pq((packed >> Simd::splat(shift)) & Simd::splat(MASK)));
+    rec2100_linear_to_scrgb_simd(linear)
 }
 
+/// Looks up `indexes` (each `0..1024`) in [`PQ_10BIT`].
+///
+/// `Simd::gather_or`'s index type is pointer-width, so the portable path pays for a
+/// software-widened per-lane address computation and scalarizes instead of using a real
+/// gather instruction. On x86-64/AVX2, where a hardware gather takes 32-bit indices
+/// directly, call it explicitly instead.
+#[inline]
+#[expect(
+    unsafe_code,
+    reason = "AVX2 gather needs 32-bit indices, unreachable through the safe portable_simd API"
+)]
+fn gather_pq<const N: usize>(indexes: Simd<u32, N>) -> Simd<f32, N> {
+    #[cfg(target_arch = "x86_64")]
+    if N == 8 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: `N == 8` was just checked, so `Simd<u32, N>` and `Simd<u32, 8>` are the
+        // same type at this monomorphization.
+        let indexes = unsafe { core::mem::transmute_copy::<Simd<u32, N>, Simd<u32, 8>>(&indexes) };
+        // SAFETY: AVX2 support was just confirmed at runtime.
+        let gathered = unsafe { gather_pq_avx2(indexes) };
+        // SAFETY: `N == 8` was just checked, so `Simd<f32, 8>` and `Simd<f32, N>` are the
+        // same type at this monomorphization.
+        return unsafe { core::mem::transmute_copy::<Simd<f32, 8>, Simd<f32, N>>(&gathered) };
+    }
+
+    Simd::gather_or(&*PQ_10BIT, indexes.cast(), Simd::splat(0.0))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[expect(
+    unsafe_code,
+    reason = "AVX2 gather needs 32-bit indices, unreachable through the safe portable_simd API"
+)]
+unsafe fn gather_pq_avx2(indexes: Simd<u32, 8>) -> Simd<f32, 8> {
+    use std::arch::x86_64::{__m256, __m256i, _mm256_i32gather_ps};
+
+    // SAFETY: the caller (`gather_pq`) confirmed AVX2 support. `indexes` is masked to
+    // `0..1024` by every caller of `gather_pq`, so every gathered address stays inside
+    // `PQ_10BIT` (a 1024-entry, 4 KiB table).
+    unsafe {
+        let indexes: __m256i = core::mem::transmute(indexes);
+        let table = PQ_10BIT.as_ptr();
+        let gathered: __m256 = _mm256_i32gather_ps::<4>(table, indexes);
+        core::mem::transmute(gathered)
+    }
+}
+
+#[cfg(test)]
 pub(super) fn unpack_bgr101010(pixel: &[u8]) -> [f32; 3] {
     const MASK: u32 = 0x03ff;
     const SCALE: f32 = 1.0 / 1023.0;
@@ -242,40 +307,36 @@ pub(super) fn unpack_bgr101010(pixel: &[u8]) -> [f32; 3] {
     [channel(20), channel(10), channel(0)]
 }
 
-fn rec2100_pq_to_scrgb(encoded: [f32; 3]) -> [f32; 3] {
-    const REC2100_MAX_NITS: f32 = 10_000.0;
+// REC2100_MAX_NITS / SC_RGB_REFERENCE_WHITE_NITS folded into the matrix at compile time so
+// the runtime path skips a fourth multiply per output channel.
+const REC2100_MAX_NITS: f32 = 10_000.0;
+const REC2100_TO_SCRGB: [[f32; 3]; 3] = {
     const SCALE: f32 = REC2100_MAX_NITS / SC_RGB_REFERENCE_WHITE_NITS;
+    [
+        [1.660_491 * SCALE, -0.587_641 * SCALE, -0.072_850 * SCALE],
+        [-0.124_550 * SCALE, 1.132_9 * SCALE, -0.008_349 * SCALE],
+        [-0.018_151 * SCALE, -0.100_579 * SCALE, 1.118_73 * SCALE],
+    ]
+};
 
+#[cfg(test)]
+fn rec2100_pq_to_scrgb(encoded: [f32; 3]) -> [f32; 3] {
     let [red, green, blue, _padding] =
         pq_to_linear_simd(F32x4::from_array([encoded[0], encoded[1], encoded[2], 0.0])).to_array();
 
-    [
-        (1.660_491 * red - 0.587_641 * green - 0.072_850 * blue) * SCALE,
-        (-0.124_550 * red + 1.132_9 * green - 0.008_349 * blue) * SCALE,
-        (-0.018_151 * red - 0.100_579 * green + 1.118_73 * blue) * SCALE,
-    ]
+    REC2100_TO_SCRGB.map(|[r, g, b]| blue.mul_add(b, green.mul_add(g, red * r)))
 }
 
 #[inline]
-pub(super) fn rec2100_pq_to_scrgb_simd<const N: usize>(
-    encoded: [Simd<f32, N>; 3],
+fn rec2100_linear_to_scrgb_simd<const N: usize>(
+    [red, green, blue]: [Simd<f32, N>; 3],
 ) -> [Simd<f32, N>; 3] {
-    const REC2100_MAX_NITS: f32 = 10_000.0;
-    const SCALE: f32 = REC2100_MAX_NITS / SC_RGB_REFERENCE_WHITE_NITS;
-
-    let [red, green, blue] = encoded.map(pq_to_linear_simd);
-    [
-        (Simd::splat(1.660_491) * red
-            - Simd::splat(0.587_641) * green
-            - Simd::splat(0.072_850) * blue)
-            * Simd::splat(SCALE),
-        (Simd::splat(-0.124_550) * red + Simd::splat(1.132_9) * green
-            - Simd::splat(0.008_349) * blue)
-            * Simd::splat(SCALE),
-        (Simd::splat(-0.018_151) * red - Simd::splat(0.100_579) * green
-            + Simd::splat(1.118_73) * blue)
-            * Simd::splat(SCALE),
-    ]
+    REC2100_TO_SCRGB.map(|[r, g, b]| {
+        blue.mul_add(
+            Simd::splat(b),
+            green.mul_add(Simd::splat(g), red * Simd::splat(r)),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -346,5 +407,33 @@ pub(super) fn normalize_alpha(value: f32) -> f32 {
         value.clamp(0.0, 1.0)
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pq_lookup_preserves_every_10_bit_code_and_channel_order() {
+        for start in (0..1024_u32).step_by(8) {
+            let packed = std::array::from_fn(|lane| {
+                let code = start + u32::try_from(lane).unwrap();
+                (3 << 30) | (code << 20) | (((code * 37) & 1023) << 10) | (1023 - code)
+            });
+            let actual = decode_bgr101010_simd(Simd::<u32, 8>::from_array(packed));
+            for (lane, pixel) in packed.into_iter().enumerate() {
+                let bytes = pixel.to_ne_bytes();
+                let expected = rec2100_pq_to_scrgb(unpack_bgr101010(&bytes));
+                assert_eq!(
+                    actual.map(|channel| channel[lane].to_bits()),
+                    expected.map(f32::to_bits),
+                );
+                assert_eq!(
+                    decode_bgr101010(&bytes).map(f32::to_bits),
+                    expected.map(f32::to_bits),
+                );
+            }
+        }
     }
 }

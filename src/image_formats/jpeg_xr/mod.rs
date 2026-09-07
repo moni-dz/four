@@ -33,7 +33,7 @@ use tonemapping::{MaxCLLMode, ToneMappingMethod};
 
 #[cfg(test)]
 use hdr::{
-    AnalysisRequest, AnalysisTotals, HDRPixelSelection, MaxCll, finish_max_cll, hdr_white_point,
+    AnalysisRequest, AnalysisTotals, HDRPixelSelection, MaxCLL, finish_max_cll, hdr_white_point,
 };
 use hdr::{AnalysisScope, HDRAnalysis, HDRMetrics};
 use normalize::write_normalized_pixels;
@@ -68,9 +68,11 @@ const BT2446_INPUT_SCALE: f32 = SC_RGB_REFERENCE_WHITE_NITS / 100.0;
 const SOURCE_BUFFER_MAX: usize = 512 * 1024 * 1024;
 // Three f32 channels plus staged alpha occupy roughly 13 KiB, leaving room in common L1 caches.
 const HDR_BATCH_PIXELS: usize = 1_024;
+#[cfg(test)]
 const COLOR_LANES: usize = 4;
 const SRGB_LANES: usize = 8;
 
+#[cfg(test)]
 type F32x4 = std::simd::Simd<f32, COLOR_LANES>;
 type F32x8 = std::simd::Simd<f32, SRGB_LANES>;
 
@@ -512,7 +514,18 @@ fn normalize(
     };
 
     let hdr_metrics = analysis.and_then(|analysis| analysis.hdr_metrics);
-    let mut rgba = vec![0; output_len];
+
+    // `write_normalized_pixels` writes every one of `output_len` bytes before returning `Ok`
+    // (each of its pixel-format paths advances a running offset from `0` to `rgba.len()` in
+    // contiguous, non-overlapping spans; `invariant_eq!` checks that at the end of the HDR
+    // paths). On an early `Err`, `rgba` is dropped unread by the `?` below. So skip zeroing a
+    // buffer this immediately overwrites in full: it can be multiple megabytes per decode.
+    #[expect(
+        unsafe_code,
+        reason = "avoids zeroing an output buffer this function immediately overwrites in full"
+    )]
+    // SAFETY: see the coverage argument above.
+    let mut rgba: Vec<u8> = unsafe { super::uninit_vec(output_len) };
 
     let has_nonzero_alpha = write_normalized_pixels(
         source, width, row_stride, layout, method, analysis, &mut rgba,
@@ -1128,12 +1141,12 @@ mod tests {
 
     #[test]
     fn white_point_methods_preserve_content_that_fits_the_target() {
-        let fitting = MaxCll {
+        let fitting = MaxCLL {
             relative_light_level: 1.0,
             channel: JPEGXRColorChannel::Red,
         };
 
-        let hdr = MaxCll {
+        let hdr = MaxCLL {
             relative_light_level: 4.0,
             channel: JPEGXRColorChannel::Red,
         };

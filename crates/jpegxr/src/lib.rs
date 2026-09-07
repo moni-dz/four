@@ -1,12 +1,16 @@
-//! Decodes JPEG XR images in safe Rust.
+//! Decodes JPEG XR images.
 //!
 //! [`Decoder`] validates the Annex A tag container and embedded T.832 codestream headers before
 //! coefficient decoding begins. Input is borrowed, so inspection does not copy compressed data.
 //! Pixel reconstruction supports the native Windows HDR screenshot profiles for packed
 //! `BGR101010` and `RGBA128Float` pixels. Other valid profiles return a precise error where
 //! [`Error::is_unsupported`] returns `true`.
+//!
+//! Codestream parsing and coefficient decoding are safe Rust. A handful of output-buffer
+//! allocations skip zero-initializing memory this crate immediately overwrites in full; each is
+//! `unsafe`, `#[expect(unsafe_code, ...)]`-annotated, and carries a coverage proof in its
+//! `SAFETY` comment.
 
-#![forbid(unsafe_code)]
 #![feature(portable_simd)]
 #![expect(
     clippy::comparison_chain,

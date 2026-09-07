@@ -1,3 +1,5 @@
+use std::simd::StdFloat;
+
 use multiversion::multiversion;
 
 use super::{LinearRGB, LinearRGBPlanes, ToneMapper};
@@ -64,12 +66,13 @@ fn hable_partial_simd(value: F32x8) -> F32x8 {
     let toe_numerator = F32x8::splat(D * E);
     let toe_denominator = F32x8::splat(D * F);
 
-    ((value * (shoulder_strength * value + linear_angle_strength) + toe_numerator)
-        / (value * (shoulder_strength * value + linear_strength) + toe_denominator))
+    (value.mul_add(shoulder_strength.mul_add(value, linear_angle_strength), toe_numerator)
+        / value.mul_add(shoulder_strength.mul_add(value, linear_strength), toe_denominator))
         - F32x8::splat(TOE)
 }
 
 #[inline]
 fn hable_partial(value: f32) -> f32 {
-    ((value * (A * value + C * B) + D * E) / (value * (A * value + B) + D * F)) - TOE
+    (value.mul_add(A.mul_add(value, C * B), D * E) / value.mul_add(A.mul_add(value, B), D * F))
+        - TOE
 }

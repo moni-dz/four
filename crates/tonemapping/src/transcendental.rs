@@ -39,7 +39,7 @@ const SQRT_TWO: f32 = std::f32::consts::SQRT_2;
 
 /// Evaluates a polynomial in `value` by Horner's method, highest coefficient first.
 #[inline]
-fn polynomial<const N: usize, const DEGREE: usize>(
+pub(crate) fn polynomial<const N: usize, const DEGREE: usize>(
     value: Simd<f32, N>,
     coefficients: [f32; DEGREE],
 ) -> Simd<f32, N> {
@@ -136,6 +136,55 @@ pub fn exp2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
     value.is_nan().select(Simd::splat(f32::NAN), result)
 }
 
+/// `log2`, but for callers that can prove `value` is always finite and at least `1.0`.
+///
+/// Skips the subnormal, zero, negative, infinite and `NaN` handling `log2` needs for the general
+/// case: none of those apply once the caller has bounded its argument away from them.
+///
+/// Callers must not rely on a defined result outside `1.0..=f32::MAX`.
+#[must_use]
+#[inline]
+pub(crate) fn log2_positive_normal<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
+    let bits = value.to_bits();
+    let exponent = ((bits >> Simd::splat(23)) & Simd::splat(0xff)).cast::<i32>() - Simd::splat(127);
+    let mantissa =
+        Simd::from_bits((bits & Simd::splat(0x007f_ffff)) | Simd::splat(0x3f80_0000_u32));
+
+    let lend = mantissa.simd_gt(Simd::splat(SQRT_TWO));
+    let mantissa = lend.select(mantissa * Simd::splat(0.5), mantissa);
+    let exponent = lend
+        .select(exponent + Simd::splat(1), exponent)
+        .cast::<f32>();
+
+    let t = mantissa - Simd::splat(1.0);
+    let squared = t * t;
+    let corrected = (t * squared).mul_add(
+        polynomial(t, LOG_POLYNOMIAL),
+        squared * Simd::splat(-0.5) + t,
+    );
+
+    corrected.mul_add(Simd::splat(LOG2_E), exponent)
+}
+
+/// `exp2`, but for callers that can prove `value` is always finite and stays well clear of the
+/// `-150.0..=128.0` extremes `exp2` guards against.
+///
+/// Skips the input clamp and the underflow/overflow/`NaN` selects `exp2` needs for the general
+/// case. Callers must not rely on a defined result outside roughly `-16.0..=16.0`.
+#[must_use]
+#[inline]
+pub(crate) fn exp2_bounded<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
+    let whole = value.round();
+    let fraction = value - whole;
+
+    let fractional = fraction.mul_add(polynomial(fraction, EXP2_POLYNOMIAL), Simd::splat(1.0));
+
+    let exponent = whole.cast::<i32>() + Simd::splat(127);
+    let scale = Simd::<f32, N>::from_bits((exponent << Simd::splat(23)).cast::<u32>());
+
+    fractional * scale
+}
+
 /// Returns the base-two logarithm of `value`, by the same code the vector path uses.
 #[inline]
 pub(crate) fn log2_scalar(value: f32) -> f32 {
@@ -150,7 +199,9 @@ pub(crate) fn exp2_scalar(value: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{exp2, exp2_scalar, log2, log2_scalar};
+    use super::{
+        exp2, exp2_bounded, exp2_scalar, log2, log2_positive_normal, log2_scalar,
+    };
     use std::simd::Simd;
 
     /// Returns the distance between two floats in units in the last place.
@@ -168,6 +219,30 @@ mod tests {
             }
         }
         (ordered(actual) - ordered(expected)).abs()
+    }
+
+    #[test]
+    fn narrow_domain_variants_match_the_general_ones_in_their_documented_domain() {
+        for exponent in -4..=4_i32 {
+            for step in 0..64_u32 {
+                let mantissa = 1.0 + f32::from(u16::try_from(step).unwrap()) / 64.0;
+                let value = mantissa * 2.0_f32.powi(exponent);
+                assert_eq!(
+                    log2_positive_normal(Simd::<f32, 1>::splat(value))[0].to_bits(),
+                    log2(Simd::<f32, 1>::splat(value))[0].to_bits(),
+                    "log2_positive_normal({value})"
+                );
+            }
+        }
+
+        for step in -1_600..=1_600_i32 {
+            let value = f32::from(i16::try_from(step).unwrap()) / 100.0;
+            assert_eq!(
+                exp2_bounded(Simd::<f32, 1>::splat(value))[0].to_bits(),
+                exp2(Simd::<f32, 1>::splat(value))[0].to_bits(),
+                "exp2_bounded({value})"
+            );
+        }
     }
 
     #[test]

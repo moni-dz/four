@@ -18,6 +18,7 @@ impl<'a> BitReader<'a> {
         }
     }
 
+    #[inline]
     pub(crate) fn read(&mut self, width: u8) -> Result<u64> {
         debug_assert!(width <= 64, "syntax elements cannot exceed 64 bits");
 
@@ -25,32 +26,32 @@ impl<'a> BitReader<'a> {
             return Ok(0);
         }
 
-        let end = self
-            .bit_position
-            .checked_add(usize::from(width))
-            .ok_or_else(|| self.error(ErrorKind::UnexpectedEof))?;
-        if end > self.bytes.len().saturating_mul(8) {
-            return Err(self.error(ErrorKind::UnexpectedEof));
-        }
-
         let byte_index = self.bit_position / 8;
         let bit_offset = self.bit_position % 8;
 
-        let value = if usize::from(width) + bit_offset <= 64
+        if usize::from(width) + bit_offset <= 64
             && let Some(window) = self.bytes.get(byte_index..byte_index + 8)
         {
+            // The window proves that all requested bits exist, including unaligned reads.
             let word = u64::from_be_bytes(window.try_into().expect("eight-byte window"));
-            (word << bit_offset) >> (64 - u32::from(width))
+            self.bit_position += usize::from(width);
+            Ok((word << bit_offset) >> (64 - u32::from(width)))
         } else {
             self.read_bytewise(width)
-        };
-
-        self.bit_position = end;
-        Ok(value)
+        }
     }
 
-    /// Reads bounds-checked bits near the end of the stream or wider than one word load.
-    fn read_bytewise(&self, width: u8) -> u64 {
+    /// Reads bits near the end of the stream or wider than one word load.
+    #[cold]
+    fn read_bytewise(&mut self, width: u8) -> Result<u64> {
+        let end = self
+            .bit_position
+            .checked_add(usize::from(width))
+            .ok_or_else(|| self.error(ErrorKind::UnexpectedEOF))?;
+        if end > self.bytes.len().saturating_mul(8) {
+            return Err(self.error(ErrorKind::UnexpectedEOF));
+        }
+
         let mut value = 0_u64;
         let mut position = self.bit_position;
         let mut remaining = usize::from(width);
@@ -65,10 +66,12 @@ impl<'a> BitReader<'a> {
             remaining -= take;
         }
 
-        value
+        self.bit_position = end;
+        Ok(value)
     }
 
     /// Returns the next eight bits without consuming them, zero-padded past the end.
+    #[inline]
     pub(crate) fn peek8(&self) -> u8 {
         let byte_index = self.bit_position / 8;
         let bit_offset = self.bit_position % 8;
@@ -77,10 +80,11 @@ impl<'a> BitReader<'a> {
         (u16::from_be_bytes([high, low]) << bit_offset).to_be_bytes()[0]
     }
 
+    #[inline]
     pub(crate) fn consume(&mut self, width: u8) -> Result<()> {
         let end = self.bit_position + usize::from(width);
         if end > self.bytes.len().saturating_mul(8) {
-            return Err(self.error(ErrorKind::UnexpectedEof));
+            return Err(self.error(ErrorKind::UnexpectedEOF));
         }
 
         self.bit_position = end;
@@ -91,6 +95,7 @@ impl<'a> BitReader<'a> {
         self.bytes.len().saturating_mul(8) - self.bit_position
     }
 
+    #[inline]
     pub(crate) fn read_u8(&mut self, width: u8) -> Result<u8> {
         u8::try_from(self.read(width)?).map_err(|_conversion_error| {
             self.error(ErrorKind::InvalidCodestream(
@@ -99,6 +104,7 @@ impl<'a> BitReader<'a> {
         })
     }
 
+    #[inline]
     pub(crate) fn read_u16(&mut self, width: u8) -> Result<u16> {
         u16::try_from(self.read(width)?).map_err(|_conversion_error| {
             self.error(ErrorKind::InvalidCodestream(
@@ -107,6 +113,7 @@ impl<'a> BitReader<'a> {
         })
     }
 
+    #[inline]
     pub(crate) fn read_u32(&mut self, width: u8) -> Result<u32> {
         u32::try_from(self.read(width)?).map_err(|_conversion_error| {
             self.error(ErrorKind::InvalidCodestream(
@@ -115,12 +122,13 @@ impl<'a> BitReader<'a> {
         })
     }
 
+    #[inline]
     pub(crate) fn read_bool(&mut self) -> Result<bool> {
         let byte = self
             .bytes
             .get(self.bit_position / 8)
             .copied()
-            .ok_or_else(|| self.error(ErrorKind::UnexpectedEof))?;
+            .ok_or_else(|| self.error(ErrorKind::UnexpectedEOF))?;
         let bit = (byte >> (7 - self.bit_position % 8)) & 1;
         self.bit_position += 1;
         Ok(bit != 0)
@@ -154,6 +162,36 @@ impl<'a> BitReader<'a> {
 #[cfg(test)]
 mod tests {
     use super::BitReader;
+
+    #[test]
+    fn word_and_tail_reads_match_individual_bits() {
+        let bytes = [0xb2, 0x69, 0xff, 0, 0x81, 0x57, 0xa3, 0x1c, 0xe5, 0x42];
+        for length in 0..=bytes.len() {
+            for start in 0..=length * 8 {
+                for width in 0..=64 {
+                    let mut reader = BitReader::new(&bytes[..length], 7);
+
+                    reader.consume(u8::try_from(start).unwrap()).unwrap();
+
+                    let end = start + usize::from(width);
+
+                    if end <= length * 8 {
+                        let expected = (start..end).fold(0_u64, |value, bit| {
+                            (value << 1) | u64::from((bytes[bit / 8] >> (7 - bit % 8)) & 1)
+                        });
+
+                        assert_eq!(reader.read(width), Ok(expected));
+                        assert_eq!(reader.bit_position, end);
+                    } else {
+                        let error = reader.read(width).unwrap_err();
+
+                        assert_eq!(error, reader.error(crate::error::ErrorKind::UnexpectedEOF));
+                        assert_eq!(reader.bit_position, start);
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn reads_across_byte_boundaries() {

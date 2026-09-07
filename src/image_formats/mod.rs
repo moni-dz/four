@@ -1,5 +1,7 @@
 //! Defines the shared decoded-image representation and format decoders.
 
+use std::mem::{self, MaybeUninit};
+
 use nutype::nutype;
 use rayon::prelude::*;
 
@@ -9,6 +11,29 @@ pub mod jpeg_xl;
 pub mod jpeg_xr;
 pub mod png;
 pub mod tiff;
+
+/// Allocates a `Vec<T>` of `len` elements without zeroing them.
+///
+/// # Safety
+///
+/// Every element must be written before it is read, or the vector dropped without any element
+/// being read (e.g. on an error path taken before the fill completes). `T` must have no validity
+/// invariant beyond its bit pattern: callers must only use this with plain integer/float sample
+/// types, never with a type that has a `Drop` impl or restricted bit patterns.
+#[expect(
+    unsafe_code,
+    reason = "avoids zeroing output buffers a decoder immediately overwrites in full"
+)]
+pub(crate) unsafe fn uninit_vec<T: Copy>(len: usize) -> Vec<T> {
+    let mut values: Vec<MaybeUninit<T>> = Vec::with_capacity(len);
+    // SAFETY: `MaybeUninit<T>` has no validity invariant, so any length up to `capacity` (just
+    // reserved above) is valid, regardless of `T`.
+    unsafe { values.set_len(len) };
+    // SAFETY: `MaybeUninit<T>` and `T` share size, alignment and layout, so a `Vec` of one
+    // transmutes into a `Vec` of the other; the caller's precondition (every element written
+    // before being read) is what makes reading back a `T` from each slot sound.
+    unsafe { mem::transmute::<Vec<MaybeUninit<T>>, Vec<T>>(values) }
+}
 
 const BMP_FILE_HEADER_BYTES: u32 = 14;
 const BMP_DIB_HEADER_BYTES: u32 = 108;

@@ -62,9 +62,9 @@ lto = "fat"
 codegen-units = 1
 
 [profile.release-with-symbols]
-inherits = "dev"
-opt-level = 3
-codegen-units = 32
+inherits = "release"
+debug = 2
+strip = "none"
 
 [workspace.lints.rust]
 ambiguous_negative_literals = "warn"

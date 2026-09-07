@@ -194,7 +194,17 @@ impl Frame {
     /// pixel. Mirrors [`rgba_pixel_rows`]'s parallelism threshold exactly.
     fn write_color_rows(&self, transform: ColorTransform, width: usize, height: usize) -> Vec<u8> {
         let pixel_count = width * height;
-        let mut rgba = vec![0; pixel_count * 4];
+
+        #[expect(
+            unsafe_code,
+            reason = "avoids zeroing an output buffer this function immediately overwrites in full"
+        )]
+        // SAFETY: the parallel/sequential split below covers every row of `rgba` via
+        // `chunks_mut`/`par_chunks_mut(width * 4)`, and `write_row` (via `convert_color_row`)
+        // unconditionally writes every 4-byte pixel of its row, in both branches (`ColorTransform::RGB`
+        // and the YCbCr conversion, chunked and tail). So every element is written before this
+        // function returns.
+        let mut rgba: Vec<u8> = unsafe { crate::image_formats::uninit_vec(pixel_count * 4) };
 
         let write_row = |y: usize, row: &mut [u8]| {
             let y = PixelY(u32::try_from(y).expect("JPEG pixel y fits u32"));

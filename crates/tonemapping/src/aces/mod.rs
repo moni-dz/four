@@ -1,3 +1,5 @@
+use std::simd::StdFloat;
+
 use multiversion::multiversion;
 
 use super::{LinearRGB, LinearRGBPlanes, ToneMapper};
@@ -75,8 +77,8 @@ fn aces_fitted(color: LinearRGB) -> LinearRGB {
     let transformed = multiply_rgb(ACES_INPUT_MATRIX, color.components());
 
     let fitted = transformed.map(|component| {
-        let numerator = component * (component + ACES_FIT_A) - ACES_FIT_B;
-        let denominator = component * (ACES_FIT_C * component + ACES_FIT_D) + ACES_FIT_E;
+        let numerator = component.mul_add(component + ACES_FIT_A, -ACES_FIT_B);
+        let denominator = component.mul_add(ACES_FIT_C.mul_add(component, ACES_FIT_D), ACES_FIT_E);
 
         numerator / denominator
     });
@@ -97,24 +99,29 @@ fn aces_fitted_batch(colors: &mut [LinearRGB]) {
             .map(|channel| F32x8::from_array(std::array::from_fn(|lane| chunk[lane].0[channel])));
 
         let transformed = ACES_INPUT_MATRIX.map(|row| {
-            (F32x8::splat(row[0]) * color[0] + F32x8::splat(row[1]) * color[1])
-                + F32x8::splat(row[2]) * color[2]
+            color[2].mul_add(
+                F32x8::splat(row[2]),
+                color[1].mul_add(F32x8::splat(row[1]), color[0] * F32x8::splat(row[0])),
+            )
         });
 
         let fitted = transformed.map(|component| {
             let numerator =
-                component * (component + F32x8::splat(ACES_FIT_A)) - F32x8::splat(ACES_FIT_B);
+                component.mul_add(component + F32x8::splat(ACES_FIT_A), -F32x8::splat(ACES_FIT_B));
 
-            let denominator = component
-                * (F32x8::splat(ACES_FIT_C) * component + F32x8::splat(ACES_FIT_D))
-                + F32x8::splat(ACES_FIT_E);
+            let denominator = component.mul_add(
+                F32x8::splat(ACES_FIT_C).mul_add(component, F32x8::splat(ACES_FIT_D)),
+                F32x8::splat(ACES_FIT_E),
+            );
 
             numerator / denominator
         });
 
         let mapped = ACES_OUTPUT_MATRIX.map(|row| {
-            (F32x8::splat(row[0]) * fitted[0] + F32x8::splat(row[1]) * fitted[1])
-                + F32x8::splat(row[2]) * fitted[2]
+            fitted[2].mul_add(
+                F32x8::splat(row[2]),
+                fitted[1].mul_add(F32x8::splat(row[1]), fitted[0] * F32x8::splat(row[0])),
+            )
         });
 
         let mapped = mapped.map(displayable);
@@ -129,30 +136,35 @@ fn aces_fitted_batch(colors: &mut [LinearRGB]) {
 fn aces_fitted_planes(colors: &mut LinearRGBPlanes) {
     map_colors(colors, |color| {
         let transformed = ACES_INPUT_MATRIX.map(|row| {
-            (F32x8::splat(row[0]) * color[0] + F32x8::splat(row[1]) * color[1])
-                + F32x8::splat(row[2]) * color[2]
+            color[2].mul_add(
+                F32x8::splat(row[2]),
+                color[1].mul_add(F32x8::splat(row[1]), color[0] * F32x8::splat(row[0])),
+            )
         });
 
         let fitted = transformed.map(|component| {
             let numerator =
-                component * (component + F32x8::splat(ACES_FIT_A)) - F32x8::splat(ACES_FIT_B);
+                component.mul_add(component + F32x8::splat(ACES_FIT_A), -F32x8::splat(ACES_FIT_B));
 
-            let denominator = component
-                * (F32x8::splat(ACES_FIT_C) * component + F32x8::splat(ACES_FIT_D))
-                + F32x8::splat(ACES_FIT_E);
+            let denominator = component.mul_add(
+                F32x8::splat(ACES_FIT_C).mul_add(component, F32x8::splat(ACES_FIT_D)),
+                F32x8::splat(ACES_FIT_E),
+            );
 
             numerator / denominator
         });
 
         ACES_OUTPUT_MATRIX.map(|row| {
-            (F32x8::splat(row[0]) * fitted[0] + F32x8::splat(row[1]) * fitted[1])
-                + F32x8::splat(row[2]) * fitted[2]
+            fitted[2].mul_add(
+                F32x8::splat(row[2]),
+                fitted[1].mul_add(F32x8::splat(row[1]), fitted[0] * F32x8::splat(row[0])),
+            )
         })
     });
 }
 
 fn multiply_rgb(matrix: [[f32; 3]; 3], color: [f32; 3]) -> [f32; 3] {
-    matrix.map(|row| row[0] * color[0] + row[1] * color[1] + row[2] * color[2])
+    matrix.map(|row| color[2].mul_add(row[2], color[1].mul_add(row[1], color[0] * row[0])))
 }
 
 /// Applies [Krzysztof Narkowicz's scalar ACES approximation] component-wise.
@@ -174,7 +186,7 @@ impl ToneMapper for ACESApproximate {
 
         LinearRGB::displayable(color.components().map(|component| {
             let exposed = component * 0.6;
-            exposed * (A * exposed + B) / (exposed * (C * exposed + D) + E)
+            exposed * A.mul_add(exposed, B) / exposed.mul_add(C.mul_add(exposed, D), E)
         }))
     }
 
@@ -196,7 +208,7 @@ fn aces_approximate_planes(colors: &mut LinearRGBPlanes) {
     map_colors(colors, |components| {
         components.map(|component| {
             let exposed = component * exposure;
-            exposed * (a * exposed + b) / (exposed * (c * exposed + d) + e)
+            exposed * a.mul_add(exposed, b) / exposed.mul_add(c.mul_add(exposed, d), e)
         })
     });
 }

@@ -15,14 +15,14 @@ use super::{
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub(super) struct MaxCll {
+pub(super) struct MaxCLL {
     pub(super) relative_light_level: f32,
     pub(super) channel: JPEGXRColorChannel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct HDRMetrics {
-    pub(super) max_cll: MaxCll,
+    pub(super) max_cll: MaxCLL,
     pub(super) max_cll_mode: MaxCLLMode,
     pub(super) luminance_white_point: Option<LuminanceWhitePoint>,
     pub(super) max_luminance_nits: f32,
@@ -34,7 +34,7 @@ pub(super) struct HDRMetrics {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct HDRAnalysis {
-    pub(super) max_cll: Option<MaxCll>,
+    pub(super) max_cll: Option<MaxCLL>,
     pub(super) luminance_white_point: Option<LuminanceWhitePoint>,
     pub(super) hdr_metrics: Option<HDRMetrics>,
 }
@@ -342,7 +342,7 @@ fn compute_totals(
         )
 }
 
-pub(super) fn finish_max_cll(estimator: MaxCLLEstimator) -> MaxCll {
+pub(super) fn finish_max_cll(estimator: MaxCLLEstimator) -> MaxCLL {
     let estimate = estimator
         .finish()
         .expect("the HDR analysis pass visits the measured number of pixels");
@@ -351,13 +351,13 @@ pub(super) fn finish_max_cll(estimator: MaxCLLEstimator) -> MaxCll {
     invariant!(relative_light_level.is_finite());
     invariant!(relative_light_level >= 0.0);
 
-    MaxCll {
+    MaxCLL {
         relative_light_level,
         channel: jpeg_xr_color_channel(estimate.channel()),
     }
 }
 
-impl MaxCll {
+impl MaxCLL {
     pub(super) fn relative_light_level(self) -> f32 {
         invariant!(self.relative_light_level.is_finite());
         invariant!(self.relative_light_level >= 0.0);
@@ -371,7 +371,7 @@ impl MaxCll {
     }
 }
 
-pub(super) fn hdr_white_point(max_cll: MaxCll) -> WhitePoint {
+pub(super) fn hdr_white_point(max_cll: MaxCLL) -> WhitePoint {
     WhitePoint::new(max_cll.relative_light_level().max(1.0))
         .expect("MaxCLL floored at display white is a positive finite white point")
 }
@@ -448,7 +448,7 @@ impl HDRMetricAccumulator {
 
     pub(super) fn finish(
         self,
-        max_cll: MaxCll,
+        max_cll: MaxCLL,
         max_cll_mode: MaxCLLMode,
         luminance_white_point: Option<LuminanceWhitePoint>,
     ) -> HDRMetrics {

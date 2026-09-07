@@ -237,9 +237,11 @@ pub(super) fn write_bgr101010_hdr_pixels(
     rgba: &mut [u8],
 ) -> bool {
     let row_count = source.len() / row_stride;
+
     let pixel_count = width
         .checked_mul(row_count)
         .expect("validated JPEG XR pixel count fits usize");
+
     let batch_capacity = HDR_BATCH_PIXELS.min(pixel_count);
     let mut colors = LinearRGBPlanes::with_capacity(batch_capacity);
     let mut alphas = Vec::with_capacity(batch_capacity);
@@ -251,6 +253,7 @@ pub(super) fn write_bgr101010_hdr_pixels(
         invariant_eq!(pixels.len(), width);
 
         let (chunks, tail) = pixels.as_chunks::<SRGB_LANES>();
+
         for chunk in chunks {
             let packed = Simd::<u32, SRGB_LANES>::from_array((*chunk).map(u32::from_ne_bytes));
             let [red, green, blue] = decode_bgr101010_simd(packed).map(Simd::to_array);
@@ -295,9 +298,11 @@ pub(super) fn write_rgba128_float_hdr_pixels(
     rgba: &mut [u8],
 ) -> bool {
     let row_count = source.len() / row_stride;
+
     let pixel_count = width
         .checked_mul(row_count)
         .expect("validated JPEG XR pixel count fits usize");
+
     let batch_capacity = HDR_BATCH_PIXELS.min(pixel_count);
     let mut colors = LinearRGBPlanes::with_capacity(batch_capacity);
     let mut alphas = Vec::with_capacity(batch_capacity);
@@ -310,6 +315,7 @@ pub(super) fn write_rgba128_float_hdr_pixels(
         invariant_eq!(pixels.len(), width);
 
         let (chunks, tail) = pixels.as_chunks::<SRGB_LANES>();
+
         for chunk in chunks {
             let ([red, green, blue], alpha) = decode_rgba128_float_simd(chunk);
             let scale = Simd::splat(color_scale);
@@ -331,8 +337,11 @@ pub(super) fn write_rgba128_float_hdr_pixels(
 
         for pixel in tail {
             let (color, alpha) = decode_rgba128_float(pixel);
+
             has_nonzero_alpha |= alpha > 0.0;
+
             let color = color.map(|component| component * color_scale);
+
             colors.push(LinearRGB::new(color));
             alphas.push(normalized_to_u8(alpha));
 
@@ -441,7 +450,9 @@ pub(super) fn append_hdr_pixels(
 ) -> Result<bool> {
     let byte_count = source.len() / row_stride * width * 4;
     let start = rgba.len();
+
     rgba.resize(start + byte_count, 0);
+
     write_hdr_pixels(
         source,
         width,

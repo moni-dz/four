@@ -1,3 +1,5 @@
 /target
 .idea
 /replay_pid*.log
+.claude
+.delta

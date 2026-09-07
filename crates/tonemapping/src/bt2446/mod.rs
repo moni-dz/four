@@ -1,13 +1,15 @@
 use multiversion::multiversion;
 use std::simd::{
-    Select, Simd,
+    Select, Simd, StdFloat,
     cmp::{SimdPartialEq, SimdPartialOrd},
     num::SimdFloat,
 };
 
 use super::{LinearRGB, LinearRGBPlanes, ToneMapper};
 use crate::simd::map_planes;
-use crate::transcendental::{exp2, exp2_scalar, log2, log2_scalar};
+use crate::transcendental::{
+    exp2, exp2_bounded, exp2_scalar, log2, log2_positive_normal, log2_scalar,
+};
 
 const BT2446_LANES: usize = 16;
 type F32x16 = Simd<f32, BT2446_LANES>;
@@ -129,25 +131,34 @@ fn bt2446a_simd(components: &[F32x16; 3]) -> [[f32; BT2446_LANES]; 3] {
         exp2(log2(normalized) * F32x16::splat(1.0 / 2.4))
     });
 
-    let input_luma = F32x16::splat(BT2020_LUMA[0]) * nonlinear[0]
-        + F32x16::splat(BT2020_LUMA[1]) * nonlinear[1]
-        + F32x16::splat(BT2020_LUMA[2]) * nonlinear[2];
+    let input_luma = nonlinear[2].mul_add(
+        F32x16::splat(BT2020_LUMA[2]),
+        nonlinear[1].mul_add(
+            F32x16::splat(BT2020_LUMA[1]),
+            nonlinear[0] * F32x16::splat(BT2020_LUMA[0]),
+        ),
+    );
 
-    let perceptual_luma =
-        log2(one + F32x16::splat(RHO_HDR - 1.0) * input_luma) * F32x16::splat(1.0 / LOG2_RHO_HDR);
+    // `input_luma` is a sum of nonnegative terms (each `nonlinear` channel and `BT2020_LUMA`
+    // weight is nonnegative), so this argument is always finite and at least `1.0`.
+    let perceptual_luma = log2_positive_normal(one + F32x16::splat(RHO_HDR - 1.0) * input_luma)
+        * F32x16::splat(1.0 / LOG2_RHO_HDR);
 
     let compressed_luma = perceptual_luma.simd_le(F32x16::splat(0.739_9)).select(
         F32x16::splat(1.077_0) * perceptual_luma,
         perceptual_luma.simd_lt(F32x16::splat(0.990_9)).select(
-            F32x16::splat(-1.151_0) * perceptual_luma * perceptual_luma
-                + F32x16::splat(2.781_1) * perceptual_luma
-                - F32x16::splat(0.630_2),
+            perceptual_luma.mul_add(
+                perceptual_luma.mul_add(F32x16::splat(-1.151_0), F32x16::splat(2.781_1)),
+                F32x16::splat(-0.630_2),
+            ),
             F32x16::splat(0.5) * perceptual_luma + F32x16::splat(0.5),
         ),
     );
 
-    let output_luma =
-        (exp2(compressed_luma * F32x16::splat(LOG2_RHO_SDR)) - one) / F32x16::splat(RHO_SDR - 1.0);
+    // `perceptual_luma` is in `0.0..=~1.0` (a knee function of a `0.0..=1.0`-ish input), so this
+    // argument stays near `0.0..=LOG2_RHO_SDR`, far inside `exp2_bounded`'s safe range.
+    let output_luma = (exp2_bounded(compressed_luma * F32x16::splat(LOG2_RHO_SDR)) - one)
+        / F32x16::splat(RHO_SDR - 1.0);
 
     let color_scale = input_luma
         .simd_eq(zero)
@@ -155,14 +166,20 @@ fn bt2446a_simd(components: &[F32x16; 3]) -> [[f32; BT2446_LANES]; 3] {
 
     let blue_difference = color_scale * (nonlinear[2] - input_luma) / F32x16::splat(CB_DIVISOR);
     let red_difference = color_scale * (nonlinear[0] - input_luma) / F32x16::splat(CR_DIVISOR);
-    let adjusted_luma = output_luma - F32x16::splat(0.1) * red_difference.simd_max(zero);
+    let adjusted_luma = red_difference
+        .simd_max(zero)
+        .mul_add(F32x16::splat(-0.1), output_luma);
 
     let output_nonlinear = [
-        adjusted_luma + F32x16::splat(CR_DIVISOR) * red_difference,
-        adjusted_luma
-            - F32x16::splat(BT2020_LUMA[2] * CB_DIVISOR / BT2020_LUMA[1]) * blue_difference
-            - F32x16::splat(BT2020_LUMA[0] * CR_DIVISOR / BT2020_LUMA[1]) * red_difference,
-        adjusted_luma + F32x16::splat(CB_DIVISOR) * blue_difference,
+        red_difference.mul_add(F32x16::splat(CR_DIVISOR), adjusted_luma),
+        red_difference.mul_add(
+            F32x16::splat(-(BT2020_LUMA[0] * CR_DIVISOR / BT2020_LUMA[1])),
+            blue_difference.mul_add(
+                F32x16::splat(-(BT2020_LUMA[2] * CB_DIVISOR / BT2020_LUMA[1])),
+                adjusted_luma,
+            ),
+        ),
+        blue_difference.mul_add(F32x16::splat(CB_DIVISOR), adjusted_luma),
     ];
 
     output_nonlinear.map(|component| {
@@ -179,9 +196,10 @@ fn bt2446a(color: LinearRGB) -> LinearRGB {
         exp2_scalar(log2_scalar(normalized) * (1.0 / 2.4))
     });
 
-    let input_luma = BT2020_LUMA[0] * nonlinear[0]
-        + BT2020_LUMA[1] * nonlinear[1]
-        + BT2020_LUMA[2] * nonlinear[2];
+    let input_luma = nonlinear[2].mul_add(
+        BT2020_LUMA[2],
+        nonlinear[1].mul_add(BT2020_LUMA[1], nonlinear[0] * BT2020_LUMA[0]),
+    );
 
     let output_luma = bt2446a_luma(input_luma);
 
@@ -193,14 +211,15 @@ fn bt2446a(color: LinearRGB) -> LinearRGB {
 
     let blue_difference = color_scale * (nonlinear[2] - input_luma) / CB_DIVISOR;
     let red_difference = color_scale * (nonlinear[0] - input_luma) / CR_DIVISOR;
-    let adjusted_luma = output_luma - (0.1 * red_difference).max(0.0);
+    let adjusted_luma = red_difference.max(0.0).mul_add(-0.1, output_luma);
 
     let output_nonlinear = [
-        adjusted_luma + CR_DIVISOR * red_difference,
-        adjusted_luma
-            - (BT2020_LUMA[2] * CB_DIVISOR / BT2020_LUMA[1]) * blue_difference
-            - (BT2020_LUMA[0] * CR_DIVISOR / BT2020_LUMA[1]) * red_difference,
-        adjusted_luma + CB_DIVISOR * blue_difference,
+        red_difference.mul_add(CR_DIVISOR, adjusted_luma),
+        red_difference.mul_add(
+            -(BT2020_LUMA[0] * CR_DIVISOR / BT2020_LUMA[1]),
+            blue_difference.mul_add(-(BT2020_LUMA[2] * CB_DIVISOR / BT2020_LUMA[1]), adjusted_luma),
+        ),
+        blue_difference.mul_add(CB_DIVISOR, adjusted_luma),
     ];
 
     LinearRGB::displayable(output_nonlinear.map(|component| {
@@ -215,9 +234,8 @@ fn bt2446a_luma(input_luma: f32) -> f32 {
     let compressed_luma = if perceptual_luma <= 0.739_9 {
         1.077_0 * perceptual_luma
     } else if perceptual_luma < 0.990_9 {
-        // `-1.1510 * pl * pl`, not `-1.1510 * pl.powi(2)`: the batch path multiplies left to
-        // right, and the two groupings do not round alike in f32.
-        -1.151_0 * perceptual_luma * perceptual_luma + 2.781_1 * perceptual_luma - 0.630_2
+        // Horner form via `mul_add`, matching the batch path's fused rounding exactly.
+        perceptual_luma.mul_add(perceptual_luma.mul_add(-1.151_0, 2.781_1), -0.630_2)
     } else {
         0.5 * perceptual_luma + 0.5
     };

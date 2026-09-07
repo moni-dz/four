@@ -10,7 +10,14 @@ use crate::error::{Error, ErrorKind, Result};
 use multiversion::multiversion;
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::simd::{Simd, cmp::SimdOrd, num::SimdInt};
+use std::marker::PhantomData;
+use std::mem::{self, MaybeUninit};
+use std::simd::{
+    Simd,
+    cmp::{SimdOrd, SimdPartialEq},
+    num::SimdInt,
+    simd_swizzle,
+};
 
 /// Largest accepted image width or height, in pixels.
 ///
@@ -97,6 +104,29 @@ struct IntegerImage {
     height: usize,
     components: usize,
     values: Vec<i32>,
+}
+
+/// Allocates a `Vec<T>` of `len` elements without zeroing them.
+///
+/// # Safety
+///
+/// Every element must be written before it is read, or the vector dropped without any element
+/// being read (e.g. on an error path taken before the fill completes). `T` must have no validity
+/// invariant beyond its bit pattern: this crate only calls this with plain integer/float sample
+/// types, never with a type that has a Drop impl or restricted bit patterns.
+#[expect(
+    unsafe_code,
+    reason = "avoids zeroing output buffers this decoder immediately overwrites in full"
+)]
+unsafe fn uninit_vec<T: Copy>(len: usize) -> Vec<T> {
+    let mut values: Vec<MaybeUninit<T>> = Vec::with_capacity(len);
+    // SAFETY: `MaybeUninit<T>` has no validity invariant, so any length up to `capacity` (just
+    // reserved above) is valid, regardless of `T`.
+    unsafe { values.set_len(len) };
+    // SAFETY: `MaybeUninit<T>` and `T` share size, alignment and layout, so a `Vec` of one
+    // transmutes into a `Vec` of the other; the caller's precondition (every element written
+    // before being read) is what makes reading back a `T` from each slot sound.
+    unsafe { mem::transmute::<Vec<MaybeUninit<T>>, Vec<T>>(values) }
 }
 
 /// Validates a plane's declared dimensions and returns `(width, height, pixel_count)`.
@@ -186,7 +216,15 @@ pub(crate) fn decode_rgba_f32(
     let row_len = width
         .checked_mul(4)
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded("RGBA output row"), primary.offset))?;
-    let mut pixels = vec![0.0; output_len];
+    #[expect(
+        unsafe_code,
+        reason = "avoids zeroing an output buffer this function immediately overwrites in full"
+    )]
+    // SAFETY: `fill_rgba_row` unconditionally writes every pixel of its row slice (all four
+    // channels, no data-dependent skip), and the `chunks_mut`/`par_chunks_mut` split below
+    // covers the entire `pixels` buffer, so every element is written before this function
+    // returns `Ok`; on `Err` the partially-filled buffer is dropped without being read.
+    let mut pixels = unsafe { uninit_vec::<f32>(output_len) };
 
     let color_crop = crop_rect(
         primary.header.margins,
@@ -287,7 +325,15 @@ pub(crate) fn decode_bgr101010(stream: &ParsedCodestream<'_>) -> Result<Vec<u32>
     let swapped = stream.header.red_blue_swapped;
 
     // Allocation and per-row fill closure shared by the parallel and serial paths below.
-    let mut pixels = vec![0; pixel_count];
+    #[expect(
+        unsafe_code,
+        reason = "avoids zeroing an output buffer this function immediately overwrites in full"
+    )]
+    // SAFETY: `fill_bgr101010_row` unconditionally writes every pixel of its row slice (its SIMD
+    // chunk loop and scalar tail loop both write unconditionally, no data-dependent skip), and
+    // the `chunks_mut`/`par_chunks_mut` split below covers the entire `pixels` buffer, so every
+    // element is written before this function returns.
+    let mut pixels = unsafe { uninit_vec::<u32>(pixel_count) };
     let fill_row =
         |y, row: &mut [u32]| fill_bgr101010_row(row, y, left, top, &color, shift, bias, swapped);
 
@@ -342,7 +388,7 @@ fn fill_bgr101010_row(
             I32x8::from_array(*chroma_v),
             bias,
         )
-        .map(|channel| clip_10_bit_simd(channel >> i64::from(shift)));
+        .map(|channel| clip_10_bit_simd(channel, shift));
 
         let packed = if swapped {
             blue | (green << 10) | (red << 20)
@@ -381,8 +427,12 @@ fn clip_10_bit(value: i64) -> u32 {
 }
 
 #[inline]
-fn clip_10_bit_simd(value: I64x8) -> Simd<u32, PIXEL_LANES> {
-    value.simd_clamp(I64x8::splat(0), I64x8::splat(1023)).cast()
+fn clip_10_bit_simd(value: I64x8, shift: u32) -> Simd<u32, PIXEL_LANES> {
+    // Clamp before narrowing so the scaling shift can use 32-bit lanes.
+    value
+        .simd_clamp(I64x8::splat(0), I64x8::splat(1023 << shift))
+        .cast::<u32>()
+        >> shift
 }
 
 #[inline]
@@ -524,14 +574,14 @@ pub(crate) fn decode_dc(stream: &ParsedCodestream<'_>) -> Result<DCImage> {
         &mut image.values,
         macroblock_width,
         components,
-        |tile, values| {
+        |tile, writer| {
             decode_dc_packet(
                 packet(stream, tile.index, 0)?,
                 &stream.primary_plane,
                 tile.width,
                 tile.height,
                 components,
-                values,
+                writer,
             )
         },
     )?;
@@ -581,14 +631,14 @@ pub(crate) fn decode_lowpass(stream: &ParsedCodestream<'_>) -> Result<LowpassIma
         &mut image.values,
         macroblock_width,
         components * 16,
-        |tile, values| {
+        |tile, writer| {
             decode_lowpass_packet(
                 packet(stream, tile.index, 1)?,
                 &stream.primary_plane,
                 tile.width,
                 tile.height,
                 components,
-                values,
+                writer,
             )
         },
     )?;
@@ -629,42 +679,117 @@ fn tile_grid(stream: &ParsedCodestream<'_>) -> Vec<Tile> {
     tiles
 }
 
-/// Decodes every tile packet into a tile-local buffer, in parallel for large images, then
-/// scatters the rows into `values` (`stride` values per macroblock).
+/// A tile's write-only view into a shared, macroblock-major reconstruction buffer.
+///
+/// Lets `decode_dc_packet`/`decode_lowpass_packet` write each decoded macroblock directly into
+/// its final position, instead of into a tile-local buffer that then has to be copied in.
+///
+/// # Safety invariant
+///
+/// Every `TileWriter` a given [`decode_tiles_into`] call hands out addresses a disjoint
+/// macroblock rectangle: `tile_grid` partitions the macroblock grid into non-overlapping tiles,
+/// so no two `TileWriter`s (even used concurrently on different threads) ever write the same
+/// element. `write_macroblock` only ever writes, never reads, so there is no read/write race
+/// either. The borrow tied to `'a` prevents a writer from outliving the buffer it points into.
+#[derive(Clone, Copy)]
+struct TileWriter<'a> {
+    base: *mut i32,
+    row_stride: usize,
+    stride: usize,
+    tile_left: usize,
+    tile_top: usize,
+    _buffer: PhantomData<&'a mut [i32]>,
+}
+
+#[expect(
+    unsafe_code,
+    reason = "lets a TileWriter cross into a rayon worker thread; soundness argued in the type's doc comment"
+)]
+// SAFETY: see the type's doc comment. `TileWriter` is constructed fresh per tile inside
+// `decode_tiles_into` and never itself crosses a thread boundary as a captured value, but
+// `decode_packet` closures are free to build one per invocation, which does run on worker
+// threads; `Sync` lets that happen soundly given the disjointness guarantee above.
+unsafe impl Sync for TileWriter<'_> {}
+
+impl TileWriter<'_> {
+    /// Writes one macroblock's `stride` values at `(local_y, local_x)` within this tile.
+    #[expect(
+        unsafe_code,
+        reason = "writes directly into the shared reconstruction buffer instead of a tile-local one that gets copied in"
+    )]
+    fn write_macroblock(&self, local_y: usize, local_x: usize, data: &[i32]) {
+        debug_assert_eq!(data.len(), self.stride);
+
+        let start =
+            (self.tile_top + local_y) * self.row_stride + (self.tile_left + local_x) * self.stride;
+
+        // SAFETY: this tile's macroblock rectangle is disjoint from every other tile's (see the
+        // type's doc comment), so `start..start + stride` belongs to this writer alone. It's
+        // in-bounds because `decode_tiles_into` sizes the shared buffer to hold every tile's
+        // full macroblock rectangle at `row_stride`.
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), self.base.add(start), self.stride);
+        }
+    }
+}
+
+/// Wraps a raw pointer so it can cross the `rayon` closure boundary below.
+///
+/// # Safety
+///
+/// Callers must only dereference it through a [`TileWriter`], whose own safety invariant
+/// establishes disjoint access.
+struct SharedBase(*mut i32);
+
+#[expect(
+    unsafe_code,
+    reason = "lets the shared buffer's base pointer cross into rayon worker threads; see the type's doc comment"
+)]
+// SAFETY: see the type's doc comment.
+unsafe impl Sync for SharedBase {}
+
+impl SharedBase {
+    /// Reads the pointer through a method call so a closure capturing `self.get()` captures the
+    /// whole `SharedBase` (and its `Sync` impl), not just the `*mut i32` field — Rust's disjoint
+    /// closure captures would otherwise capture the bare, non-`Sync` pointer field directly.
+    fn get(&self) -> *mut i32 {
+        self.0
+    }
+}
+
+/// Decodes every tile packet directly into its macroblock rectangle of `values` (`stride` values
+/// per macroblock), in parallel for large images.
 ///
 /// Tile packets are independent bitstreams whose prediction resets at tile edges, so tiles can
-/// decode in any order; only the scatter needs the global macroblock layout.
+/// decode in any order; each tile's [`TileWriter`] only ever touches its own rectangle.
 fn decode_tiles_into(
     stream: &ParsedCodestream<'_>,
     values: &mut [i32],
     macroblock_width: usize,
     stride: usize,
-    decode_packet: impl Fn(&Tile, &mut [i32]) -> Result<()> + Sync,
+    decode_packet: impl Fn(&Tile, TileWriter<'_>) -> Result<()> + Sync,
 ) -> Result<()> {
     let tiles = tile_grid(stream);
+    let row_stride = macroblock_width * stride;
+    let base = SharedBase(values.as_mut_ptr());
+
     let decode_tile = |tile: &Tile| {
-        let mut local = vec![0_i32; tile.width * tile.height * stride];
-        decode_packet(tile, &mut local)?;
-        Ok(local)
+        let writer = TileWriter {
+            base: base.get(),
+            row_stride,
+            stride,
+            tile_left: tile.left,
+            tile_top: tile.top,
+            _buffer: PhantomData,
+        };
+        decode_packet(tile, writer)
     };
 
     let macroblock_count = values.len() / stride.max(1);
-    let tile_values = if macroblock_count >= MIN_PARALLEL_MACROBLOCKS && tiles.len() > 1 {
-        tiles
-            .par_iter()
-            .map(decode_tile)
-            .collect::<Result<Vec<_>>>()?
+    if macroblock_count >= MIN_PARALLEL_MACROBLOCKS && tiles.len() > 1 {
+        tiles.par_iter().try_for_each(decode_tile)?;
     } else {
-        tiles.iter().map(decode_tile).collect::<Result<Vec<_>>>()?
-    };
-
-    for (tile, local) in tiles.iter().zip(&tile_values) {
-        let row_len = tile.width * stride;
-        for local_y in 0..tile.height {
-            let global_row = (tile.top + local_y) * macroblock_width + tile.left;
-            values[global_row * stride..][..row_len]
-                .copy_from_slice(&local[local_y * row_len..][..row_len]);
-        }
+        tiles.iter().try_for_each(decode_tile)?;
     }
 
     Ok(())
@@ -1185,13 +1310,16 @@ fn dequantize_and_predict_highpass_macroblock(
     debug_assert_eq!(remainder, []);
 
     for (values, &factor) in components.iter_mut().zip(factors) {
-        for value in values.iter_mut() {
-            *value = value.checked_mul(factor).ok_or_else(|| {
-                Error::new(
-                    ErrorKind::InvalidCodestream("dequantized highpass coefficient overflow"),
-                    offset,
-                )
-            })?;
+        // Lossless quantization leaves coefficients unchanged.
+        if factor != 1 {
+            for value in values.iter_mut() {
+                *value = value.checked_mul(factor).ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidCodestream("dequantized highpass coefficient overflow"),
+                        offset,
+                    )
+                })?;
+            }
         }
 
         match mode {
@@ -1259,11 +1387,20 @@ fn combine_and_transform(
         .checked_mul(lowpass.components)
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded("sample buffer"), stream.offset))?;
 
+    #[expect(
+        unsafe_code,
+        reason = "avoids zeroing an output buffer this function immediately overwrites in full"
+    )]
     let mut output = IntegerImage {
         width,
         height,
         components: lowpass.components,
-        values: vec![0; value_count],
+        // SAFETY: `combine_and_transform_band` below unconditionally writes every `(row, x)`
+        // position of its band slice for every one of the 16 blocks per macroblock, and the
+        // `chunks_mut`/`par_chunks_mut` split below covers every band; together every element of
+        // `values` is written before this function returns `Ok`. Unlike the highpass/lowpass
+        // coefficient buffers, this one has no data-dependent "leave as zero" case.
+        values: unsafe { uninit_vec(value_count) },
     };
 
     let band_len = width * 16;
@@ -1307,15 +1444,13 @@ fn combine_and_transform_band(
         let highpass_start = (macroblock * highpass.components + component) * 256;
 
         for block in 0_usize..16 {
-            let mut coefficients = [0_i32; 16];
-            coefficients[0] = lowpass.values[lowpass_start + block];
-
+            let dc = lowpass.values[lowpass_start + block];
             let source =
                 &highpass.values[highpass_start + block * 16..highpass_start + (block + 1) * 16];
 
-            coefficients[1..].copy_from_slice(&source[1..]);
-
-            inverse_transform_4x4(&mut coefficients, offset)?;
+            // `source[0]` is highpass's own placeholder DC; substitute the real lowpass value.
+            let values = permute_coefficients(|input| if input == 0 { dc } else { source[input] });
+            let coefficients = inverse_transform_4x4_values(values, offset)?;
 
             let block_x = block % 4;
             let block_y = block / 4;
@@ -1334,34 +1469,41 @@ fn combine_and_transform_band(
     Ok(())
 }
 
+// Regroups the 16 macroblock-relative coefficient positions (T.832's raster scan order) into
+// the four disjoint 2x2 groups the butterfly stages below each expect contiguously: `[0, 1,
+// 4, 5]` for the DC/lowpass rotate (`t2x2`), `[2, 3, 6, 7, 8, 9, 12, 13]` for the two odd
+// pairs (`inverse_odd_pair`), and `[10, 11, 14, 15]` for the remaining odd-odd pair
+// (`inverse_odd_odd`). `t2x2_quad` then recombines across all four groups. This undoes the
+// forward encoder's equivalent regrouping permutation.
+const INVERSE_TRANSFORM_PERMUTATION: [usize; 16] =
+    [0, 8, 4, 13, 2, 15, 3, 14, 1, 12, 5, 9, 7, 11, 6, 10];
+
+/// Builds the permuted `values` the transform stages expect, reading coefficient `input` from
+/// `source(input)`.
+///
+/// A `source` closure lets `combine_and_transform_band` build `values` directly from the DC
+/// coefficient and the highpass block, instead of first assembling a combined `[i32; 16]` just to
+/// have this function immediately copy out of it again.
 #[inline]
-fn inverse_transform_4x4(coefficients: &mut [i32; 16], offset: usize) -> Result<()> {
-    // Regroups the 16 macroblock-relative coefficient positions (T.832's raster scan order) into
-    // the four disjoint 2x2 groups the butterfly stages below each expect contiguously: `[0, 1,
-    // 4, 5]` for the DC/lowpass rotate (`t2x2`), `[2, 3, 6, 7, 8, 9, 12, 13]` for the two odd
-    // pairs (`inverse_odd_pair`), and `[10, 11, 14, 15]` for the remaining odd-odd pair
-    // (`inverse_odd_odd`). `t2x2_quad` then recombines across all four groups. This undoes the
-    // forward encoder's equivalent regrouping permutation.
-    const PERMUTATION: [usize; 16] = [0, 8, 4, 13, 2, 15, 3, 14, 1, 12, 5, 9, 7, 11, 6, 10];
-
+fn permute_coefficients(source: impl Fn(usize) -> i32) -> [i64; 16] {
     let mut values = [0_i64; 16];
-    for (input, destination) in PERMUTATION.into_iter().enumerate() {
-        values[destination] = i64::from(coefficients[input]);
+    for (input, destination) in INVERSE_TRANSFORM_PERMUTATION.into_iter().enumerate() {
+        values[destination] = i64::from(source(input));
     }
+    values
+}
 
+#[inline]
+fn inverse_transform_4x4_values(mut values: [i64; 16], offset: usize) -> Result<[i32; 16]> {
     transform_group(&mut values, [0, 1, 4, 5], |group| t2x2(group, 1));
     inverse_odd_pair(&mut values);
     transform_group(&mut values, [10, 11, 14, 15], inverse_odd_odd);
-    t2x2_quad(&mut values);
+    t2x2_quad(&values, offset)
+}
 
-    for (destination, value) in coefficients.iter_mut().zip(values) {
-        *destination = i32::try_from(value).map_err(|_conversion_error| {
-            Error::new(
-                ErrorKind::InvalidCodestream("inverse-transform coefficient overflow"),
-                offset,
-            )
-        })?;
-    }
+fn inverse_transform_4x4(coefficients: &mut [i32; 16], offset: usize) -> Result<()> {
+    let values = permute_coefficients(|input| coefficients[input]);
+    *coefficients = inverse_transform_4x4_values(values, offset)?;
 
     Ok(())
 }
@@ -1419,7 +1561,7 @@ fn inverse_odd_pair(values: &mut [i64; 16]) {
 }
 
 #[inline]
-fn t2x2_quad(values: &mut [i64; 16]) {
+fn t2x2_quad(values: &[i64; 16], offset: usize) -> Result<[i32; 16]> {
     let mut first = I64x4::from_array([values[0], values[5], values[1], values[4]]);
     let mut second = I64x4::from_array([values[3], values[6], values[2], values[7]]);
     let mut third = I64x4::from_array([values[12], values[9], values[13], values[8]]);
@@ -1436,15 +1578,32 @@ fn t2x2_quad(values: &mut [i64; 16]) {
     first -= fourth;
     second += third;
 
-    let [first_a, first_b, first_c, first_d] = first.to_array();
-    let [second_a, second_b, second_c, second_d] = second.to_array();
-    let [third_a, third_b, third_c, third_d] = third.to_array();
-    let [fourth_a, fourth_b, fourth_c, fourth_d] = fourth.to_array();
+    // Adding 2^31 maps the i32 range to 0..=u32::MAX. Any upper bit means overflow.
+    let bias = I64x4::splat(1 << 31);
+    let biased = (first + bias) | (second + bias) | (third + bias) | (fourth + bias);
+    if (biased >> 32).simd_ne(I64x4::splat(0)).any() {
+        return Err(Error::new(
+            ErrorKind::InvalidCodestream("inverse-transform coefficient overflow"),
+            offset,
+        ));
+    }
 
-    [values[0], values[5], values[1], values[4]] = [first_a, first_b, first_c, first_d];
-    [values[3], values[6], values[2], values[7]] = [second_a, second_b, second_c, second_d];
-    [values[12], values[9], values[13], values[8]] = [third_a, third_b, third_c, third_d];
-    [values[15], values[10], values[14], values[11]] = [fourth_a, fourth_b, fourth_c, fourth_d];
+    let low = simd_swizzle!(
+        first.cast::<i32>(),
+        second.cast::<i32>(),
+        [0, 2, 6, 4, 3, 1, 5, 7]
+    );
+    let high = simd_swizzle!(
+        third.cast::<i32>(),
+        fourth.cast::<i32>(),
+        [3, 1, 5, 7, 0, 2, 6, 4]
+    );
+    Ok(simd_swizzle!(
+        low,
+        high,
+        [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    )
+    .to_array())
 }
 
 #[inline]
@@ -1885,7 +2044,7 @@ fn decode_dc_packet(
     width: usize,
     height: usize,
     components: usize,
-    values: &mut [i32],
+    writer: TileWriter<'_>,
 ) -> Result<()> {
     let mut reader = BitReader::new(packet.bytes, packet.offset);
 
@@ -1901,8 +2060,7 @@ fn decode_dc_packet(
     for local_y in 0..height {
         for local_x in 0..width {
             let macroblock = decode_dc_macroblock(&mut reader, plane, &mut context)?;
-            let start = (local_y * width + local_x) * components;
-            values[start..start + components].copy_from_slice(&macroblock[..components]);
+            writer.write_macroblock(local_y, local_x, &macroblock[..components]);
 
             if local_x.is_multiple_of(16) || local_x + 1 == width {
                 context.adapt();
@@ -1927,7 +2085,7 @@ fn decode_lowpass_packet(
     width: usize,
     height: usize,
     components: usize,
-    values: &mut [i32],
+    writer: TileWriter<'_>,
 ) -> Result<()> {
     let mut reader = BitReader::new(packet.bytes, packet.offset);
 
@@ -1947,8 +2105,7 @@ fn decode_lowpass_packet(
             }
 
             let macroblock = decode_lowpass_macroblock(&mut reader, plane, &mut context)?;
-            let start = (local_y * width + local_x) * components * 16;
-            values[start..start + components * 16].copy_from_slice(&macroblock[..components * 16]);
+            writer.write_macroblock(local_y, local_x, &macroblock[..components * 16]);
 
             if local_x.is_multiple_of(16) || local_x + 1 == width {
                 context.adapt();
@@ -2094,12 +2251,12 @@ fn decode_flexbits_packet(
                     let refinement = i32::try_from(reader.read_u32(flex_bits)?)
                         .expect("at most 15 flexbits fit i32");
 
-                    let flex = match vlc.cmp(&0) {
-                        Ordering::Greater => refinement,
-                        Ordering::Less => -refinement,
-                        Ordering::Equal if refinement != 0 && reader.read_bool()? => -refinement,
-                        Ordering::Equal => refinement,
+                    let negative = if vlc == 0 && refinement != 0 {
+                        reader.read_bool()?
+                    } else {
+                        vlc < 0
                     };
+                    let flex = if negative { -refinement } else { refinement };
 
                     let flex = flex.checked_shl(u32::from(trim)).ok_or_else(|| {
                         reader.error(ErrorKind::InvalidCodestream(
@@ -2963,6 +3120,212 @@ fn decode_absolute_level(reader: &mut BitReader<'_>, adaptive: &mut AdaptiveVLC)
 mod tests {
     use super::*;
     use crate::{Decoder, PixelFormat};
+
+    #[test]
+    fn tile_writer_places_every_macroblock_at_its_disjoint_global_offset() {
+        // A 4x4 macroblock grid split into a 2x2 grid of 2x2-macroblock tiles, matching the DC
+        // decode path's `stride == components == 3`.
+        const MACROBLOCK_WIDTH: usize = 4;
+        const MACROBLOCK_HEIGHT: usize = 4;
+        const STRIDE: usize = 3;
+        let row_stride = MACROBLOCK_WIDTH * STRIDE;
+
+        let tiles = [
+            Tile {
+                index: 0,
+                left: 0,
+                top: 0,
+                width: 2,
+                height: 2,
+            },
+            Tile {
+                index: 1,
+                left: 2,
+                top: 0,
+                width: 2,
+                height: 2,
+            },
+            Tile {
+                index: 2,
+                left: 0,
+                top: 2,
+                width: 2,
+                height: 2,
+            },
+            Tile {
+                index: 3,
+                left: 2,
+                top: 2,
+                width: 2,
+                height: 2,
+            },
+        ];
+
+        let tag = |tile_index: usize, local_y: usize, local_x: usize| -> i32 {
+            i32::try_from(tile_index * 100 + local_y * 10 + local_x).unwrap()
+        };
+
+        let mut values = vec![0_i32; MACROBLOCK_WIDTH * MACROBLOCK_HEIGHT * STRIDE];
+        let base = values.as_mut_ptr();
+
+        for tile in &tiles {
+            let writer = TileWriter {
+                base,
+                row_stride,
+                stride: STRIDE,
+                tile_left: tile.left,
+                tile_top: tile.top,
+                _buffer: PhantomData,
+            };
+            for local_y in 0..tile.height {
+                for local_x in 0..tile.width {
+                    let value = tag(tile.index, local_y, local_x);
+                    writer.write_macroblock(local_y, local_x, &[value, value + 1, value + 2]);
+                }
+            }
+        }
+
+        for global_y in 0..MACROBLOCK_HEIGHT {
+            for global_x in 0..MACROBLOCK_WIDTH {
+                let tile_index = (global_y / 2) * 2 + (global_x / 2);
+                let expected = tag(tile_index, global_y % 2, global_x % 2);
+                let start = (global_y * MACROBLOCK_WIDTH + global_x) * STRIDE;
+                assert_eq!(
+                    values[start..start + STRIDE],
+                    [expected, expected + 1, expected + 2],
+                    "at global ({global_x}, {global_y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn highpass_dequantization_preserves_prediction_and_overflow_checks() {
+        for factor in [1, 3] {
+            for mode in 0..=2 {
+                let mut values = [1; 256];
+                dequantize_and_predict_highpass_macroblock(&mut values, &[factor], mode, 7)
+                    .unwrap();
+                for (index, value) in values.into_iter().enumerate() {
+                    let block = index / 16;
+                    let coefficient = index % 16;
+                    let chain_length = match (mode, coefficient) {
+                        (0, 4 | 8 | 12) => block % 4 + 1,
+                        (1, 1..=3) => block / 4 + 1,
+                        _ => 1,
+                    };
+                    assert_eq!(value, factor * i32::try_from(chain_length).unwrap());
+                }
+            }
+        }
+
+        let mut values = [i32::MIN; 256];
+        values[0] = i32::MAX;
+        let expected = values;
+        dequantize_and_predict_highpass_macroblock(&mut values, &[1], 2, 7).unwrap();
+        assert_eq!(values, expected);
+        assert_eq!(
+            dequantize_and_predict_highpass_macroblock(&mut values, &[2], 2, 7),
+            Err(Error::new(
+                ErrorKind::InvalidCodestream("dequantized highpass coefficient overflow"),
+                7,
+            ))
+        );
+
+        let mut values = [1; 256];
+        values[4] = i32::MAX;
+        assert_eq!(
+            dequantize_and_predict_highpass_macroblock(&mut values, &[1], 0, 7),
+            Err(Error::new(
+                ErrorKind::InvalidCodestream("predicted highpass coefficient overflow"),
+                7,
+            ))
+        );
+    }
+
+    #[test]
+    fn scaled_simd_clipping_matches_scalar_at_boundaries() {
+        for shift in [0, 3] {
+            let ceiling = 1023_i64 << shift;
+            for values in [
+                [i64::MIN, i64::from(i32::MIN), -1, 0, 1, 7, 8, 1023],
+                [
+                    ceiling - 1,
+                    ceiling,
+                    ceiling + 1,
+                    ceiling + 7,
+                    ceiling + 8,
+                    i64::from(i32::MAX),
+                    i64::MAX - 1,
+                    i64::MAX,
+                ],
+            ] {
+                assert_eq!(
+                    clip_10_bit_simd(I64x8::from_array(values), shift).to_array(),
+                    values.map(|value| clip_10_bit(value >> shift)),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inverse_transform_vector_narrowing_matches_checked_scalar_output() {
+        let reference = |coefficients: [i32; 16]| {
+            let mut values = [0_i64; 16];
+            for (input, destination) in [0, 8, 4, 13, 2, 15, 3, 14, 1, 12, 5, 9, 7, 11, 6, 10]
+                .into_iter()
+                .enumerate()
+            {
+                values[destination] = i64::from(coefficients[input]);
+            }
+            transform_group(&mut values, [0, 1, 4, 5], |group| t2x2(group, 1));
+            inverse_odd_pair(&mut values);
+            transform_group(&mut values, [10, 11, 14, 15], inverse_odd_odd);
+            for indexes in [[0, 3, 12, 15], [5, 6, 9, 10], [1, 2, 13, 14], [4, 7, 8, 11]] {
+                transform_group(&mut values, indexes, |group| t2x2(group, 0));
+            }
+            let mut output = [0; 16];
+            for (destination, value) in output.iter_mut().zip(values) {
+                *destination = i32::try_from(value).ok()?;
+            }
+            Some(output)
+        };
+
+        let mut cases = vec![[0; 16], [i32::MIN; 16], [i32::MAX; 16]];
+        for lane in 0..16 {
+            for value in [i32::MIN, i32::MAX, -1, 1] {
+                let mut coefficients = [0; 16];
+                coefficients[lane] = value;
+                cases.push(coefficients);
+            }
+        }
+        let mut state = 0x1234_5678_u32;
+        for shift in [0, 4, 16] {
+            for _ in 0..256 {
+                cases.push(std::array::from_fn(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    i32::from_ne_bytes(state.to_ne_bytes()) >> shift
+                }));
+            }
+        }
+
+        for mut coefficients in cases {
+            let expected = reference(coefficients);
+            let result = inverse_transform_4x4(&mut coefficients, 7);
+            if let Some(expected) = expected {
+                result.unwrap();
+                assert_eq!(coefficients, expected);
+            } else {
+                assert_eq!(
+                    result,
+                    Err(Error::new(
+                        ErrorKind::InvalidCodestream("inverse-transform coefficient overflow"),
+                        7,
+                    )),
+                );
+            }
+        }
+    }
 
     #[test]
     fn simd_reconstruction_preserves_transform_and_row_layout() {

@@ -37,6 +37,9 @@ impl PartialEq for Error {
 impl Eq for Error {}
 
 impl Error {
+    // Keep backtrace capture and allocation out of the decoder's successful paths.
+    #[cold]
+    #[inline(never)]
     pub(crate) fn new(kind: ErrorKind, offset: usize) -> Self {
         Self {
             kind,
@@ -60,7 +63,7 @@ impl Error {
     /// Returns whether input ended before a complete syntax element was available.
     #[must_use]
     pub const fn is_unexpected_eof(&self) -> bool {
-        matches!(self.kind, ErrorKind::UnexpectedEof)
+        matches!(self.kind, ErrorKind::UnexpectedEOF)
     }
 
     /// Returns whether the file header or codestream is missing its required signature.
@@ -139,7 +142,7 @@ impl Error {
 pub(crate) enum ErrorKind {
     /// Input ended before a complete syntax element was available.
     #[error("unexpected end of input")]
-    UnexpectedEof,
+    UnexpectedEOF,
 
     /// File header does not contain the JPEG XR signature.
     #[error("invalid JPEG XR signature")]

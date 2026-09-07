@@ -444,7 +444,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Container<'_>> {
             TAG_PIXEL_FORMAT => {
                 entry.require(ElementType::Byte, 16)?;
                 let value = <[u8; 16]>::try_from(entry.data).map_err(|_conversion_error| {
-                    Error::new(ErrorKind::UnexpectedEof, entry.offset)
+                    Error::new(ErrorKind::UnexpectedEOF, entry.offset)
                 })?;
                 pixel_format = Some(PixelFormat::parse(value, entry.offset)?);
             }
@@ -579,7 +579,7 @@ fn parse_entry(bytes: &[u8], offset: usize) -> Result<Entry<'_>> {
         .ok_or_else(|| Error::new(ErrorKind::InvalidOffset("tag payload"), offset + 8))?;
     let data = bytes
         .get(data_offset..end)
-        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, data_offset))?;
+        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEOF, data_offset))?;
 
     Ok(Entry {
         tag,
@@ -608,7 +608,7 @@ fn codestream<'a>(
         .ok_or_else(|| Error::new(ErrorKind::InvalidOffset(name), error_offset))?;
     let bytes = bytes
         .get(offset..end)
-        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, offset))?;
+        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEOF, offset))?;
 
     Ok(Codestream { bytes, offset })
 }
@@ -620,7 +620,7 @@ fn required<T>(value: Option<T>, tag: u16, offset: usize) -> Result<T> {
 fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
     let value = bytes
         .get(offset..offset.saturating_add(2))
-        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, offset))?;
+        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEOF, offset))?;
 
     Ok(U16::read_from_bytes(value)
         .expect("validated two-byte slice")
@@ -630,7 +630,7 @@ fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
 fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
     let value = bytes
         .get(offset..offset.saturating_add(4))
-        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEof, offset))?;
+        .ok_or_else(|| Error::new(ErrorKind::UnexpectedEOF, offset))?;
 
     Ok(U32::read_from_bytes(value)
         .expect("validated four-byte slice")

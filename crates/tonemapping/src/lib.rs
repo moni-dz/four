@@ -105,9 +105,10 @@ impl LinearRGB {
     #[must_use]
     #[inline]
     pub fn luminance(self) -> f32 {
-        let luminance = REC709_LUMINANCE[0] * self.0[0]
-            + REC709_LUMINANCE[1] * self.0[1]
-            + REC709_LUMINANCE[2] * self.0[2];
+        let luminance = self.0[2].mul_add(
+            REC709_LUMINANCE[2],
+            self.0[1].mul_add(REC709_LUMINANCE[1], self.0[0] * REC709_LUMINANCE[0]),
+        );
 
         // The weights sum to one, so a finite input can overflow only by a rounding step.
         // Saturating preserves the documented guarantee that luminance is finite.

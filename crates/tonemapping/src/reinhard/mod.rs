@@ -3,7 +3,7 @@ use std::backtrace::Backtrace;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;
-use std::simd::{Select, cmp::SimdPartialOrd, num::SimdFloat};
+use std::simd::{Select, StdFloat, cmp::SimdPartialOrd, num::SimdFloat};
 
 use super::{
     LinearRGB, LinearRGBPlanes, MaxCll, OrderedLevel, ToneMapper, WhitePoint, WhitePointError,
@@ -141,9 +141,13 @@ fn luminance_reinhard_batch(colors: &mut LinearRGBPlanes) {
     let one = F32x8::splat(1.0);
 
     map_colors(colors, |components| {
-        let luminance = F32x8::splat(super::REC709_LUMINANCE[0]) * components[0]
-            + F32x8::splat(super::REC709_LUMINANCE[1]) * components[1]
-            + F32x8::splat(super::REC709_LUMINANCE[2]) * components[2];
+        let luminance = components[2].mul_add(
+            F32x8::splat(super::REC709_LUMINANCE[2]),
+            components[1].mul_add(
+                F32x8::splat(super::REC709_LUMINANCE[1]),
+                components[0] * F32x8::splat(super::REC709_LUMINANCE[0]),
+            ),
+        );
 
         let scale = one / (one + luminance);
 
@@ -382,9 +386,13 @@ fn extended_luminance_reinhard_batch(colors: &mut LinearRGBPlanes, white_squared
     let white_squared = F32x8::splat(white_squared);
 
     map_colors(colors, |components| {
-        let luminance = F32x8::splat(super::REC709_LUMINANCE[0]) * components[0]
-            + F32x8::splat(super::REC709_LUMINANCE[1]) * components[1]
-            + F32x8::splat(super::REC709_LUMINANCE[2]) * components[2];
+        let luminance = components[2].mul_add(
+            F32x8::splat(super::REC709_LUMINANCE[2]),
+            components[1].mul_add(
+                F32x8::splat(super::REC709_LUMINANCE[1]),
+                components[0] * F32x8::splat(super::REC709_LUMINANCE[0]),
+            ),
+        );
 
         let scale = (one + luminance / white_squared) / (one + luminance);
 
@@ -423,9 +431,13 @@ fn reinhard_jodie_batch(colors: &mut LinearRGBPlanes) {
     let one = F32x8::splat(1.0);
 
     map_colors(colors, |components| {
-        let luminance = F32x8::splat(super::REC709_LUMINANCE[0]) * components[0]
-            + F32x8::splat(super::REC709_LUMINANCE[1]) * components[1]
-            + F32x8::splat(super::REC709_LUMINANCE[2]) * components[2];
+        let luminance = components[2].mul_add(
+            F32x8::splat(super::REC709_LUMINANCE[2]),
+            components[1].mul_add(
+                F32x8::splat(super::REC709_LUMINANCE[1]),
+                components[0] * F32x8::splat(super::REC709_LUMINANCE[0]),
+            ),
+        );
 
         let luminance_scale = one / (one + luminance);
         let component_mapped = components.map(|component| component / (one + component));
