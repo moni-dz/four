@@ -20,8 +20,8 @@ use model::{
 use scan::{ScanComponent, ScanHeader, parse_frame_components, parse_scan_header};
 
 use super::{
-    DIMENSION_MAX, DecodedImage, Dimensions, PIXELS_MAX, map_dimensions_error, rgba_pixel_rows,
-    round_clamp_u8,
+    DIMENSION_MAX, DecodedImage, Dimensions, PARALLEL_PIXELS_MIN, PARALLEL_PIXELS_PER_JOB,
+    PIXELS_MAX, map_dimensions_error, rgba_pixel_rows, round_clamp_u8,
 };
 
 use zune_jpeg::JpegDecoder;

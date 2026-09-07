@@ -1,17 +1,24 @@
 //! Owns frame geometry, bounded coefficient storage, and pixel materialization.
 
 use exn::OptionExt;
+use multiversion::multiversion;
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::convert::Infallible;
+use std::simd::{Simd, StdFloat, num::SimdFloat};
 
 use super::{
     BLOCK_SIDE, COMPONENTS_MAX, DIMENSION_MAX, DecodedImage, Dimensions, Error, JPEGError,
-    JPEGLimit, JPEGTableKind, PIXELS_MAX, PROGRESSIVE_COEFFICIENT_BYTES_MAX, Result, divide_ceil,
-    error, idct, map_dimensions_error, rgba_pixel_rows, round_clamp_u8,
+    JPEGLimit, JPEGTableKind, PARALLEL_PIXELS_MIN, PARALLEL_PIXELS_PER_JOB, PIXELS_MAX,
+    PROGRESSIVE_COEFFICIENT_BYTES_MAX, Result, divide_ceil, error, idct, map_dimensions_error,
+    rgba_pixel_rows, round_clamp_u8,
 };
 
 const PARALLEL_BLOCKS_MIN: usize = 4 * 1024;
 const PARALLEL_BLOCKS_PER_JOB: usize = 1_024;
+
+const COLOR_LANES: usize = 8;
+type F32x8 = Simd<f32, COLOR_LANES>;
 
 #[derive(Clone, Copy)]
 pub(super) enum ColorTransform {
@@ -162,25 +169,90 @@ impl Frame {
         let width = usize::try_from(self.width).expect("validated JPEG width fits usize");
         let height = usize::try_from(self.height).expect("validated JPEG height fits usize");
 
-        let rgba: Vec<u8> = rgba_pixel_rows(width, height, |x, y| {
-            let x = PixelX(u32::try_from(x).expect("JPEG pixel x fits u32"));
-            let y = PixelY(u32::try_from(y).expect("JPEG pixel y fits u32"));
-            Ok::<_, Infallible>(self.rgba_pixel(x, y, transform))
-        })
-        .unwrap_or_else(|never| match never {});
+        let rgba = if self.components.len() == 1 {
+            rgba_pixel_rows(width, height, |x, y| {
+                let x = PixelX(u32::try_from(x).expect("JPEG pixel x fits u32"));
+                let y = PixelY(u32::try_from(y).expect("JPEG pixel y fits u32"));
+                Ok::<_, Infallible>(self.rgba_pixel(x, y))
+            })
+            .unwrap_or_else(|never| match never {})
+        } else {
+            self.write_color_rows(transform, width, height)
+        };
 
         invariant_eq!(rgba.len(), width * height * 4);
         DecodedImage::new(self.width, self.height, rgba)
     }
 
-    fn rgba_pixel(&self, x: PixelX, y: PixelY, transform: ColorTransform) -> [u8; 4] {
-        let first = self.sample(0, x, y);
-        if self.components.len() == 1 {
-            [first, first, first, 255]
+    fn rgba_pixel(&self, x: PixelX, y: PixelY) -> [u8; 4] {
+        let sample = self.sample(0, x, y);
+        [sample, sample, sample, 255]
+    }
+
+    /// Materializes the two- or three-component color path a row at a time so the chroma-upsample
+    /// and YCbCr->RGB matrix multiply can run through [`convert_color_row`] instead of once per
+    /// pixel. Mirrors [`rgba_pixel_rows`]'s parallelism threshold exactly.
+    fn write_color_rows(&self, transform: ColorTransform, width: usize, height: usize) -> Vec<u8> {
+        let pixel_count = width * height;
+        let mut rgba = vec![0; pixel_count * 4];
+
+        let write_row = |y: usize, row: &mut [u8]| {
+            let y = PixelY(u32::try_from(y).expect("JPEG pixel y fits u32"));
+            let first = self.component_row(0, y, width);
+            let second = self.component_row(1, y, width);
+            let third = self.component_row(2, y, width);
+
+            let (targets, remainder) = row.as_chunks_mut::<4>();
+            invariant!(remainder.is_empty());
+            convert_color_row(&first, &second, &third, transform, targets);
+        };
+
+        if pixel_count >= PARALLEL_PIXELS_MIN {
+            rgba.par_chunks_mut(width * 4)
+                .with_min_len(PARALLEL_PIXELS_PER_JOB / width.max(1))
+                .enumerate()
+                .for_each(|(y, row)| write_row(y, row));
         } else {
-            let second = self.sample(1, x, y);
-            let third = self.sample(2, x, y);
-            convert_color(first, second, third, transform)
+            for (y, row) in rgba.chunks_mut(width * 4).enumerate() {
+                write_row(y, row);
+            }
+        }
+
+        rgba
+    }
+
+    /// Returns component `component_index`'s samples for row `y`, one per output pixel. Borrows
+    /// the plane row directly when the component isn't subsampled (always true for luma); otherwise
+    /// materializes the nearest-neighbor chroma upsample once for the whole row instead of once per
+    /// pixel, using the same division [`sample`](Self::sample) performs.
+    fn component_row(&self, component_index: usize, y: PixelY, width: usize) -> Cow<'_, [u8]> {
+        let component = &self.components[component_index];
+
+        let sample_y = if component.vertical_sampling == self.max_vertical_sampling {
+            y.0
+        } else {
+            y.0 * u32::from(component.vertical_sampling) / u32::from(self.max_vertical_sampling)
+        };
+
+        let row_start = usize::try_from(
+            u64::from(sample_y) * u64::from(component.plane_width),
+        )
+        .expect("the bounded component plane index fits usize");
+
+        if component.horizontal_sampling == self.max_horizontal_sampling {
+            Cow::Borrowed(&component.plane[row_start..row_start + width])
+        } else {
+            let horizontal_sampling = u32::from(component.horizontal_sampling);
+            let max_horizontal_sampling = u32::from(self.max_horizontal_sampling);
+
+            Cow::Owned(
+                (0..u32::try_from(width).expect("JPEG width fits u32"))
+                    .map(|x| {
+                        let sample_x = x * horizontal_sampling / max_horizontal_sampling;
+                        component.plane[row_start + sample_x as usize]
+                    })
+                    .collect(),
+            )
         }
     }
 
@@ -455,6 +527,73 @@ fn convert_color(first: u8, second: u8, third: u8, transform: ColorTransform) ->
                 255,
             ]
         }
+    }
+}
+
+/// Vectorized sibling of [`convert_color`]: applies the same ITU-T T.871 conversion to a whole row
+/// of samples at once. Uses plain multiply/add rather than `mul_add` so its rounding matches
+/// [`convert_color`]'s bit for bit — the scalar tail calls `convert_color` directly, so the two
+/// must agree exactly, not just approximately.
+#[multiversion(targets = "simd")]
+fn convert_color_row(
+    first: &[u8],
+    second: &[u8],
+    third: &[u8],
+    transform: ColorTransform,
+    targets: &mut [[u8; 4]],
+) {
+    invariant_eq!(first.len(), targets.len());
+    invariant_eq!(second.len(), targets.len());
+    invariant_eq!(third.len(), targets.len());
+
+    if matches!(transform, ColorTransform::RGB) {
+        for (((first, second), third), target) in
+            first.iter().zip(second).zip(third).zip(targets.iter_mut())
+        {
+            *target = [*first, *second, *third, 255];
+        }
+        return;
+    }
+
+    let (first_chunks, first_tail) = first.as_chunks::<COLOR_LANES>();
+    let (second_chunks, second_tail) = second.as_chunks::<COLOR_LANES>();
+    let (third_chunks, third_tail) = third.as_chunks::<COLOR_LANES>();
+    let (target_chunks, target_tail) = targets.as_chunks_mut::<COLOR_LANES>();
+
+    for (((luminance, blue), red), targets) in first_chunks
+        .iter()
+        .zip(second_chunks)
+        .zip(third_chunks)
+        .zip(target_chunks)
+    {
+        let luminance = F32x8::from_array((*luminance).map(f32::from));
+        let blue_difference = F32x8::from_array((*blue).map(f32::from)) - F32x8::splat(128.0);
+        let red_difference = F32x8::from_array((*red).map(f32::from)) - F32x8::splat(128.0);
+
+        let red_out = luminance + red_difference * F32x8::splat(1.402);
+        let green_out = luminance
+            - blue_difference * F32x8::splat(0.344_136)
+            - red_difference * F32x8::splat(0.714_136);
+        let blue_out = luminance + blue_difference * F32x8::splat(1.772);
+
+        let encode = |values: F32x8| {
+            values
+                .round()
+                .simd_clamp(F32x8::splat(0.0), F32x8::splat(255.0))
+                .cast::<u8>()
+                .to_array()
+        };
+        let [red_out, green_out, blue_out] = [red_out, green_out, blue_out].map(encode);
+
+        for lane in 0..COLOR_LANES {
+            targets[lane] = [red_out[lane], green_out[lane], blue_out[lane], 255];
+        }
+    }
+
+    for (((first, second), third), target) in
+        first_tail.iter().zip(second_tail).zip(third_tail).zip(target_tail)
+    {
+        *target = convert_color(*first, *second, *third, transform);
     }
 }
 
