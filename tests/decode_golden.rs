@@ -9,7 +9,7 @@
 //! stating the reason and the magnitude of the difference. Set `FOUR_RECORD_GOLDEN=1` to print the
 //! constants for the current build.
 
-use four::{DecodedImage, gif, jpeg, jpeg_xl, png, tiff};
+use four::{DecodedImage, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
 
 /// One pinned fixture.
 struct Golden {
@@ -33,6 +33,7 @@ fn decode(file: &str, bytes: &[u8]) -> DecodedImage {
         "gif" => gif::decode(bytes).expect("fixture decodes as GIF"),
         "jpg" | "jpeg" => jpeg::decode(bytes).expect("fixture decodes as JPEG"),
         "jxl" => jpeg_xl::decode(bytes).expect("fixture decodes as JPEG XL"),
+        "jxr" => jpeg_xr::decode(bytes).expect("fixture decodes as JPEG XR"),
         "png" => png::decode(bytes).expect("fixture decodes as PNG"),
         "tiff" | "tif" => tiff::decode(bytes).expect("fixture decodes as TIFF"),
         other => panic!("no decoder is registered for the {other} fixture extension"),
@@ -188,6 +189,7 @@ fn truncated_fixtures_fail_without_panicking() {
                 "gif" => gif::decode(prefix).is_ok(),
                 "jpg" | "jpeg" => jpeg::decode(prefix).is_ok(),
                 "jxl" => jpeg_xl::decode(prefix).is_ok(),
+                "jxr" => jpeg_xr::decode(prefix).is_ok(),
                 "png" => png::decode(prefix).is_ok(),
                 "tiff" | "tif" => tiff::decode(prefix).is_ok(),
                 other => panic!("no decoder is registered for the {other} fixture extension"),
@@ -197,6 +199,29 @@ fn truncated_fixtures_fail_without_panicking() {
 }
 
 const GOLDENS: &[Golden] = &[
+    Golden {
+        file: "screenshot.jxr",
+        dimensions: (3840, 2160),
+        hash: 0x6d05_5895_20a4_8482,
+        thumbnail: [
+            [50, 45, 37, 255],
+            [127, 108, 97, 255],
+            [125, 117, 116, 255],
+            [89, 90, 93, 255],
+            [11, 8, 5, 255],
+            [55, 44, 32, 255],
+            [88, 76, 65, 255],
+            [43, 35, 23, 255],
+            [42, 28, 17, 255],
+            [71, 48, 36, 255],
+            [49, 35, 30, 255],
+            [37, 26, 21, 255],
+            [47, 34, 26, 255],
+            [40, 26, 20, 255],
+            [26, 18, 17, 255],
+            [44, 34, 29, 255],
+        ],
+    },
     Golden {
         file: "large.tiff",
         dimensions: (640, 480),
