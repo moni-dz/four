@@ -10,7 +10,7 @@ supported formats:
 
 HDR tone mappers:
  - ACES
- - ITU-R BT2446-2 Method A
+ - ITU-R BT2446-1 Method A
  - clamp
  - Hable's filmic (Uncharted 2)
  - Reinhard (luminance, extended, extended-luminance)

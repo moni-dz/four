@@ -524,10 +524,10 @@ define_tone_mapping_methods! {
         uses_white_point: false,
         uses_luminance_white_point: false,
     }
-    /// Applies ITU-R BT.2446-2 Method A.
+    /// Applies ITU-R BT.2446-1 Method A.
     #[default]
     BT2446 {
-        label: "ITU-R BT2446-2 A",
+        label: "ITU-R BT2446-1 A",
         mapper: BT2446A = |_, _| BT2446A,
         uses_white_point: false,
         uses_luminance_white_point: false,
@@ -1148,7 +1148,7 @@ mod tests {
         assert_eq!(labels.len(), ToneMappingMethod::ALL.len());
         assert!(labels.iter().all(|label| !label.is_empty()));
         assert_eq!(ToneMappingMethod::default(), ToneMappingMethod::BT2446);
-        assert_eq!(ToneMappingMethod::default().to_string(), "ITU-R BT2446-2 A");
+        assert_eq!(ToneMappingMethod::default().to_string(), "ITU-R BT2446-1 A");
     }
 
     #[test]
