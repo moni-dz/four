@@ -10,7 +10,7 @@ use std::io::Cursor;
 
 use ::png::{BitDepth, ColorType, Decoder, Limits, Transformations};
 
-use super::{DIMENSION_MAX, DecodedImage, Dimensions, DimensionsError, PIXELS_MAX};
+use super::{DIMENSION_MAX, DecodedImage, Dimensions, PIXELS_MAX, map_dimensions_error};
 use error::error;
 
 pub use error::{Error, PNGError, PNGLimit, Result};
@@ -98,21 +98,24 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
 fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     Dimensions::try_new((width, height))
         .map(|_| ())
-        .map_err(|dimensions_error| match dimensions_error {
-            DimensionsError::Zero => error(PNGError::Output("PNG dimensions must both be nonzero")),
-            DimensionsError::TooLarge { width, height } => {
-                error(PNGError::LimitExceeded(PNGLimit::Dimensions {
-                    actual_width: width,
-                    actual_height: height,
-                    max: DIMENSION_MAX,
-                }))
-            }
-            DimensionsError::TooManyPixels { pixels } => {
-                error(PNGError::LimitExceeded(PNGLimit::Pixels {
-                    actual: pixels,
-                    max: PIXELS_MAX,
-                }))
-            }
+        .map_err(|dimensions_error| {
+            map_dimensions_error(
+                dimensions_error,
+                || error(PNGError::Output("PNG dimensions must both be nonzero")),
+                |width, height| {
+                    error(PNGError::LimitExceeded(PNGLimit::Dimensions {
+                        actual_width: width,
+                        actual_height: height,
+                        max: DIMENSION_MAX,
+                    }))
+                },
+                |pixels| {
+                    error(PNGError::LimitExceeded(PNGLimit::Pixels {
+                        actual: pixels,
+                        max: PIXELS_MAX,
+                    }))
+                },
+            )
         })
 }
 

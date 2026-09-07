@@ -1,6 +1,8 @@
 use multiversion::multiversion;
 use std::simd::{Simd, StdFloat, num::SimdFloat};
 
+use super::round_clamp_u8;
+
 const BLOCK_SIDE: usize = 8;
 // These literals carry the same 36 decimal places as Rust's f32 mathematical constants. The
 // compiler still rounds each one to f32 once, but retaining the source precision makes that
@@ -131,7 +133,7 @@ pub(super) fn inverse(coefficients: &[i32; 64]) -> [u8; 64] {
     );
 
     if coefficients[1..].iter().all(|value| *value == 0) {
-        let sample = clamp_sample(coefficients[0] as f32 / 8.0 + LEVEL_SHIFT);
+        let sample = round_clamp_u8(coefficients[0] as f32 / 8.0 + LEVEL_SHIFT);
         return [sample; 64];
     }
 
@@ -189,16 +191,6 @@ fn inverse_simd(coefficients: &[i32; 64]) -> [u8; 64] {
     }
 
     samples
-}
-
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "the value is rounded and clamped to the complete u8 range before conversion"
-)]
-fn clamp_sample(value: f32) -> u8 {
-    invariant!(value.is_finite());
-    value.round().clamp(f32::from(u8::MIN), f32::from(u8::MAX)) as u8
 }
 
 #[cfg(test)]

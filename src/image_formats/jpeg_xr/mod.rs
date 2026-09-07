@@ -23,27 +23,32 @@
 //!   `max(R, G, B)` outlier-rejection step used for still-image `MaxCLL` estimation.
 
 mod error;
+mod hdr;
+mod normalize;
+mod pixel;
 
-use std::num::NonZeroUsize;
-use std::simd::{
-    Select, Simd, StdFloat,
-    cmp::SimdPartialOrd,
-    num::{SimdFloat, SimdUint},
-};
+#[cfg(test)]
+use tonemapping::{Clamp, LinearRGB, LinearRGBPlanes, LuminanceWhitePoint, ToneMapper, WhitePoint};
+use tonemapping::{MaxCLLMode, ToneMappingMethod};
 
-use ::jpegxr::{Decoder as JXRDecoder, PixelFormat as CodecPixelFormat};
-use multiversion::multiversion;
-use rayon::prelude::*;
-use tonemapping::{
-    Clamp, ColorChannel as ToneColorChannel, LinearRGB, LinearRGBPlanes, LuminanceWhitePoint,
-    LuminanceWhitePointEstimator, MaxCLLEstimator, MaxCLLMode, ToneMapper, ToneMappingMethod,
-    WhitePoint, exp2, log2,
+#[cfg(test)]
+use hdr::{
+    AnalysisRequest, AnalysisTotals, HDRPixelSelection, MaxCll, finish_max_cll, hdr_white_point,
 };
-use zerocopy::{FromBytes, IntoBytes};
+use hdr::{AnalysisScope, HDRAnalysis, HDRMetrics};
+use normalize::write_normalized_pixels;
+#[cfg(test)]
+use normalize::{
+    append_hdr_pixels, display_linear_to_srgb8, hdr_to_srgb8, normalized_to_u8,
+    write_bgr101010_hdr_pixels, write_display_pixels, write_hdr_pixels_scalar,
+};
+use pixel::PixelLayout;
+#[cfg(test)]
+use pixel::{SampleEncoding, half_to_f32, pq_to_linear, pq_to_linear_simd, unpack_bgr101010};
 
 use super::{
-    DIMENSION_MAX, DecodedImage, Dimensions, DimensionsError, PARALLEL_PIXELS_MIN,
-    PARALLEL_PIXELS_PER_JOB, PIXELS_MAX,
+    DIMENSION_MAX, DecodedImage, Dimensions, PARALLEL_PIXELS_MIN, PARALLEL_PIXELS_PER_JOB,
+    PIXELS_MAX, map_dimensions_error, round_clamp_u8,
 };
 use error::error;
 
@@ -66,8 +71,8 @@ const HDR_BATCH_PIXELS: usize = 1_024;
 const COLOR_LANES: usize = 4;
 const SRGB_LANES: usize = 8;
 
-type F32x4 = Simd<f32, COLOR_LANES>;
-type F32x8 = Simd<f32, SRGB_LANES>;
+type F32x4 = std::simd::Simd<f32, COLOR_LANES>;
+type F32x8 = std::simd::Simd<f32, SRGB_LANES>;
 
 /// Identifies a color channel in decoded JPEG XR RGB data.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -185,6 +190,20 @@ pub struct JPEGXRMetadata {
 }
 
 impl JPEGXRMetadata {
+    fn new(layout: PixelLayout, hdr_metrics: Option<HDRMetrics>) -> Self {
+        invariant!(layout.encoding.is_hdr() || hdr_metrics.is_none());
+
+        Self {
+            bits_per_channel: layout.encoding.bits_per_channel(),
+            color_channels: u8::try_from(layout.color_channels)
+                .expect("a JPEG XR color-channel count fits u8"),
+            has_alpha: layout.has_alpha,
+            is_bgr: layout.source_is_bgr,
+            is_hdr: layout.encoding.is_hdr(),
+            hdr_metrics,
+        }
+    }
+
     /// Returns the number of bits in each native color sample.
     #[must_use]
     pub const fn bits_per_channel(self) -> u8 {
@@ -368,7 +387,7 @@ pub fn decode_with_metadata_and_options(
         return Err(error(JPEGXRError::Signature));
     }
 
-    let decoder = JXRDecoder::new(bytes).map_err(|source| codec_error(&source))?;
+    let decoder = ::jpegxr::Decoder::new(bytes).map_err(|source| codec_error(&source))?;
     let width = decoder.info().width();
     let height = decoder.info().height();
     let (width, height) = validate_dimensions(
@@ -378,8 +397,8 @@ pub fn decode_with_metadata_and_options(
 
     let pixel_format = decoder.info().pixel_format();
     let layout = match pixel_format {
-        CodecPixelFormat::BGR101010 => PixelLayout::bgr101010(),
-        CodecPixelFormat::RGBA128_FLOAT => PixelLayout::rgba128_float(),
+        ::jpegxr::PixelFormat::BGR101010 => PixelLayout::bgr101010(),
+        ::jpegxr::PixelFormat::RGBA128_FLOAT => PixelLayout::rgba128_float(),
         _ => {
             return Err(error(JPEGXRError::Unsupported(
                 pixel_format.name().to_owned(),
@@ -408,20 +427,20 @@ pub fn decode_with_metadata_and_options(
     }
 
     let normalized = match pixel_format {
-        CodecPixelFormat::BGR101010 => {
+        ::jpegxr::PixelFormat::BGR101010 => {
             let native_image = decoder
                 .decode_bgr101010()
                 .map_err(|source| codec_error(&source))?;
-            let source = native_image.pixels().as_bytes();
+            let source = zerocopy::IntoBytes::as_bytes(native_image.pixels());
 
             invariant_eq!(source.len(), source_len);
             normalize(source, width, height, row_stride, layout, options)?
         }
-        CodecPixelFormat::RGBA128_FLOAT => {
+        ::jpegxr::PixelFormat::RGBA128_FLOAT => {
             let native_image = decoder
                 .decode_rgba_f32()
                 .map_err(|source| codec_error(&source))?;
-            let source = native_image.pixels().as_bytes();
+            let source = zerocopy::IntoBytes::as_bytes(native_image.pixels());
 
             invariant_eq!(source.len(), source_len);
             normalize(source, width, height, row_stride, layout, options)?
@@ -436,171 +455,10 @@ pub fn decode_with_metadata_and_options(
     })
 }
 
-#[expect(
-    dead_code,
-    reason = "normalization primitives remain available for future decoder profiles"
-)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum SampleEncoding {
-    Fixed16,
-    Fixed32,
-    Float16,
-    Float32,
-    PackedBGR101010,
-    RGBE,
-    Unsigned8,
-    Unsigned16,
-}
-
-impl SampleEncoding {
-    const fn bytes(self) -> usize {
-        match self {
-            Self::Unsigned8 | Self::RGBE => 1,
-            Self::Unsigned16 | Self::Fixed16 | Self::Float16 => 2,
-            Self::Fixed32 | Self::Float32 | Self::PackedBGR101010 => 4,
-        }
-    }
-
-    const fn is_hdr(self) -> bool {
-        matches!(
-            self,
-            Self::Fixed16
-                | Self::Fixed32
-                | Self::Float16
-                | Self::Float32
-                | Self::PackedBGR101010
-                | Self::RGBE
-        )
-    }
-
-    const fn bits_per_channel(self) -> u8 {
-        match self {
-            Self::Unsigned8 | Self::RGBE => 8,
-            Self::PackedBGR101010 => 10,
-            Self::Unsigned16 | Self::Fixed16 | Self::Float16 => 16,
-            Self::Fixed32 | Self::Float32 => 32,
-        }
-    }
-}
-
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "the fields describe independent WIC pixel-layout properties"
-)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PixelLayout {
-    encoding: SampleEncoding,
-    color_channels: usize,
-    source_channels: usize,
-    bytes_per_pixel: usize,
-    has_alpha: bool,
-    premultiplied_alpha: bool,
-    blue_first: bool,
-    source_is_bgr: bool,
-}
-
-impl JPEGXRMetadata {
-    fn new(layout: PixelLayout, hdr_metrics: Option<HDRMetrics>) -> Self {
-        invariant!(layout.encoding.is_hdr() || hdr_metrics.is_none());
-
-        Self {
-            bits_per_channel: layout.encoding.bits_per_channel(),
-            color_channels: u8::try_from(layout.color_channels)
-                .expect("a JPEG XR color-channel count fits u8"),
-            has_alpha: layout.has_alpha,
-            is_bgr: layout.source_is_bgr,
-            is_hdr: layout.encoding.is_hdr(),
-            hdr_metrics,
-        }
-    }
-}
-
-impl PixelLayout {
-    const fn bgr101010() -> Self {
-        Self {
-            encoding: SampleEncoding::PackedBGR101010,
-            color_channels: 3,
-            source_channels: 3,
-            bytes_per_pixel: 4,
-            has_alpha: false,
-            premultiplied_alpha: false,
-            blue_first: false,
-            source_is_bgr: true,
-        }
-    }
-
-    const fn rgba128_float() -> Self {
-        Self {
-            encoding: SampleEncoding::Float32,
-            color_channels: 3,
-            source_channels: 4,
-            bytes_per_pixel: 16,
-            has_alpha: true,
-            premultiplied_alpha: false,
-            blue_first: false,
-            source_is_bgr: false,
-        }
-    }
-
-    fn row_stride(self, width: u32) -> Result<usize> {
-        usize::try_from(width)
-            .ok()
-            .and_then(|width| width.checked_mul(self.bytes_per_pixel))
-            .ok_or_else(|| error(JPEGXRError::Output("JPEG XR row stride exceeds usize")))
-    }
-
-    fn read_pixel(self, pixel: &[u8]) -> Result<([f32; 3], f32)> {
-        invariant_eq!(pixel.len(), self.bytes_per_pixel);
-
-        if self.encoding == SampleEncoding::RGBE {
-            return Ok((decode_rgbe(pixel)?, 1.0));
-        }
-
-        if self.encoding == SampleEncoding::PackedBGR101010 {
-            return Ok((decode_bgr101010(pixel), 1.0));
-        }
-
-        let sample = |channel: usize| -> Result<f32> {
-            invariant!(channel < self.source_channels);
-
-            let start = channel * self.encoding.bytes();
-            let end = start + self.encoding.bytes();
-            let bytes = pixel.get(start..end).ok_or_else(|| {
-                error(JPEGXRError::Output(
-                    "JPEG XR sample exceeds its pixel stride",
-                ))
-            })?;
-
-            Ok(decode_sample(bytes, self.encoding))
-        };
-
-        let mut color = if self.color_channels == 1 {
-            let gray = sample(0)?;
-            [gray, gray, gray]
-        } else {
-            [sample(0)?, sample(1)?, sample(2)?]
-        };
-
-        if self.blue_first && self.color_channels == 3 {
-            color.swap(0, 2);
-        }
-
-        let alpha = if self.has_alpha {
-            normalize_alpha(sample(self.color_channels)?)
-        } else {
-            1.0
-        };
-
-        if self.premultiplied_alpha {
-            if alpha > 0.0 {
-                color = color.map(|channel| channel / alpha);
-            } else {
-                color.fill(0.0);
-            }
-        }
-
-        Ok((color, alpha))
-    }
+#[derive(Debug)]
+struct NormalizedImage {
+    rgba: Vec<u8>,
+    hdr_metrics: Option<HDRMetrics>,
 }
 
 fn normalize(
@@ -674,1000 +532,6 @@ fn normalize(
     Ok(NormalizedImage { rgba, hdr_metrics })
 }
 
-/// Scales scRGB into the fixed unit each tone mapper expects; only `BT2446` needs rescaling.
-fn hdr_color_scale(method: ToneMappingMethod) -> f32 {
-    if method == ToneMappingMethod::BT2446 {
-        BT2446_INPUT_SCALE
-    } else {
-        1.0
-    }
-}
-
-fn write_normalized_pixels(
-    source: &[u8],
-    width: usize,
-    row_stride: usize,
-    layout: PixelLayout,
-    method: ToneMappingMethod,
-    analysis: Option<HDRAnalysis>,
-    rgba: &mut [u8],
-) -> Result<bool> {
-    if !layout.encoding.is_hdr() {
-        return write_pixel_slabs(source, width, row_stride, rgba, |source, rgba| {
-            write_sdr_pixels(source, width, row_stride, layout, rgba)
-        });
-    }
-
-    if method == ToneMappingMethod::Clamp {
-        return write_pixel_slabs(source, width, row_stride, rgba, |source, rgba| {
-            write_hdr_pixels_scalar(source, width, row_stride, layout, &Clamp, 1.0, rgba)
-        });
-    }
-
-    let white_point = analysis
-        .and_then(|analysis| analysis.max_cll)
-        .map_or_else(display_white_point, hdr_white_point);
-    let luminance_white_point = analysis
-        .and_then(|analysis| analysis.luminance_white_point)
-        .map_or_else(display_luminance_white_point, hdr_luminance_white_point);
-    let mapper = method.resolve(white_point, luminance_white_point);
-    let color_scale = hdr_color_scale(method);
-
-    write_pixel_slabs(source, width, row_stride, rgba, |source, rgba| {
-        write_hdr_pixels(
-            source,
-            width,
-            row_stride,
-            layout,
-            &mapper,
-            color_scale,
-            rgba,
-        )
-    })
-}
-
-fn write_pixel_slabs(
-    source: &[u8],
-    width: usize,
-    row_stride: usize,
-    rgba: &mut [u8],
-    writer: impl Fn(&[u8], &mut [u8]) -> Result<bool> + Sync,
-) -> Result<bool> {
-    let row_count = source.len() / row_stride;
-
-    let pixel_count = width
-        .checked_mul(row_count)
-        .expect("validated JPEG XR pixel count fits usize");
-
-    if pixel_count < PARALLEL_PIXELS_MIN {
-        return writer(source, rgba);
-    }
-
-    let rows_per_job = PARALLEL_PIXELS_PER_JOB.div_ceil(width);
-    let source_bytes_per_job = rows_per_job * row_stride;
-    let rgba_bytes_per_job = rows_per_job * width * 4;
-
-    source
-        .par_chunks(source_bytes_per_job)
-        .zip(rgba.par_chunks_mut(rgba_bytes_per_job))
-        .map(|(source, rgba)| writer(source, rgba))
-        .try_reduce(|| false, |left, right| Ok::<bool, Error>(left || right))
-}
-
-fn write_sdr_pixels(
-    source: &[u8],
-    width: usize,
-    row_stride: usize,
-    layout: PixelLayout,
-    rgba: &mut [u8],
-) -> Result<bool> {
-    let mut has_nonzero_alpha = false;
-    for (row, target_row) in source
-        .chunks_exact(row_stride)
-        .zip(rgba.chunks_exact_mut(width * 4))
-    {
-        let (targets, remainder) = target_row.as_chunks_mut::<4>();
-
-        invariant!(remainder.is_empty());
-
-        for (x, target) in targets.iter_mut().enumerate() {
-            let pixel = pixel_at(row, x, layout)?;
-            let (color, alpha) = layout.read_pixel(pixel)?;
-
-            has_nonzero_alpha |= alpha > 0.0;
-
-            let color = color.map(normalized_to_u8);
-            target.copy_from_slice(&[color[0], color[1], color[2], normalized_to_u8(alpha)]);
-        }
-    }
-
-    Ok(has_nonzero_alpha)
-}
-
-fn write_hdr_pixels_scalar(
-    source: &[u8],
-    width: usize,
-    row_stride: usize,
-    layout: PixelLayout,
-    mapper: &(impl ToneMapper + Sync),
-    color_scale: f32,
-    rgba: &mut [u8],
-) -> Result<bool> {
-    let mut has_nonzero_alpha = false;
-    for (row, target_row) in source
-        .chunks_exact(row_stride)
-        .zip(rgba.chunks_exact_mut(width * 4))
-    {
-        let (targets, remainder) = target_row.as_chunks_mut::<4>();
-
-        invariant!(remainder.is_empty());
-
-        for (x, target) in targets.iter_mut().enumerate() {
-            let pixel = pixel_at(row, x, layout)?;
-            let (color, alpha) = layout.read_pixel(pixel)?;
-
-            has_nonzero_alpha |= alpha > 0.0;
-
-            let color = color.map(|component| component * color_scale);
-            let color = display_linear_to_srgb8(mapper.map(LinearRGB::new(color)));
-            target.copy_from_slice(&[color[0], color[1], color[2], normalized_to_u8(alpha)]);
-        }
-    }
-
-    Ok(has_nonzero_alpha)
-}
-
-fn write_hdr_pixels(
-    source: &[u8],
-    width: usize,
-    row_stride: usize,
-    layout: PixelLayout,
-    mapper: &(impl ToneMapper + Sync),
-    color_scale: f32,
-    rgba: &mut [u8],
-) -> Result<bool> {
-    if layout.encoding == SampleEncoding::PackedBGR101010 {
-        return Ok(write_bgr101010_hdr_pixels(
-            source,
-            width,
-            row_stride,
-            mapper,
-            color_scale,
-            rgba,
-        ));
-    }
-
-    let row_count = source.len() / row_stride;
-
-    let pixel_count = width
-        .checked_mul(row_count)
-        .expect("validated JPEG XR pixel count fits usize");
-
-    let batch_capacity = HDR_BATCH_PIXELS.min(pixel_count);
-    let mut colors = LinearRGBPlanes::with_capacity(batch_capacity);
-    let mut alphas = Vec::with_capacity(batch_capacity);
-    let mut has_nonzero_alpha = false;
-    let mut rgba_offset = 0;
-
-    for row in source.chunks_exact(row_stride) {
-        for x in 0..width {
-            let pixel = pixel_at(row, x, layout)?;
-            let (color, alpha) = layout.read_pixel(pixel)?;
-
-            has_nonzero_alpha |= alpha > 0.0;
-
-            let color = color.map(|component| component * color_scale);
-            colors.push(LinearRGB::new(color));
-            alphas.push(normalized_to_u8(alpha));
-
-            if colors.len() == HDR_BATCH_PIXELS {
-                write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
-            }
-        }
-    }
-
-    write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
-    invariant_eq!(rgba_offset, rgba.len());
-    Ok(has_nonzero_alpha)
-}
-
-#[multiversion(targets = "simd")]
-fn write_bgr101010_hdr_pixels(
-    source: &[u8],
-    width: usize,
-    row_stride: usize,
-    mapper: &(impl ToneMapper + Sync),
-    color_scale: f32,
-    rgba: &mut [u8],
-) -> bool {
-    let row_count = source.len() / row_stride;
-    let pixel_count = width
-        .checked_mul(row_count)
-        .expect("validated JPEG XR pixel count fits usize");
-    let batch_capacity = HDR_BATCH_PIXELS.min(pixel_count);
-    let mut colors = LinearRGBPlanes::with_capacity(batch_capacity);
-    let mut alphas = Vec::with_capacity(batch_capacity);
-    let mut rgba_offset = 0;
-
-    for row in source.chunks_exact(row_stride) {
-        let (pixels, remainder) = row.as_chunks::<4>();
-        invariant!(remainder.is_empty());
-        invariant_eq!(pixels.len(), width);
-
-        let (chunks, tail) = pixels.as_chunks::<SRGB_LANES>();
-        for chunk in chunks {
-            let packed = Simd::<u32, SRGB_LANES>::from_array((*chunk).map(u32::from_ne_bytes));
-            let [red, green, blue] = decode_bgr101010_simd(packed).map(Simd::to_array);
-
-            for ((red, green), blue) in red.into_iter().zip(green).zip(blue) {
-                colors.push(LinearRGB::new([
-                    red * color_scale,
-                    green * color_scale,
-                    blue * color_scale,
-                ]));
-                alphas.push(u8::MAX);
-            }
-
-            if colors.len() >= HDR_BATCH_PIXELS {
-                write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
-            }
-        }
-
-        for pixel in tail {
-            let color = decode_bgr101010(pixel).map(|component| component * color_scale);
-            colors.push(LinearRGB::new(color));
-            alphas.push(u8::MAX);
-
-            if colors.len() == HDR_BATCH_PIXELS {
-                write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
-            }
-        }
-    }
-
-    write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
-    invariant_eq!(rgba_offset, rgba.len());
-    true
-}
-
-fn write_tone_mapped_batch(
-    mapper: &(impl ToneMapper + Sync),
-    colors: &mut LinearRGBPlanes,
-    alphas: &mut Vec<u8>,
-    rgba: &mut [u8],
-    rgba_offset: &mut usize,
-) {
-    invariant_eq!(colors.len(), alphas.len());
-
-    if colors.is_empty() {
-        return;
-    }
-
-    mapper.map_planes_in_place(colors);
-
-    let byte_count = colors.len() * 4;
-    let target = &mut rgba[*rgba_offset..*rgba_offset + byte_count];
-    let (targets, remainder) = target.as_chunks_mut::<4>();
-
-    invariant!(remainder.is_empty());
-    write_display_pixels(colors, alphas, targets);
-
-    *rgba_offset += byte_count;
-    colors.clear();
-    alphas.clear();
-}
-
-#[multiversion(targets = "simd")]
-fn write_display_pixels(colors: &LinearRGBPlanes, alphas: &[u8], targets: &mut [[u8; 4]]) {
-    invariant_eq!(colors.len(), alphas.len());
-    invariant_eq!(colors.len(), targets.len());
-
-    let [red, green, blue] = colors.channels();
-    let (red_chunks, red_tail) = red.as_chunks::<SRGB_LANES>();
-    let (green_chunks, green_tail) = green.as_chunks::<SRGB_LANES>();
-    let (blue_chunks, blue_tail) = blue.as_chunks::<SRGB_LANES>();
-    let (alpha_chunks, alpha_tail) = alphas.as_chunks::<SRGB_LANES>();
-    let (target_chunks, target_tail) = targets.as_chunks_mut::<SRGB_LANES>();
-
-    for ((((red, green), blue), alphas), targets) in red_chunks
-        .iter()
-        .zip(green_chunks)
-        .zip(blue_chunks)
-        .zip(alpha_chunks)
-        .zip(target_chunks)
-    {
-        // Match `normalized_to_u8`: round half away from zero, then saturate the cast.
-        let encoded = [*red, *green, *blue].map(|channel| {
-            let srgb = linear_to_srgb_simd(F32x8::from_array(channel));
-            (srgb.simd_clamp(F32x8::splat(0.0), F32x8::splat(1.0))
-                * F32x8::splat(f32::from(u8::MAX)))
-            .round()
-            .cast::<u8>()
-            .to_array()
-        });
-
-        for lane in 0..SRGB_LANES {
-            targets[lane] = [
-                encoded[0][lane],
-                encoded[1][lane],
-                encoded[2][lane],
-                alphas[lane],
-            ];
-        }
-    }
-
-    for ((((red, green), blue), alpha), target) in red_tail
-        .iter()
-        .zip(green_tail)
-        .zip(blue_tail)
-        .zip(alpha_tail)
-        .zip(target_tail)
-    {
-        let color = LinearRGB::new([*red, *green, *blue]);
-        let [red, green, blue] = display_linear_to_srgb8(color);
-        *target = [red, green, blue, *alpha];
-    }
-}
-
-#[cfg(test)]
-fn append_hdr_pixels(
-    source: &[u8],
-    width: usize,
-    row_stride: usize,
-    layout: PixelLayout,
-    mapper: &(impl ToneMapper + Sync),
-    rgba: &mut Vec<u8>,
-) -> Result<bool> {
-    let byte_count = source.len() / row_stride * width * 4;
-    let start = rgba.len();
-    rgba.resize(start + byte_count, 0);
-    write_hdr_pixels(
-        source,
-        width,
-        row_stride,
-        layout,
-        mapper,
-        1.0,
-        &mut rgba[start..],
-    )
-}
-
-fn pixel_at(row: &[u8], x: usize, layout: PixelLayout) -> Result<&[u8]> {
-    let start = x
-        .checked_mul(layout.bytes_per_pixel)
-        .ok_or_else(|| error(JPEGXRError::Output("JPEG XR pixel offset exceeds usize")))?;
-
-    let end = start + layout.bytes_per_pixel;
-
-    row.get(start..end)
-        .ok_or_else(|| error(JPEGXRError::Output("JPEG XR pixel exceeds its decoded row")))
-}
-
-#[derive(Debug)]
-struct NormalizedImage {
-    rgba: Vec<u8>,
-    hdr_metrics: Option<HDRMetrics>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct MaxCll {
-    relative_light_level: f32,
-    channel: JPEGXRColorChannel,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct HDRMetrics {
-    max_cll: MaxCll,
-    max_cll_mode: MaxCLLMode,
-    luminance_white_point: Option<LuminanceWhitePoint>,
-    max_luminance_nits: f32,
-    average_luminance_nits: f32,
-    min_luminance_nits: f32,
-    rec709_percentage: f32,
-    dci_p3_percentage: f32,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct HDRAnalysis {
-    max_cll: Option<MaxCll>,
-    luminance_white_point: Option<LuminanceWhitePoint>,
-    hdr_metrics: Option<HDRMetrics>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct HDRPixelSelection {
-    count: usize,
-    exclude_fully_transparent: bool,
-}
-
-impl HDRPixelSelection {
-    fn new(source: &[u8], row_stride: usize, layout: PixelLayout) -> Result<Self> {
-        let pixels_per_row = row_stride / layout.bytes_per_pixel;
-        let row_count = source.len() / row_stride;
-        let source_pixel_count = pixels_per_row
-            .checked_mul(row_count)
-            .expect("validated JPEG XR pixel count fits usize");
-
-        invariant!(source_pixel_count > 0);
-
-        let visible_alpha_pixels = if layout.has_alpha {
-            visible_alpha_pixel_count(source, row_stride, layout)?
-        } else {
-            source_pixel_count
-        };
-
-        let exclude_fully_transparent = layout.has_alpha && visible_alpha_pixels > 0;
-
-        let count = if exclude_fully_transparent {
-            visible_alpha_pixels
-        } else {
-            source_pixel_count
-        };
-
-        invariant!(count > 0);
-        invariant!(count <= source_pixel_count);
-
-        Ok(Self {
-            count,
-            exclude_fully_transparent,
-        })
-    }
-}
-
-impl HDRMetrics {
-    #[cfg(test)]
-    fn estimate(
-        source: &[u8],
-        row_stride: usize,
-        layout: PixelLayout,
-        max_cll_mode: MaxCLLMode,
-        estimate_luminance_white_point: bool,
-    ) -> Result<Self> {
-        HDRAnalysis::estimate(
-            source,
-            row_stride,
-            layout,
-            max_cll_mode,
-            AnalysisScope {
-                estimate_max_cll: true,
-                estimate_luminance_white_point,
-                collect_hdr_metrics: true,
-            },
-        )
-        .map(|analysis| {
-            analysis
-                .hdr_metrics
-                .expect("full HDR analysis produces display metrics")
-        })
-    }
-}
-
-/// Which measurements an HDR analysis pass collects.
-#[derive(Clone, Copy, Debug)]
-struct AnalysisScope {
-    estimate_max_cll: bool,
-    estimate_luminance_white_point: bool,
-    collect_hdr_metrics: bool,
-}
-
-/// The parameters that decide which measurements an analysis pass collects.
-#[derive(Clone, Copy, Debug)]
-struct AnalysisRequest {
-    selection: HDRPixelSelection,
-    pixel_count: usize,
-    max_cll_mode: MaxCLLMode,
-    estimate_max_cll: bool,
-    estimate_luminance_white_point: bool,
-    collect_hdr_metrics: bool,
-}
-
-/// The measurements one worker gathers from its share of the image.
-///
-/// Every field merges associatively, which is what lets the analysis pass run in parallel: each
-/// worker builds its own totals over a row group, and the results fold together into the answer
-/// the sequential pass would have produced.
-#[derive(Debug)]
-struct AnalysisTotals {
-    accumulator: Option<HDRMetricAccumulator>,
-    max_cll_estimator: Option<MaxCLLEstimator>,
-    luminance_white_point_estimator: Option<LuminanceWhitePointEstimator>,
-    max_cll_batch: Option<Vec<LinearRGB>>,
-}
-
-impl AnalysisTotals {
-    fn new(request: &AnalysisRequest) -> Self {
-        Self {
-            accumulator: request.collect_hdr_metrics.then(HDRMetricAccumulator::new),
-            // Every partial estimator declares the whole image, so the merged observation count
-            // matches what `finish` requires and the retained sample counts agree.
-            max_cll_estimator: request.estimate_max_cll.then(|| {
-                MaxCLLEstimator::with_mode(
-                    NonZeroUsize::new(request.pixel_count)
-                        .expect("HDR analysis includes at least one pixel"),
-                    request.max_cll_mode,
-                )
-            }),
-            luminance_white_point_estimator: request.estimate_luminance_white_point.then(|| {
-                LuminanceWhitePointEstimator::new(
-                    NonZeroUsize::new(request.pixel_count)
-                        .expect("HDR analysis includes at least one pixel"),
-                )
-            }),
-            max_cll_batch: request
-                .estimate_max_cll
-                .then(|| Vec::with_capacity(HDR_BATCH_PIXELS.min(request.pixel_count))),
-        }
-    }
-
-    fn observe_slab(
-        &mut self,
-        source: &[u8],
-        row_stride: usize,
-        layout: PixelLayout,
-        request: &AnalysisRequest,
-    ) -> Result<()> {
-        visit_pixels(source, row_stride, layout, |color, alpha| {
-            if request.selection.exclude_fully_transparent && alpha == 0.0 {
-                return;
-            }
-
-            if let Some(accumulator) = &mut self.accumulator {
-                accumulator.observe(color);
-            }
-
-            let color = LinearRGB::new(color);
-            if let Some(estimator) = &mut self.luminance_white_point_estimator {
-                estimator.observe(color);
-            }
-
-            if let Some(batch) = &mut self.max_cll_batch {
-                batch.push(color);
-                if batch.len() == HDR_BATCH_PIXELS {
-                    self.max_cll_estimator
-                        .as_mut()
-                        .expect("a MaxCLL batch has an estimator")
-                        .observe_many(batch);
-                    batch.clear();
-                }
-            }
-        })
-    }
-
-    fn merge(&mut self, other: Self) {
-        if let (Some(accumulator), Some(other)) = (&mut self.accumulator, other.accumulator) {
-            accumulator.merge(other);
-        }
-
-        // Drain the other worker's pending batch into its own estimator before merging, so no
-        // observation is lost and the counts still add up.
-        let mut other_max_cll = other.max_cll_estimator;
-        if let (Some(estimator), Some(batch)) =
-            (other_max_cll.as_mut(), other.max_cll_batch.as_ref())
-        {
-            estimator.observe_many(batch);
-        }
-        if let (Some(estimator), Some(other)) = (&mut self.max_cll_estimator, other_max_cll) {
-            estimator.merge(other);
-        }
-
-        if let (Some(estimator), Some(other)) = (
-            &mut self.luminance_white_point_estimator,
-            other.luminance_white_point_estimator,
-        ) {
-            estimator.merge(other);
-        }
-    }
-}
-
-impl HDRAnalysis {
-    fn estimate(
-        source: &[u8],
-        row_stride: usize,
-        layout: PixelLayout,
-        max_cll_mode: MaxCLLMode,
-        scope: AnalysisScope,
-    ) -> Result<Self> {
-        invariant!(layout.encoding.is_hdr());
-        invariant!(row_stride >= layout.bytes_per_pixel);
-        invariant!(!scope.collect_hdr_metrics || scope.estimate_max_cll);
-
-        let selection = HDRPixelSelection::new(source, row_stride, layout)?;
-        let pixel_count = selection.count;
-
-        let request = AnalysisRequest {
-            selection,
-            pixel_count,
-            max_cll_mode,
-            estimate_max_cll: scope.estimate_max_cll,
-            estimate_luminance_white_point: scope.estimate_luminance_white_point,
-            collect_hdr_metrics: scope.collect_hdr_metrics,
-        };
-
-        let totals = compute_totals(source, row_stride, layout, &request)?;
-
-        let AnalysisTotals {
-            accumulator,
-            mut max_cll_estimator,
-            luminance_white_point_estimator,
-            max_cll_batch,
-        } = totals;
-
-        if let Some(batch) = &max_cll_batch {
-            max_cll_estimator
-                .as_mut()
-                .expect("a MaxCLL batch has an estimator")
-                .observe_many(batch);
-        }
-
-        if let Some(accumulator) = &accumulator {
-            invariant_eq!(
-                usize::try_from(accumulator.pixel_count)
-                    .expect("the bounded JPEG XR pixel count fits usize"),
-                pixel_count
-            );
-        }
-
-        let max_cll = max_cll_estimator.map(finish_max_cll);
-        let luminance_white_point = luminance_white_point_estimator.and_then(|estimator| {
-            estimator
-                .finish()
-                .expect("HDR analysis observes exactly its declared pixel count")
-        });
-        let hdr_metrics = accumulator.map(|accumulator| {
-            accumulator.finish(
-                max_cll.expect("display HDR metrics include MaxCLL"),
-                max_cll_mode,
-                luminance_white_point,
-            )
-        });
-
-        Ok(Self {
-            max_cll,
-            luminance_white_point,
-            hdr_metrics,
-        })
-    }
-}
-
-/// Gathers mergeable HDR measurements over parallel row groups.
-///
-/// Jobs are sized in pixels so formats use comparable row-group sizes.
-fn compute_totals(
-    source: &[u8],
-    row_stride: usize,
-    layout: PixelLayout,
-    request: &AnalysisRequest,
-) -> Result<AnalysisTotals> {
-    let width = row_stride / layout.bytes_per_pixel;
-    let rows_per_job = PARALLEL_PIXELS_PER_JOB.div_ceil(width);
-
-    // `visit_pixels` below scans every source pixel regardless of transparency, so the
-    // serial/parallel split must be sized off the pixels actually scanned, not
-    // `request.pixel_count` (which, for images with transparency, counts only the visible pixels
-    // the estimators retain). Otherwise a large mostly-transparent image runs its full scan
-    // serially.
-    let row_count = source.len() / row_stride;
-    let scanned_pixel_count = width * row_count;
-
-    if scanned_pixel_count < PARALLEL_PIXELS_MIN {
-        let mut totals = AnalysisTotals::new(request);
-        totals.observe_slab(source, row_stride, layout, request)?;
-        return Ok(totals);
-    }
-
-    // `try_fold` reuses one `AnalysisTotals` (and its full-image-sized percentile heaps) across
-    // every chunk rayon assigns to the same split, instead of allocating a fresh one per chunk:
-    // a `map` here would size those heaps for the whole image on every one of the ~1000 chunks a
-    // large image produces.
-    source
-        .par_chunks(rows_per_job * row_stride)
-        .try_fold(
-            || AnalysisTotals::new(request),
-            |mut totals, slab| {
-                totals.observe_slab(slab, row_stride, layout, request)?;
-                Ok::<AnalysisTotals, Error>(totals)
-            },
-        )
-        .try_reduce(
-            || AnalysisTotals::new(request),
-            |mut left, right| {
-                left.merge(right);
-                Ok::<AnalysisTotals, Error>(left)
-            },
-        )
-}
-
-fn finish_max_cll(estimator: MaxCLLEstimator) -> MaxCll {
-    let estimate = estimator
-        .finish()
-        .expect("the HDR analysis pass visits the measured number of pixels");
-    let relative_light_level = estimate.level();
-
-    invariant!(relative_light_level.is_finite());
-    invariant!(relative_light_level >= 0.0);
-
-    MaxCll {
-        relative_light_level,
-        channel: jpeg_xr_color_channel(estimate.channel()),
-    }
-}
-
-impl MaxCll {
-    fn relative_light_level(self) -> f32 {
-        invariant!(self.relative_light_level.is_finite());
-        invariant!(self.relative_light_level >= 0.0);
-        self.relative_light_level
-    }
-
-    fn nits(self) -> f32 {
-        nonnegative_f64_to_f32(
-            f64::from(self.relative_light_level) * f64::from(SC_RGB_REFERENCE_WHITE_NITS),
-        )
-    }
-}
-
-fn hdr_white_point(max_cll: MaxCll) -> WhitePoint {
-    WhitePoint::new(max_cll.relative_light_level().max(1.0))
-        .expect("MaxCLL floored at display white is a positive finite white point")
-}
-
-fn display_white_point() -> WhitePoint {
-    WhitePoint::new(1.0).expect("display white is a positive finite white point")
-}
-
-fn hdr_luminance_white_point(white_point: LuminanceWhitePoint) -> LuminanceWhitePoint {
-    let luminance = white_point.luminance().max(1.0);
-    LuminanceWhitePoint::new(luminance)
-        .expect("p99.99 luminance floored at display white is a positive finite white point")
-}
-
-fn display_luminance_white_point() -> LuminanceWhitePoint {
-    LuminanceWhitePoint::new(1.0).expect("display white is a positive finite luminance white point")
-}
-
-#[derive(Clone, Copy, Debug)]
-struct HDRMetricAccumulator {
-    pixel_count: u64,
-    luminance_sum_nits: f64,
-    max_luminance_nits: f64,
-    min_luminance_nits: f64,
-    rec709_pixels: u64,
-    dci_p3_pixels: u64,
-}
-
-impl HDRMetricAccumulator {
-    const fn new() -> Self {
-        Self {
-            pixel_count: 0,
-            luminance_sum_nits: 0.0,
-            max_luminance_nits: f64::NEG_INFINITY,
-            min_luminance_nits: f64::INFINITY,
-            rec709_pixels: 0,
-            dci_p3_pixels: 0,
-        }
-    }
-
-    fn observe(&mut self, color: [f32; 3]) {
-        let color = color.map(sanitize_metric_sample);
-
-        // Rec. 709 luma weights (ITU-R BT.709-6 section 3.2), applied to linear scRGB components
-        // to get relative luminance, then scaled to absolute nits by the scRGB reference white.
-        let luminance = (0.212_6 * color[0] + 0.715_2 * color[1] + 0.072_2 * color[2]).max(0.0)
-            * f64::from(SC_RGB_REFERENCE_WHITE_NITS);
-
-        self.pixel_count += 1;
-        self.luminance_sum_nits += luminance;
-        self.max_luminance_nits = self.max_luminance_nits.max(luminance);
-        self.min_luminance_nits = self.min_luminance_nits.min(luminance);
-
-        match gamut_membership(color) {
-            GamutMembership::Rec709 => self.rec709_pixels += 1,
-            GamutMembership::DisplayP3Only => self.dci_p3_pixels += 1,
-            GamutMembership::OutsideDisplayP3 => {}
-        }
-    }
-
-    /// Folds `other` into these metrics.
-    ///
-    /// Counts add, extremes take the wider bound, and the luminance sum adds. Summation order
-    /// changes with the number of workers, so the average luminance can move by a rounding step
-    /// between runs on differently sized machines.
-    fn merge(&mut self, other: Self) {
-        self.pixel_count += other.pixel_count;
-        self.luminance_sum_nits += other.luminance_sum_nits;
-        self.max_luminance_nits = self.max_luminance_nits.max(other.max_luminance_nits);
-        self.min_luminance_nits = self.min_luminance_nits.min(other.min_luminance_nits);
-        self.rec709_pixels += other.rec709_pixels;
-        self.dci_p3_pixels += other.dci_p3_pixels;
-    }
-
-    fn finish(
-        self,
-        max_cll: MaxCll,
-        max_cll_mode: MaxCLLMode,
-        luminance_white_point: Option<LuminanceWhitePoint>,
-    ) -> HDRMetrics {
-        invariant!(self.pixel_count > 0);
-        invariant!(self.max_luminance_nits.is_finite());
-        invariant!(self.min_luminance_nits.is_finite());
-
-        let pixel_count = f64::from(
-            u32::try_from(self.pixel_count)
-                .expect("the bounded JPEG XR pixel count fits u32 metadata arithmetic"),
-        );
-
-        HDRMetrics {
-            max_cll,
-            max_cll_mode,
-            luminance_white_point,
-            max_luminance_nits: nonnegative_f64_to_f32(self.max_luminance_nits),
-            average_luminance_nits: nonnegative_f64_to_f32(self.luminance_sum_nits / pixel_count),
-            min_luminance_nits: nonnegative_f64_to_f32(self.min_luminance_nits),
-            rec709_percentage: percentage(self.rec709_pixels, self.pixel_count),
-            dci_p3_percentage: percentage(self.dci_p3_pixels, self.pixel_count),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum GamutMembership {
-    Rec709,
-    DisplayP3Only,
-    OutsideDisplayP3,
-}
-
-fn gamut_membership(color: [f64; 3]) -> GamutMembership {
-    let scale = color.iter().copied().map(f64::abs).fold(1.0_f64, f64::max);
-    let epsilon = 1.0e-6 * scale;
-
-    if color.iter().all(|channel| *channel >= -epsilon) {
-        return GamutMembership::Rec709;
-    }
-
-    // Converts Rec. 709 linear RGB (already established as out-of-gamut above) to Display-P3
-    // linear RGB via the direct Rec. 709 -> Display-P3 primaries matrix (both D65 white points,
-    // so no chromatic adaptation step is needed). Nonnegative components here mean the color is
-    // representable in Display-P3 even though it fell outside Rec. 709.
-    let display_p3 = [
-        0.822_592_87 * color[0] + 0.177_533_95 * color[1],
-        0.033_199_51 * color[0] + 0.966_783_50 * color[1],
-        0.017_085_35 * color[0] + 0.072_395_72 * color[1] + 0.910_301_48 * color[2],
-    ];
-
-    if display_p3.iter().all(|channel| *channel >= -epsilon) {
-        GamutMembership::DisplayP3Only
-    } else {
-        GamutMembership::OutsideDisplayP3
-    }
-}
-
-fn sanitize_metric_sample(value: f32) -> f64 {
-    if value.is_nan() {
-        0.0
-    } else if value == f32::INFINITY {
-        f64::from(f32::MAX)
-    } else if value == f32::NEG_INFINITY {
-        -f64::from(f32::MAX)
-    } else {
-        f64::from(value)
-    }
-}
-
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "bounded metadata values are intentionally returned as the decoder's f32 scalar type"
-)]
-fn nonnegative_f64_to_f32(value: f64) -> f32 {
-    invariant!(value.is_finite());
-    invariant!(value >= 0.0);
-    value.min(f64::from(f32::MAX)) as f32
-}
-
-fn percentage(part: u64, total: u64) -> f32 {
-    invariant!(part <= total);
-    invariant!(total > 0);
-
-    let part = u32::try_from(part).expect("the bounded JPEG XR pixel count fits u32");
-    let total = u32::try_from(total).expect("the bounded JPEG XR pixel count fits u32");
-    percentage_from_u32(part, total)
-}
-
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "a bounded 0..=100 metadata percentage is intentionally stored as f32"
-)]
-fn percentage_from_u32(part: u32, total: u32) -> f32 {
-    (f64::from(part) * 100.0 / f64::from(total)) as f32
-}
-
-const fn jpeg_xr_color_channel(channel: ToneColorChannel) -> JPEGXRColorChannel {
-    match channel {
-        ToneColorChannel::Red => JPEGXRColorChannel::Red,
-        ToneColorChannel::Green => JPEGXRColorChannel::Green,
-        ToneColorChannel::Blue => JPEGXRColorChannel::Blue,
-    }
-}
-
-fn visit_pixels(
-    source: &[u8],
-    row_stride: usize,
-    layout: PixelLayout,
-    mut visitor: impl FnMut([f32; 3], f32),
-) -> Result<()> {
-    invariant!(row_stride >= layout.bytes_per_pixel);
-
-    let mut rows = source.chunks_exact(row_stride);
-    for row in &mut rows {
-        let mut pixels = row.chunks_exact(layout.bytes_per_pixel);
-
-        for pixel in &mut pixels {
-            let (color, alpha) = layout.read_pixel(pixel)?;
-            visitor(color, alpha);
-        }
-
-        if !pixels.remainder().is_empty() {
-            return Err(error(JPEGXRError::Output(
-                "JPEG XR row contains a partial pixel",
-            )));
-        }
-    }
-
-    if !rows.remainder().is_empty() {
-        return Err(error(JPEGXRError::Output(
-            "JPEG XR source buffer contains a partial row",
-        )));
-    }
-
-    Ok(())
-}
-
-/// Counts source pixels with nonzero alpha over parallel row groups.
-fn visible_alpha_pixel_count(
-    source: &[u8],
-    row_stride: usize,
-    layout: PixelLayout,
-) -> Result<usize> {
-    invariant!(layout.has_alpha);
-
-    let width = row_stride / layout.bytes_per_pixel;
-    let row_count = source.len() / row_stride;
-    let scanned_pixel_count = width * row_count;
-
-    if scanned_pixel_count < PARALLEL_PIXELS_MIN {
-        return visible_alpha_pixel_count_slab(source, row_stride, layout);
-    }
-
-    let rows_per_job = PARALLEL_PIXELS_PER_JOB.div_ceil(width);
-    source
-        .par_chunks(rows_per_job * row_stride)
-        .try_fold(
-            || 0_usize,
-            |count, slab| {
-                Ok::<usize, Error>(
-                    count + visible_alpha_pixel_count_slab(slab, row_stride, layout)?,
-                )
-            },
-        )
-        .try_reduce(|| 0_usize, |left, right| Ok(left + right))
-}
-
-fn visible_alpha_pixel_count_slab(
-    source: &[u8],
-    row_stride: usize,
-    layout: PixelLayout,
-) -> Result<usize> {
-    let mut visible_pixels = 0_usize;
-
-    visit_pixels(source, row_stride, layout, |_color, alpha| {
-        if alpha > 0.0 {
-            visible_pixels = visible_pixels
-                .checked_add(1)
-                .expect("validated JPEG XR pixel count fits usize");
-        }
-    })?;
-
-    Ok(visible_pixels)
-}
-
 /// Builds the error for a decoder-reported dimension too large to convert to `i32`.
 fn dimension_overflow_error(value: u32) -> Error {
     error(JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions {
@@ -1687,211 +551,28 @@ fn validate_dimensions(width: i32, height: i32) -> Result<(u32, u32)> {
 
     Dimensions::try_new((width, height))
         .map(|_| (width, height))
-        .map_err(|dimensions_error| match dimensions_error {
-            DimensionsError::Zero => error(JPEGXRError::Output(
-                "JPEG XR dimensions must both be nonzero",
-            )),
-            DimensionsError::TooLarge { width, height } => {
-                error(JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions {
-                    actual: Some(width.max(height)),
-                    max: DIMENSION_MAX,
-                }))
-            }
-            DimensionsError::TooManyPixels { pixels } => {
-                error(JPEGXRError::LimitExceeded(JPEGXRLimit::Pixels {
-                    actual: Some(pixels),
-                    max: PIXELS_MAX,
-                }))
-            }
+        .map_err(|dimensions_error| {
+            map_dimensions_error(
+                dimensions_error,
+                || {
+                    error(JPEGXRError::Output(
+                        "JPEG XR dimensions must both be nonzero",
+                    ))
+                },
+                |width, height| {
+                    error(JPEGXRError::LimitExceeded(JPEGXRLimit::Dimensions {
+                        actual: Some(width.max(height)),
+                        max: DIMENSION_MAX,
+                    }))
+                },
+                |pixels| {
+                    error(JPEGXRError::LimitExceeded(JPEGXRLimit::Pixels {
+                        actual: Some(pixels),
+                        max: PIXELS_MAX,
+                    }))
+                },
+            )
         })
-}
-
-fn decode_sample(bytes: &[u8], encoding: SampleEncoding) -> f32 {
-    invariant_eq!(bytes.len(), encoding.bytes());
-
-    match encoding {
-        SampleEncoding::Unsigned8 => f32::from(read_sample::<u8>(bytes)) / f32::from(u8::MAX),
-        SampleEncoding::Unsigned16 => f32::from(read_sample::<u16>(bytes)) / f32::from(u16::MAX),
-        SampleEncoding::Fixed16 => f32::from(read_sample::<i16>(bytes)) / 8192.0,
-        SampleEncoding::Fixed32 => fixed32_to_f32(read_sample::<i32>(bytes)),
-        SampleEncoding::Float16 => half_to_f32(read_sample::<u16>(bytes)),
-        SampleEncoding::Float32 => read_sample::<f32>(bytes),
-        SampleEncoding::PackedBGR101010 => {
-            unreachable!("packed BGR101010 pixels are decoded as a unit")
-        }
-        SampleEncoding::RGBE => {
-            unreachable!("RGBE pixels are decoded as a unit")
-        }
-    }
-}
-
-fn decode_bgr101010(pixel: &[u8]) -> [f32; 3] {
-    rec2100_pq_to_scrgb(unpack_bgr101010(pixel))
-}
-
-#[inline]
-fn decode_bgr101010_simd<const N: usize>(packed: Simd<u32, N>) -> [Simd<f32, N>; 3] {
-    const MASK: u32 = 0x03ff;
-    const SCALE: f32 = 1.0 / 1023.0;
-
-    let encoded = [20, 10, 0].map(|shift| {
-        ((packed >> Simd::splat(shift)) & Simd::splat(MASK)).cast::<f32>() * Simd::splat(SCALE)
-    });
-    rec2100_pq_to_scrgb_simd(encoded)
-}
-
-fn unpack_bgr101010(pixel: &[u8]) -> [f32; 3] {
-    const MASK: u32 = 0x03ff;
-    const SCALE: f32 = 1.0 / 1023.0;
-
-    invariant_eq!(pixel.len(), SampleEncoding::PackedBGR101010.bytes());
-
-    let packed = read_sample::<u32>(pixel);
-    let channel = |shift| {
-        let sample = u16::try_from((packed >> shift) & MASK)
-            .expect("a masked 10-bit JPEG XR sample fits u16");
-        f32::from(sample) * SCALE
-    };
-
-    [channel(20), channel(10), channel(0)]
-}
-
-fn rec2100_pq_to_scrgb(encoded: [f32; 3]) -> [f32; 3] {
-    const REC2100_MAX_NITS: f32 = 10_000.0;
-    const SCALE: f32 = REC2100_MAX_NITS / SC_RGB_REFERENCE_WHITE_NITS;
-
-    let [red, green, blue, _padding] =
-        pq_to_linear_simd(F32x4::from_array([encoded[0], encoded[1], encoded[2], 0.0])).to_array();
-
-    [
-        (1.660_491 * red - 0.587_641 * green - 0.072_850 * blue) * SCALE,
-        (-0.124_550 * red + 1.132_9 * green - 0.008_349 * blue) * SCALE,
-        (-0.018_151 * red - 0.100_579 * green + 1.118_73 * blue) * SCALE,
-    ]
-}
-
-#[inline]
-fn rec2100_pq_to_scrgb_simd<const N: usize>(encoded: [Simd<f32, N>; 3]) -> [Simd<f32, N>; 3] {
-    const REC2100_MAX_NITS: f32 = 10_000.0;
-    const SCALE: f32 = REC2100_MAX_NITS / SC_RGB_REFERENCE_WHITE_NITS;
-
-    let [red, green, blue] = encoded.map(pq_to_linear_simd);
-    [
-        (Simd::splat(1.660_491) * red
-            - Simd::splat(0.587_641) * green
-            - Simd::splat(0.072_850) * blue)
-            * Simd::splat(SCALE),
-        (Simd::splat(-0.124_550) * red + Simd::splat(1.132_9) * green
-            - Simd::splat(0.008_349) * blue)
-            * Simd::splat(SCALE),
-        (Simd::splat(-0.018_151) * red - Simd::splat(0.100_579) * green
-            + Simd::splat(1.118_73) * blue)
-            * Simd::splat(SCALE),
-    ]
-}
-
-#[cfg(test)]
-fn pq_to_linear(encoded: f32) -> f32 {
-    const INVERSE_M1: f32 = 16_384.0 / 2_610.0;
-    const INVERSE_M2: f32 = 32.0 / 2_523.0;
-    const C1: f32 = 3_424.0 / 4_096.0;
-    const C2: f32 = 2_413.0 / 128.0;
-    const C3: f32 = 2_392.0 / 128.0;
-
-    let powered = encoded.powf(INVERSE_M2);
-    ((powered - C1).max(0.0) / (C2 - C3 * powered)).powf(INVERSE_M1)
-}
-
-#[inline]
-fn pq_to_linear_simd<const N: usize>(encoded: Simd<f32, N>) -> Simd<f32, N> {
-    const INVERSE_M1: f32 = 16_384.0 / 2_610.0;
-    const INVERSE_M2: f32 = 32.0 / 2_523.0;
-    const C1: f32 = 3_424.0 / 4_096.0;
-    const C2: f32 = 2_413.0 / 128.0;
-    const C3: f32 = 2_392.0 / 128.0;
-
-    let powered = exp2(log2(encoded) * Simd::splat(INVERSE_M2));
-    let ratio = (powered - Simd::splat(C1)).simd_max(Simd::splat(0.0))
-        / (Simd::splat(C2) - Simd::splat(C3) * powered);
-    exp2(log2(ratio) * Simd::splat(INVERSE_M1))
-}
-
-fn read_sample<T: FromBytes + Sized>(bytes: &[u8]) -> T {
-    T::read_from_bytes(bytes).expect("JPEG XR sample length must match its encoding")
-}
-
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "s7.24 fixed-point values are intentionally converted to f32 for tone mapping"
-)]
-fn fixed32_to_f32(value: i32) -> f32 {
-    (f64::from(value) / 16_777_216.0) as f32
-}
-
-/// Widens an IEEE 754 binary16 sample to `f32`.
-fn half_to_f32(bits: u16) -> f32 {
-    f32::from(f16::from_bits(bits))
-}
-
-fn decode_rgbe(pixel: &[u8]) -> Result<[f32; 3]> {
-    if pixel.len() < 4 {
-        return Err(error(JPEGXRError::Output(
-            "JPEG XR RGBE pixel is shorter than four bytes",
-        )));
-    }
-
-    let exponent = pixel[3];
-    if exponent == 0 {
-        return Ok([0.0; 3]);
-    }
-
-    let scale = 2.0_f32.powi(i32::from(exponent) - 136);
-    Ok([
-        f32::from(pixel[0]) * scale,
-        f32::from(pixel[1]) * scale,
-        f32::from(pixel[2]) * scale,
-    ])
-}
-
-fn display_linear_to_srgb8(color: LinearRGB) -> [u8; 3] {
-    color.components().map(linear_to_srgb).map(normalized_to_u8)
-}
-
-#[cfg(test)]
-fn hdr_to_srgb8(color: [f32; 3], mapper: &impl ToneMapper) -> [u8; 3] {
-    display_linear_to_srgb8(mapper.map(LinearRGB::new(color)))
-}
-
-fn normalize_alpha(value: f32) -> f32 {
-    if value.is_finite() {
-        value.clamp(0.0, 1.0)
-    } else {
-        0.0
-    }
-}
-
-fn linear_to_srgb(value: f32) -> f32 {
-    linear_to_srgb_simd(Simd::<f32, 1>::splat(value))[0]
-}
-
-#[inline]
-fn linear_to_srgb_simd<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
-    let value = value.simd_clamp(Simd::splat(0.0), Simd::splat(1.0));
-    let linear = value * Simd::splat(12.92);
-    let nonlinear =
-        exp2(log2(value) * Simd::splat(1.0 / 2.4)) * Simd::splat(1.055) - Simd::splat(0.055);
-    value
-        .simd_le(Simd::splat(0.003_130_8))
-        .select(linear, nonlinear)
-}
-
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "the normalized sample is rounded and clamped to u8 before conversion"
-)]
-fn normalized_to_u8(value: f32) -> u8 {
-    (value.clamp(0.0, 1.0) * f32::from(u8::MAX)).round() as u8
 }
 
 fn codec_error(source: &jpegxr::Error) -> Error {
@@ -1921,7 +602,6 @@ fn codec_error(source: &jpegxr::Error) -> Error {
 mod tests {
     use super::*;
     use tonemapping::{ACESFitted, BT2446A, ExtendedLuminanceReinhard, ExtendedReinhard};
-
     #[test]
     fn display_pixel_batches_match_the_scalar_tail() {
         // `write_display_pixels` vectorizes complete lane groups and falls back to

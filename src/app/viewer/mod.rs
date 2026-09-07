@@ -1,5 +1,9 @@
 //! Owns viewer state and renders the GPUI interface.
 
+mod decode_scheduler;
+mod geometry;
+mod render;
+
 use std::cell::OnceCell;
 use std::path::Path;
 use std::sync::Arc;
@@ -7,12 +11,16 @@ use std::sync::Arc;
 use exn::ErrorExt;
 
 use gpui::{
-    Anchor, AnchoredPositionMode, App, CursorStyle, FocusHandle, Focusable, Image as GPUIImage,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathPromptOptions, Pixels, Point,
-    Role, ScrollWheelEvent, SharedString, Toggled, Window, WindowControlArea, actions, anchored,
-    deferred, div, img, point, prelude::*, px, rgb, rgba,
+    App, FocusHandle, Focusable, MouseDownEvent, PathPromptOptions, Pixels, Point, SharedString,
+    Window, actions, div, prelude::*, px, rgb,
 };
 use tonemapping::{MaxCLLMode, ToneMappingMethod};
+
+use decode_scheduler::{DecodeJob, DecodePayload, LatestLoadCoordinator, LoadPurpose, LoadRequest};
+use geometry::zoom_to_cursor_pan;
+use render::context_menu_height;
+#[cfg(test)]
+use render::toggled_max_cll_mode;
 
 use super::image_loader::{
     DisplayedImage, HDROptions, ImageMetadata, LoadError, LoadResult, LoadedImage, MetadataField,
@@ -90,96 +98,6 @@ actions!(
     four,
     [Quit, OpenFile, ZoomIn, ZoomOut, ZoomReset, DismissMenu]
 );
-
-/// Scale that fits an `image_w`×`image_h` image inside `content_w`×`content_h`, preserving
-/// aspect ratio (matches gpui's `ObjectFit::Contain`, which this replaces).
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "image dimensions stay far below f32's 2^24 exact-integer range"
-)]
-fn fit_scale(content_w: Pixels, content_h: Pixels, image_w: u32, image_h: u32) -> f32 {
-    assert!(image_w > 0, "image width must be nonzero");
-    assert!(image_h > 0, "image height must be nonzero");
-
-    // Floored so a content area shrunk to zero or negative (viewport smaller than the drag region)
-    // can't return a zero scale: a later zoom would then divide by zero in `zoom_to_cursor_pan` and
-    // get NaN stuck in `self.pan` forever, since `f32::clamp` passes NaN through unchanged.
-    let content_w = f32::from(content_w).max(1.0);
-    let content_h = f32::from(content_h).max(1.0);
-
-    (content_w / image_w as f32).min(content_h / image_h as f32)
-}
-
-/// Clamps a pan offset so a `display`-sized image centered in a `content`-sized container can't
-/// be dragged fully out of view.
-fn clamp_pan(
-    pan: Point<Pixels>,
-    display_w: Pixels,
-    display_h: Pixels,
-    content_w: Pixels,
-    content_h: Pixels,
-) -> Point<Pixels> {
-    let max_x = ((display_w - content_w) * 0.5).max(px(0.0));
-    let max_y = ((display_h - content_h) * 0.5).max(px(0.0));
-
-    point(pan.x.clamp(-max_x, max_x), pan.y.clamp(-max_y, max_y))
-}
-
-/// Pan offset that keeps the image point under `cursor_offset` (relative to the content-area
-/// center) fixed while the effective scale changes from `old_scale` to `new_scale`.
-fn zoom_to_cursor_pan(
-    cursor_offset: Point<Pixels>,
-    old_pan: Point<Pixels>,
-    old_scale: f32,
-    new_scale: f32,
-) -> Point<Pixels> {
-    let image_point = (cursor_offset - old_pan) / old_scale;
-    cursor_offset - image_point * new_scale
-}
-
-#[cfg(test)]
-mod zoom_math_tests {
-    use super::{clamp_pan, fit_scale, zoom_to_cursor_pan};
-    use gpui::{point, px};
-
-    #[test]
-    fn fit_scale_stays_positive_when_content_area_collapses() {
-        assert!(fit_scale(px(0.0), px(0.0), 100, 100) > 0.0);
-        assert!(fit_scale(px(-5.0), px(200.0), 100, 100) > 0.0);
-    }
-
-    #[test]
-    fn zoom_to_cursor_pan_is_identity_when_scale_unchanged() {
-        let cursor = point(px(50.0), px(-30.0));
-        let pan = point(px(10.0), px(5.0));
-
-        assert_eq!(zoom_to_cursor_pan(cursor, pan, 2.0, 2.0), pan);
-    }
-
-    #[test]
-    fn zoom_to_cursor_pan_leaves_pan_unchanged_when_cursor_is_centered() {
-        let cursor = point(px(0.0), px(0.0));
-        let pan = point(px(0.0), px(0.0));
-
-        assert_eq!(zoom_to_cursor_pan(cursor, pan, 1.0, 4.0), pan);
-    }
-
-    #[test]
-    fn clamp_pan_constrains_oversized_image_pan() {
-        let pan = point(px(1000.0), px(1000.0));
-        let clamped = clamp_pan(pan, px(400.0), px(300.0), px(200.0), px(200.0));
-
-        assert_eq!(clamped, point(px(100.0), px(50.0)));
-    }
-
-    #[test]
-    fn clamp_pan_forces_zero_when_image_fits_within_content() {
-        let pan = point(px(40.0), px(40.0));
-        let clamped = clamp_pan(pan, px(100.0), px(100.0), px(200.0), px(200.0));
-
-        assert_eq!(clamped, point(px(0.0), px(0.0)));
-    }
-}
 
 pub(super) enum ViewerState {
     Empty {
@@ -259,77 +177,6 @@ impl ViewerState {
 
     fn has_image(&self) -> bool {
         self.displayed().is_some()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LoadRequest(u64);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LoadPurpose {
-    Image,
-    HdrMetrics,
-    HDROptions,
-}
-
-#[derive(Debug)]
-struct DecodeJob<T> {
-    request: LoadRequest,
-    payload: T,
-}
-
-#[derive(Debug)]
-struct DecodePayload {
-    hdr_options: HDROptions,
-    include_hdr_metrics: bool,
-    path: Arc<Path>,
-    purpose: LoadPurpose,
-}
-
-// Decoders are synchronous, so an active job must finish. Keeping only the latest waiting job
-// bounds decode work to one allocation-heavy operation at a time without misrepresenting it as
-// cancellable.
-#[derive(Debug)]
-struct LatestLoadCoordinator<T> {
-    active: Option<LoadRequest>,
-    queued: Option<DecodeJob<T>>,
-}
-
-impl<T> LatestLoadCoordinator<T> {
-    fn new() -> Self {
-        Self {
-            active: None,
-            queued: None,
-        }
-    }
-
-    fn submit(&mut self, job: DecodeJob<T>) -> Option<DecodeJob<T>> {
-        if self.active.is_none() {
-            self.active = Some(job.request);
-            return Some(job);
-        }
-
-        self.queued = Some(job);
-        None
-    }
-
-    fn complete(&mut self, request: LoadRequest) -> Option<DecodeJob<T>> {
-        let active = self
-            .active
-            .take()
-            .expect("a decode completed while the load coordinator was idle");
-        assert_eq!(
-            active, request,
-            "a decode other than the active request completed"
-        );
-
-        let next = self.queued.take();
-        self.active = next.as_ref().map(|job| job.request);
-        next
-    }
-
-    fn discard_queued(&mut self) {
-        self.queued = None;
     }
 }
 
@@ -509,27 +356,22 @@ impl Root {
         });
 
         cx.spawn_in(window, async move |root, cx| {
-            let path = match paths.await {
-                Ok(Ok(Some(mut paths))) => paths.pop(),
-                Ok(Ok(None)) => None,
-                // `Ok(Err(_))` is the platform reporting the dialog itself failed; `Err(_)` is the
-                // response channel being dropped before it replied. Both are real failures, unlike
-                // `Ok(Ok(None))` (the user just canceled), so both get surfaced the same way.
-                Ok(Err(prompt_error)) => {
-                    let _ = root.update_in(cx, |root, window, cx| {
-                        root.dismiss_menus();
-                        root.viewer
-                            .apply_result(Err(LoadError::new(prompt_error.to_string()).raise()));
-                        root.sync_window_title(window);
-                        cx.notify();
-                    });
-                    return;
-                }
+            // `Ok(Err(_))` is the platform reporting the dialog itself failed; `Err(_)` is the
+            // response channel being dropped before it replied. Both are real failures, unlike
+            // `Ok(Ok(None))` (the user just canceled), so both get surfaced the same way.
+            let paths = match paths.await {
+                Ok(prompt_result) => prompt_result.map_err(|prompt_error| prompt_error.to_string()),
+                Err(prompt_error) => Err(prompt_error.to_string()),
+            };
+
+            let path = match paths {
+                Ok(Some(mut paths)) => paths.pop(),
+                Ok(None) => None,
                 Err(prompt_error) => {
                     let _ = root.update_in(cx, |root, window, cx| {
                         root.dismiss_menus();
                         root.viewer
-                            .apply_result(Err(LoadError::new(prompt_error.to_string()).raise()));
+                            .apply_result(Err(LoadError::new(prompt_error).raise()));
                         root.sync_window_title(window);
                         cx.notify();
                     });
@@ -620,30 +462,38 @@ impl Root {
         .detach();
     }
 
-    fn apply_load_result(&mut self, request: LoadRequest, result: LoadResult<LoadedImage>) -> bool {
+    /// Runs `apply` only if `request` is still current, bracketed by the "status is never blank"
+    /// invariant and the context-menu reset every load-result application performs.
+    fn apply_result_with(&mut self, request: LoadRequest, apply: impl FnOnce(&mut Self)) -> bool {
         if !self.accepts_load_request(request) {
             return false;
         }
 
         assert!(
             !self.viewer.status().is_empty(),
-            "viewer status must never be blank before a load result is applied"
+            "viewer status must never be blank before a result is applied"
         );
         self.context_menu_position = None;
 
-        let load_succeeded = result.is_ok();
-        self.viewer.apply_result(result);
-        if load_succeeded {
-            self.metadata_visible = false;
-            self.tone_mapping_menu_open = false;
-            self.reset_zoom();
-        }
+        apply(self);
 
         assert!(
             !self.viewer.status().is_empty(),
-            "viewer status must never be blank after a load result is applied"
+            "viewer status must never be blank after a result is applied"
         );
         true
+    }
+
+    fn apply_load_result(&mut self, request: LoadRequest, result: LoadResult<LoadedImage>) -> bool {
+        self.apply_result_with(request, |root| {
+            let load_succeeded = result.is_ok();
+            root.viewer.apply_result(result);
+            if load_succeeded {
+                root.metadata_visible = false;
+                root.tone_mapping_menu_open = false;
+                root.reset_zoom();
+            }
+        })
     }
 
     fn apply_hdr_options_result(
@@ -651,41 +501,27 @@ impl Root {
         request: LoadRequest,
         result: LoadResult<LoadedImage>,
     ) -> bool {
-        if !self.accepts_load_request(request) {
-            return false;
-        }
+        self.apply_result_with(request, |root| {
+            let displayed_options = root
+                .viewer
+                .displayed()
+                .and_then(|displayed| displayed.hdr_options);
 
-        assert!(
-            !self.viewer.status().is_empty(),
-            "viewer status must never be blank before an HDR options result is applied"
-        );
-        self.context_menu_position = None;
+            let resolved_options = result
+                .as_ref()
+                .ok()
+                .and_then(|loaded| loaded.displayed.hdr_options)
+                .or(displayed_options);
 
-        let displayed_options = self
-            .viewer
-            .displayed()
-            .and_then(|displayed| displayed.hdr_options);
+            root.viewer.apply_result(result);
 
-        let resolved_options = result
-            .as_ref()
-            .ok()
-            .and_then(|loaded| loaded.displayed.hdr_options)
-            .or(displayed_options);
+            root.pending_hdr_options = None;
+            if let Some(options) = resolved_options {
+                root.preferred_hdr_options = options;
+            }
 
-        self.viewer.apply_result(result);
-
-        self.pending_hdr_options = None;
-        if let Some(options) = resolved_options {
-            self.preferred_hdr_options = options;
-        }
-
-        self.tone_mapping_menu_open = false;
-
-        assert!(
-            !self.viewer.status().is_empty(),
-            "viewer status must never be blank after an HDR options result is applied"
-        );
-        true
+            root.tone_mapping_menu_open = false;
+        })
     }
 
     fn select_tone_mapping(
@@ -791,441 +627,6 @@ impl Root {
         );
         cx.notify();
     }
-
-    fn render_context_menu(
-        position: Point<Pixels>,
-        has_image: bool,
-        metadata_visible: bool,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        assert!(
-            position.x >= px(0.0),
-            "context menu x position must be clamped nonnegative, got {:?}",
-            position.x
-        );
-        assert!(
-            position.y >= px(DRAG_REGION_HEIGHT),
-            "context menu y position must clear the drag region, got {:?}",
-            position.y
-        );
-
-        deferred(
-            div()
-                .absolute()
-                .left(position.x)
-                .top(position.y)
-                .w(px(CONTEXT_MENU_WIDTH))
-                .h(px(context_menu_height(has_image)))
-                .p_1()
-                .rounded_md()
-                .shadow_lg()
-                .border_1()
-                .border_color(rgb(COLOR_PANEL_BORDER))
-                .bg(rgb(COLOR_PANEL_BACKGROUND))
-                .flex()
-                .flex_col()
-                .on_mouse_down_out(cx.listener(|root, _, _, cx| {
-                    root.context_menu_position = None;
-                    cx.notify();
-                }))
-                .child(
-                    menu_item("open-image", "Open image…")
-                        .on_click(cx.listener(|root, _, window, cx| root.open_image(window, cx))),
-                )
-                .when(has_image, |menu| {
-                    let label = if metadata_visible {
-                        "Hide image info"
-                    } else {
-                        "Show image info"
-                    };
-                    menu.child(menu_item("toggle-image-info", label).on_click(
-                        cx.listener(|root, _, window, cx| root.toggle_metadata(window, cx)),
-                    ))
-                })
-                .child(menu_item("quit", "Quit").on_click(|_, _, cx| cx.quit())),
-        )
-        .priority(1)
-    }
-
-    fn render_metadata_overlay(
-        metadata: &ImageMetadata,
-        hdr_options: Option<HDROptions>,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        assert_ne!(
-            metadata.fields.len(),
-            0,
-            "metadata overlay requires at least one field to display"
-        );
-
-        div()
-            .absolute()
-            .left(px(METADATA_OVERLAY_MARGIN))
-            .top(px(DRAG_REGION_HEIGHT + METADATA_OVERLAY_MARGIN))
-            .w(px(METADATA_OVERLAY_WIDTH))
-            .p_3()
-            .rounded_md()
-            .border_1()
-            .border_color(rgba(COLOR_STATUS_BAR_BORDER))
-            .shadow_lg()
-            .bg(rgba(COLOR_STATUS_BAR_BACKGROUND))
-            .font_family("Consolas")
-            .text_sm()
-            .flex()
-            .flex_col()
-            .when_some(hdr_options, |overlay, options| {
-                overlay.child(Self::render_max_cll_selector(options.max_cll_mode(), cx))
-            })
-            .children(metadata.fields.iter().map(metadata_field))
-    }
-
-    fn render_tone_mapping_selector(
-        active_method: ToneMappingMethod,
-        menu_open: bool,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let selector = div()
-            .id("tone-mapping-selector")
-            .relative()
-            .h(px(TONE_MAPPING_SELECTOR_HEIGHT))
-            .min_w_0()
-            .flex_1()
-            .flex()
-            .items_center()
-            .justify_between()
-            .px_2()
-            .rounded_sm()
-            .border_1()
-            .border_color(rgba(COLOR_CONTROL_BORDER))
-            .bg(rgb(COLOR_CONTROL_BACKGROUND))
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(COLOR_CONTROL_HOVER)))
-            .child(active_method.label())
-            .child(
-                div()
-                    .ml_2()
-                    .text_color(rgb(COLOR_TEXT_SECONDARY))
-                    .child("▼"),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |root, _, _, cx| {
-                    root.context_menu_position = None;
-                    root.tone_mapping_menu_open = !menu_open;
-                    cx.notify();
-                }),
-            )
-            .when(menu_open, |selector| {
-                selector.child(Self::render_tone_mapping_menu(active_method, cx))
-            });
-
-        div()
-            .w_full()
-            .flex()
-            .items_center()
-            .gap(px(METADATA_FIELD_GAP))
-            .child(
-                div()
-                    .w(px(TONE_MAPPING_LABEL_WIDTH))
-                    .flex_none()
-                    .text_color(rgb(COLOR_TEXT_SECONDARY))
-                    .child("Tone mapper"),
-            )
-            .child(selector)
-    }
-
-    fn render_max_cll_selector(selected_mode: MaxCLLMode, cx: &mut Context<Self>) -> gpui::Div {
-        let checked = selected_mode == MaxCLLMode::TrueMaximum;
-        let next_mode = toggled_max_cll_mode(selected_mode);
-        let description = if checked {
-            "True maximum"
-        } else {
-            "99.99th percentile"
-        };
-
-        let selector = div()
-            .id("max-cll-selector")
-            .role(Role::CheckBox)
-            .aria_label("Use true maximum MaxCLL")
-            .aria_toggled(if checked {
-                Toggled::True
-            } else {
-                Toggled::False
-            })
-            .h(px(MAX_CLL_SELECTOR_HEIGHT))
-            .min_w_0()
-            .flex_1()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .rounded_sm()
-            .border_1()
-            .border_color(rgba(COLOR_CONTROL_BORDER))
-            .bg(rgb(COLOR_CONTROL_BACKGROUND))
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(COLOR_CONTROL_HOVER)))
-            .child(
-                div()
-                    .size(px(MAX_CLL_CHECKBOX_SIZE))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_xs()
-                    .border_1()
-                    .border_color(rgba(COLOR_CHECKBOX_BORDER))
-                    .when(checked, |checkbox| {
-                        checkbox.bg(rgb(COLOR_SELECTED_BACKGROUND))
-                    })
-                    .text_color(rgb(COLOR_ACCENT_GREEN))
-                    .child(if checked { "✓" } else { "" }),
-            )
-            .child(description)
-            .on_click(cx.listener(move |root, _, window, cx| {
-                root.select_max_cll_mode(next_mode, window, cx);
-            }));
-
-        div()
-            .w_full()
-            .flex()
-            .items_center()
-            .gap(px(METADATA_FIELD_GAP))
-            .pb_1()
-            .child(
-                div()
-                    .w(px(METADATA_LABEL_WIDTH))
-                    .flex_none()
-                    .text_color(rgb(COLOR_TEXT_SECONDARY))
-                    .child("MaxCLL"),
-            )
-            .child(selector)
-    }
-
-    fn render_tone_mapping_menu(
-        active_method: ToneMappingMethod,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        deferred(
-            anchored()
-                .anchor(Anchor::TopLeft)
-                .position(point(
-                    px(0.0),
-                    px(TONE_MAPPING_SELECTOR_HEIGHT + TONE_MAPPING_MENU_MARGIN),
-                ))
-                .position_mode(AnchoredPositionMode::Local)
-                .snap_to_window_with_margin(px(METADATA_OVERLAY_MARGIN))
-                .child(
-                    div()
-                        .occlude()
-                        .w(px(TONE_MAPPING_MENU_WIDTH))
-                        .p_1()
-                        .rounded_md()
-                        .shadow_lg()
-                        .border_1()
-                        .border_color(rgb(COLOR_PANEL_BORDER))
-                        .bg(rgb(COLOR_PANEL_BACKGROUND))
-                        .flex()
-                        .flex_col()
-                        .children(ToneMappingMethod::ALL.map(|method| {
-                            tone_mapping_menu_item(method, active_method).on_click(cx.listener(
-                                move |root, _, window, cx| {
-                                    root.select_tone_mapping(method, window, cx);
-                                },
-                            ))
-                        }))
-                        .on_mouse_down_out(cx.listener(|root, _, _, cx| {
-                            root.tone_mapping_menu_open = false;
-                            cx.notify();
-                        })),
-                ),
-        )
-        .priority(2)
-    }
-
-    fn on_image_scroll(
-        &mut self,
-        event: &ScrollWheelEvent,
-        content_w: Pixels,
-        content_h: Pixels,
-        width: u32,
-        height: u32,
-        cx: &mut Context<Self>,
-    ) {
-        let delta = event.delta.pixel_delta(px(SCROLL_LINE_HEIGHT));
-        let step = f32::from(delta.y) / SCROLL_LINE_HEIGHT;
-        let new_zoom = (self.zoom * ZOOM_STEP_BASE.powf(step)).clamp(ZOOM_MIN, ZOOM_MAX);
-        if (new_zoom - self.zoom).abs() > f32::EPSILON {
-            let base_scale = fit_scale(content_w, content_h, width, height);
-            let cursor_offset = point(
-                event.position.x - content_w * 0.5,
-                event.position.y - px(DRAG_REGION_HEIGHT) - content_h * 0.5,
-            );
-            self.pan = zoom_to_cursor_pan(
-                cursor_offset,
-                self.pan,
-                base_scale * self.zoom,
-                base_scale * new_zoom,
-            );
-            self.zoom = new_zoom;
-            cx.notify();
-        }
-    }
-
-    fn on_image_drag_start(&mut self, event: &MouseDownEvent, cx: &mut Context<Self>) {
-        if (self.zoom - 1.0).abs() > f32::EPSILON {
-            self.drag_anchor = Some(event.position);
-            cx.notify();
-        }
-    }
-
-    fn on_image_drag_move(&mut self, event: &MouseMoveEvent, cx: &mut Context<Self>) {
-        let Some(anchor_mouse) = self.drag_anchor else {
-            return;
-        };
-        if event.pressed_button != Some(MouseButton::Left) {
-            return;
-        }
-        self.pan += event.position - anchor_mouse;
-        self.drag_anchor = Some(event.position);
-        cx.notify();
-    }
-
-    fn on_image_drag_end(&mut self, cx: &mut Context<Self>) {
-        if self.drag_anchor.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "image dimensions stay far below f32's 2^24 exact-integer range"
-    )]
-    fn render_image_content(
-        &mut self,
-        image: Option<Arc<GPUIImage>>,
-        image_dims: Option<(u32, u32)>,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let has_image = image.is_some();
-
-        div()
-            .relative()
-            .flex_1()
-            .min_h_0()
-            .min_w_0()
-            .flex()
-            .items_center()
-            .justify_center()
-            .overflow_hidden()
-            .when_some(
-                image.zip(image_dims),
-                |content, (image, (width, height))| {
-                    let viewport_size = window.viewport_size();
-                    let content_w = viewport_size.width;
-                    let content_h = viewport_size.height - px(DRAG_REGION_HEIGHT);
-
-                    let scale = fit_scale(content_w, content_h, width, height) * self.zoom;
-                    let display_w = px(width as f32) * scale;
-                    let display_h = px(height as f32) * scale;
-
-                    self.pan = clamp_pan(self.pan, display_w, display_h, content_w, content_h);
-                    let pan = self.pan;
-                    let zoom = self.zoom;
-                    let left = (content_w - display_w) * 0.5 + pan.x;
-                    let top = (content_h - display_h) * 0.5 + pan.y;
-
-                    content
-                        .on_scroll_wheel(cx.listener(
-                            move |root, event: &ScrollWheelEvent, _, cx| {
-                                root.on_image_scroll(
-                                    event, content_w, content_h, width, height, cx,
-                                );
-                            },
-                        ))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|root, event: &MouseDownEvent, _, cx| {
-                                root.on_image_drag_start(event, cx);
-                            }),
-                        )
-                        .on_mouse_move(cx.listener(move |root, event: &MouseMoveEvent, _, cx| {
-                            root.on_image_drag_move(event, cx);
-                        }))
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|root, _: &MouseUpEvent, _, cx| {
-                                root.on_image_drag_end(cx);
-                            }),
-                        )
-                        .child(
-                            img(image)
-                                .id("displayed-image")
-                                .absolute()
-                                .left(left)
-                                .top(top)
-                                .w(display_w)
-                                .h(display_h),
-                        )
-                        .when((zoom - 1.0).abs() > f32::EPSILON, |content| {
-                            content.cursor(CursorStyle::OpenHand)
-                        })
-                },
-            )
-            .when(!has_image, |content| {
-                content.child(
-                    div()
-                        .text_sm()
-                        .text_color(rgb(COLOR_TEXT_HINT))
-                        .child("Right-click anywhere, then choose Open image…"),
-                )
-            })
-    }
-
-    fn render_status_bar(
-        status: SharedString,
-        hdr_options: Option<HDROptions>,
-        tone_mapping_menu_open: bool,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        div()
-            .w_full()
-            .h(px(DRAG_REGION_HEIGHT))
-            .flex_none()
-            .flex()
-            .items_center()
-            .text_sm()
-            .bg(rgb(COLOR_METADATA_OVERLAY_BACKGROUND))
-            .child(
-                div()
-                    .h_full()
-                    .min_w_0()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .overflow_hidden()
-                    .px_3()
-                    .window_control_area(WindowControlArea::Drag)
-                    .child(status),
-            )
-            .when_some(hdr_options, |titlebar, options| {
-                titlebar.child(
-                    div()
-                        .w(px(TONE_MAPPING_TITLEBAR_WIDTH))
-                        .h_full()
-                        .flex_none()
-                        .flex()
-                        .items_center()
-                        .px_3()
-                        .child(Self::render_tone_mapping_selector(
-                            options.tone_mapping(),
-                            tone_mapping_menu_open,
-                            cx,
-                        )),
-                )
-            })
-    }
 }
 
 impl Focusable for Root {
@@ -1284,7 +685,7 @@ impl Render for Root {
                 cx.notify();
             }))
             .on_mouse_down(
-                MouseButton::Right,
+                gpui::MouseButton::Right,
                 cx.listener(|root, event: &MouseDownEvent, window, cx| {
                     root.show_context_menu(event, window);
                     cx.notify();
@@ -1311,105 +712,6 @@ impl Render for Root {
     }
 }
 
-const fn toggled_max_cll_mode(mode: MaxCLLMode) -> MaxCLLMode {
-    match mode {
-        MaxCLLMode::Percentile99_99 => MaxCLLMode::TrueMaximum,
-        MaxCLLMode::TrueMaximum => MaxCLLMode::Percentile99_99,
-    }
-}
-
-const fn context_menu_height(has_image: bool) -> f32 {
-    let item_count = if has_image { 3.0 } else { 2.0 };
-    CONTEXT_MENU_PADDING + CONTEXT_MENU_ITEM_HEIGHT * item_count
-}
-
-fn menu_item(identifier: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
-    assert_ne!(
-        identifier.len(),
-        0,
-        "menu item identifier must not be blank"
-    );
-    assert_ne!(label.len(), 0, "menu item label must not be blank");
-
-    div()
-        .id(identifier)
-        .h(px(CONTEXT_MENU_ITEM_HEIGHT))
-        .w_full()
-        .flex()
-        .items_center()
-        .px_2()
-        .rounded_sm()
-        .cursor_pointer()
-        .text_sm()
-        .text_color(rgb(COLOR_TEXT_MENU))
-        .hover(|style| style.bg(rgb(COLOR_MENU_ITEM_HOVER)))
-        .child(label)
-}
-
-fn tone_mapping_menu_item(
-    method: ToneMappingMethod,
-    active_method: ToneMappingMethod,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(method.label())
-        .h(px(TONE_MAPPING_MENU_ITEM_HEIGHT))
-        .w_full()
-        .flex()
-        .items_center()
-        .px_2()
-        .rounded_sm()
-        .cursor_pointer()
-        .text_color(rgb(COLOR_TEXT_MENU))
-        .hover(|style| style.bg(rgb(COLOR_MENU_ITEM_HOVER)))
-        .when(method == active_method, |item| {
-            item.bg(rgb(COLOR_SELECTED_BACKGROUND))
-        })
-        .child(
-            div()
-                .w_5()
-                .flex_none()
-                .text_color(rgb(COLOR_ACCENT_GREEN))
-                .child(if method == active_method { "✓" } else { "" }),
-        )
-        .child(method.label())
-}
-
-fn metadata_field(field: &MetadataField) -> gpui::Div {
-    assert_ne!(
-        field.label.len(),
-        0,
-        "metadata field label must not be blank"
-    );
-    assert_ne!(
-        field.value.len(),
-        0,
-        "metadata field value for {:?} must not be blank",
-        field.label
-    );
-
-    div()
-        .w_full()
-        .flex()
-        .items_start()
-        .gap(px(METADATA_FIELD_GAP))
-        .py_0p5()
-        .when(field.starts_section, Styled::mt_2)
-        .child(
-            div()
-                .w(px(METADATA_LABEL_WIDTH))
-                .flex_none()
-                .text_color(rgb(COLOR_TEXT_SECONDARY))
-                .child(field.label),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .flex_1()
-                .text_color(rgb(COLOR_TEXT_VALUE))
-                .child(field.value.clone()),
-        )
-}
-
 pub(super) fn initial_viewer(path: Option<&Path>) -> ViewerState {
     let viewer = match path {
         Some(path) => ViewerState::from_result(load_image(path)),
@@ -1422,6 +724,8 @@ pub(super) fn initial_viewer(path: Option<&Path>) -> ViewerState {
 
 #[cfg(test)]
 mod tests {
+    use gpui::{Image as GPUIImage, point};
+
     use super::*;
 
     fn loaded_hdr_viewer(options: HDROptions) -> ViewerState {

@@ -56,6 +56,33 @@ fn validate_dimensions_pair(&(width, height): &(u32, u32)) -> Result<(), Dimensi
 )]
 pub(crate) struct Dimensions((u32, u32));
 
+/// Maps a [`DimensionsError`] to a format-specific error via three closures, so each format keeps
+/// its own error variant shapes (some report `actual_width`/`actual_height` separately, others
+/// collapse to a single `actual: width.max(height)`) without duplicating the match.
+pub(crate) fn map_dimensions_error<E>(
+    error: DimensionsError,
+    zero: impl FnOnce() -> E,
+    too_large: impl FnOnce(u32, u32) -> E,
+    too_many_pixels: impl FnOnce(u64) -> E,
+) -> E {
+    match error {
+        DimensionsError::Zero => zero(),
+        DimensionsError::TooLarge { width, height } => too_large(width, height),
+        DimensionsError::TooManyPixels { pixels } => too_many_pixels(pixels),
+    }
+}
+
+/// Rounds a sample already scaled to the `[0, 255]` domain and clamps it into `u8`.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is rounded and clamped to the complete u8 range before conversion"
+)]
+pub(crate) fn round_clamp_u8(value: f32) -> u8 {
+    invariant!(value.is_finite());
+    value.round().clamp(f32::from(u8::MIN), f32::from(u8::MAX)) as u8
+}
+
 /// Pixel count below which a decoder normalizes on the calling thread.
 const PARALLEL_PIXELS_MIN: usize = 256 * 1024;
 

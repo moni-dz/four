@@ -4,12 +4,6 @@ use std::fmt;
 
 use exn::ErrorExt;
 
-/// An exception carrying a [`TIFFError`] and its propagation frames.
-pub type Error = exn::Exn<TIFFError>;
-
-/// The result returned by TIFF decoder operations.
-pub type Result<T> = exn::Result<T, TIFFError>;
-
 /// A TIFF decoding failure.
 #[derive(Debug)]
 pub enum TIFFError {
@@ -70,24 +64,7 @@ impl fmt::Display for TIFFError {
     }
 }
 
-impl std::error::Error for TIFFError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Codec(source) => Some(source.as_ref()),
-            _ => None,
-        }
-    }
-}
-
-/// Raises a leaf error at its validation site.
-#[track_caller]
-pub(super) fn error(error: TIFFError) -> Error {
-    invariant!(
-        !error.to_string().is_empty(),
-        "a TIFF error must have a useful display message"
-    );
-    error.raise()
-}
+format_error_boilerplate!("TIFF", TIFFError, source = |source| Some(source.as_ref()));
 
 fn write_limit_error(formatter: &mut fmt::Formatter<'_>, limit: TIFFLimit) -> fmt::Result {
     match limit {

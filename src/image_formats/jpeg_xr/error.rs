@@ -4,12 +4,6 @@ use std::fmt;
 
 use exn::ErrorExt;
 
-/// An exception carrying a [`JPEGXRError`] and its propagation frames.
-pub type Error = exn::Exn<JPEGXRError>;
-
-/// The result returned by JPEG XR decoder operations.
-pub type Result<T> = exn::Result<T, JPEGXRError>;
-
 /// A JPEG XR decoding or normalization failure.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JPEGXRError {
@@ -68,23 +62,7 @@ impl fmt::Display for JPEGXRError {
     }
 }
 
-impl std::error::Error for JPEGXRError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Codec(source) => Some(source),
-            _ => None,
-        }
-    }
-}
-
-#[track_caller]
-pub(super) fn error(error: JPEGXRError) -> Error {
-    invariant!(
-        !error.to_string().is_empty(),
-        "a JPEG XR error must have a useful display message"
-    );
-    error.raise()
-}
+format_error_boilerplate!("JPEG XR", JPEGXRError, source = |source| Some(source));
 
 fn write_limit_error(formatter: &mut fmt::Formatter<'_>, limit: JPEGXRLimit) -> fmt::Result {
     match limit {

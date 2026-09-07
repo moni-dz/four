@@ -5,9 +5,9 @@ use rayon::prelude::*;
 use std::convert::Infallible;
 
 use super::{
-    BLOCK_SIDE, COMPONENTS_MAX, DIMENSION_MAX, DecodedImage, Dimensions, DimensionsError, Error,
-    JPEGError, JPEGLimit, JPEGTableKind, PIXELS_MAX, PROGRESSIVE_COEFFICIENT_BYTES_MAX, Result,
-    divide_ceil, error, idct, rgba_pixel_rows,
+    BLOCK_SIDE, COMPONENTS_MAX, DIMENSION_MAX, DecodedImage, Dimensions, Error, JPEGError,
+    JPEGLimit, JPEGTableKind, PIXELS_MAX, PROGRESSIVE_COEFFICIENT_BYTES_MAX, Result, divide_ceil,
+    error, idct, map_dimensions_error, rgba_pixel_rows, round_clamp_u8,
 };
 
 const PARALLEL_BLOCKS_MIN: usize = 4 * 1024;
@@ -448,38 +448,36 @@ fn convert_color(first: u8, second: u8, third: u8, transform: ColorTransform) ->
             let red = luminance + 1.402 * red_difference;
             let green = luminance - 0.344_136 * blue_difference - 0.714_136 * red_difference;
             let blue = luminance + 1.772 * blue_difference;
-            [clamp_color(red), clamp_color(green), clamp_color(blue), 255]
+            [
+                round_clamp_u8(red),
+                round_clamp_u8(green),
+                round_clamp_u8(blue),
+                255,
+            ]
         }
     }
-}
-
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "YCbCr conversion values are rounded and clamped to u8 before conversion"
-)]
-fn clamp_color(value: f32) -> u8 {
-    invariant!(value.is_finite());
-    value.round().clamp(f32::from(u8::MIN), f32::from(u8::MAX)) as u8
 }
 
 pub(super) fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     Dimensions::try_new((width, height))
         .map(|_| ())
-        .map_err(|dimensions_error| match dimensions_error {
-            DimensionsError::Zero => error(JPEGError::Frame("JPEG dimensions must be nonzero")),
-            DimensionsError::TooLarge { width, height } => {
-                error(JPEGError::LimitExceeded(JPEGLimit::Dimensions {
-                    actual: width.max(height),
-                    max: DIMENSION_MAX,
-                }))
-            }
-            DimensionsError::TooManyPixels { pixels } => {
-                error(JPEGError::LimitExceeded(JPEGLimit::Pixels {
-                    actual: pixels,
-                    max: PIXELS_MAX,
-                }))
-            }
+        .map_err(|dimensions_error| {
+            map_dimensions_error(
+                dimensions_error,
+                || error(JPEGError::Frame("JPEG dimensions must be nonzero")),
+                |width, height| {
+                    error(JPEGError::LimitExceeded(JPEGLimit::Dimensions {
+                        actual: width.max(height),
+                        max: DIMENSION_MAX,
+                    }))
+                },
+                |pixels| {
+                    error(JPEGError::LimitExceeded(JPEGLimit::Pixels {
+                        actual: pixels,
+                        max: PIXELS_MAX,
+                    }))
+                },
+            )
         })
 }
 

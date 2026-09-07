@@ -4,12 +4,6 @@ use std::fmt;
 
 use exn::ErrorExt;
 
-/// An exception carrying a [`JPEGXLError`] and its propagation frames.
-pub type Error = exn::Exn<JPEGXLError>;
-
-/// The result returned by JPEG XL decoder operations.
-pub type Result<T> = exn::Result<T, JPEGXLError>;
-
 /// A JPEG XL decoding failure.
 #[derive(Debug)]
 pub enum JPEGXLError {
@@ -83,21 +77,8 @@ impl fmt::Display for JPEGXLError {
     }
 }
 
-impl std::error::Error for JPEGXLError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Codec(source) => Some(source.as_ref()),
-            _ => None,
-        }
-    }
-}
-
-/// Raises a leaf error at its validation site.
-#[track_caller]
-pub(super) fn error(error: JPEGXLError) -> Error {
-    invariant!(
-        !error.to_string().is_empty(),
-        "a JPEG XL error must have a useful display message"
-    );
-    error.raise()
-}
+format_error_boilerplate!(
+    "JPEG XL",
+    JPEGXLError,
+    source = |source| Some(source.as_ref())
+);

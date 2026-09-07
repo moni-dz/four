@@ -11,7 +11,7 @@ use std::num::NonZeroU64;
 
 use ::gif::{ColorOutput, DecodeOptions, MemoryLimit};
 
-use super::{DIMENSION_MAX, DecodedImage, Dimensions, DimensionsError, PIXELS_MAX};
+use super::{DIMENSION_MAX, DecodedImage, Dimensions, PIXELS_MAX, map_dimensions_error};
 use error::error;
 
 pub use error::{Error, GIFError, GIFLimit, Result};
@@ -175,31 +175,36 @@ fn composite_first_frame(
 fn validate_dimensions(width: u32, height: u32) -> Result<()> {
     Dimensions::try_new((width, height))
         .map(|_| ())
-        .map_err(|dimensions_error| match dimensions_error {
-            DimensionsError::Zero => error(GIFError::Output(
-                "GIF logical-screen dimensions must both be nonzero",
-            )),
-            DimensionsError::TooLarge { width, height } => {
-                error(GIFError::LimitExceeded(GIFLimit::Dimensions {
-                    actual_width: width,
-                    actual_height: height,
-                    max: DIMENSION_MAX,
-                }))
-            }
-            DimensionsError::TooManyPixels { pixels } => {
-                error(GIFError::LimitExceeded(GIFLimit::Pixels {
-                    actual: pixels,
-                    max: PIXELS_MAX,
-                }))
-            }
+        .map_err(|dimensions_error| {
+            map_dimensions_error(
+                dimensions_error,
+                || {
+                    error(GIFError::Output(
+                        "GIF logical-screen dimensions must both be nonzero",
+                    ))
+                },
+                |width, height| {
+                    error(GIFError::LimitExceeded(GIFLimit::Dimensions {
+                        actual_width: width,
+                        actual_height: height,
+                        max: DIMENSION_MAX,
+                    }))
+                },
+                |pixels| {
+                    error(GIFError::LimitExceeded(GIFLimit::Pixels {
+                        actual: pixels,
+                        max: PIXELS_MAX,
+                    }))
+                },
+            )
         })
 }
 
 fn codec_error(source: ::gif::DecodingError) -> Error {
-    let detail = source.to_string();
-    let lowercase = detail.to_ascii_lowercase();
-
-    if lowercase.contains("memory limit") || lowercase.contains("out of memory") {
+    if matches!(
+        source,
+        ::gif::DecodingError::OutOfMemory | ::gif::DecodingError::MemoryLimit
+    ) {
         error(GIFError::LimitExceeded(GIFLimit::CodecFrameBytes(
             FRAME_BYTES_MAX,
         )))
