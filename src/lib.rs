@@ -8,7 +8,7 @@
 //! control over file, network, and resource policy.
 
 // Every invariant names the exact expression in its panic message. Centralizing that mechanical
-// part prevents a future assertion from silently losing the diagnostic required by AGENTS.md.
+// part prevents a future assertion from silently losing the diagnostic.
 macro_rules! invariant {
     ($condition:expr, $($message:tt)+) => {
         debug_assert!($condition, $($message)+)

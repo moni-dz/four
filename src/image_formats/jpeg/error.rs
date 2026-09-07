@@ -160,6 +160,10 @@ impl std::error::Error for JPEGError {}
 /// Raises a leaf error at its validation site so `exn` records the useful source location.
 #[track_caller]
 pub(super) fn error(error: JPEGError) -> Error {
+    invariant!(
+        !error.to_string().is_empty(),
+        "a JPEG error must have a useful display message"
+    );
     error.raise()
 }
 
