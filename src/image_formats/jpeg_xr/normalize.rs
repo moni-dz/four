@@ -10,7 +10,10 @@ use super::hdr::{
     HDRAnalysis, display_luminance_white_point, display_white_point, hdr_luminance_white_point,
     hdr_white_point,
 };
-use super::pixel::{PixelLayout, SampleEncoding, decode_bgr101010, decode_bgr101010_simd};
+use super::pixel::{
+    PixelLayout, SampleEncoding, decode_bgr101010, decode_bgr101010_simd, decode_rgba128_float,
+    decode_rgba128_float_simd,
+};
 use super::{
     BT2446_INPUT_SCALE, Error, F32x8, HDR_BATCH_PIXELS, JPEGXRError, PARALLEL_PIXELS_MIN,
     PARALLEL_PIXELS_PER_JOB, Result, SRGB_LANES, error, round_clamp_u8,
@@ -179,6 +182,17 @@ pub(super) fn write_hdr_pixels(
         ));
     }
 
+    if layout == PixelLayout::rgba128_float() {
+        return Ok(write_rgba128_float_hdr_pixels(
+            source,
+            width,
+            row_stride,
+            mapper,
+            color_scale,
+            rgba,
+        ));
+    }
+
     let row_count = source.len() / row_stride;
 
     let pixel_count = width
@@ -269,6 +283,68 @@ pub(super) fn write_bgr101010_hdr_pixels(
     write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
     invariant_eq!(rgba_offset, rgba.len());
     true
+}
+
+#[multiversion(targets = "simd")]
+pub(super) fn write_rgba128_float_hdr_pixels(
+    source: &[u8],
+    width: usize,
+    row_stride: usize,
+    mapper: &(impl ToneMapper + Sync),
+    color_scale: f32,
+    rgba: &mut [u8],
+) -> bool {
+    let row_count = source.len() / row_stride;
+    let pixel_count = width
+        .checked_mul(row_count)
+        .expect("validated JPEG XR pixel count fits usize");
+    let batch_capacity = HDR_BATCH_PIXELS.min(pixel_count);
+    let mut colors = LinearRGBPlanes::with_capacity(batch_capacity);
+    let mut alphas = Vec::with_capacity(batch_capacity);
+    let mut has_nonzero_alpha = false;
+    let mut rgba_offset = 0;
+
+    for row in source.chunks_exact(row_stride) {
+        let (pixels, remainder) = row.as_chunks::<16>();
+        invariant!(remainder.is_empty());
+        invariant_eq!(pixels.len(), width);
+
+        let (chunks, tail) = pixels.as_chunks::<SRGB_LANES>();
+        for chunk in chunks {
+            let ([red, green, blue], alpha) = decode_rgba128_float_simd(chunk);
+            let scale = Simd::splat(color_scale);
+            let red = (red * scale).to_array();
+            let green = (green * scale).to_array();
+            let blue = (blue * scale).to_array();
+            let alpha = alpha.to_array();
+
+            for (((red, green), blue), alpha) in red.into_iter().zip(green).zip(blue).zip(alpha) {
+                has_nonzero_alpha |= alpha > 0.0;
+                colors.push(LinearRGB::new([red, green, blue]));
+                alphas.push(normalized_to_u8(alpha));
+            }
+
+            if colors.len() >= HDR_BATCH_PIXELS {
+                write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
+            }
+        }
+
+        for pixel in tail {
+            let (color, alpha) = decode_rgba128_float(pixel);
+            has_nonzero_alpha |= alpha > 0.0;
+            let color = color.map(|component| component * color_scale);
+            colors.push(LinearRGB::new(color));
+            alphas.push(normalized_to_u8(alpha));
+
+            if colors.len() == HDR_BATCH_PIXELS {
+                write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
+            }
+        }
+    }
+
+    write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
+    invariant_eq!(rgba_offset, rgba.len());
+    has_nonzero_alpha
 }
 
 fn write_tone_mapped_batch(

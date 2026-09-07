@@ -182,6 +182,35 @@ pub(super) fn decode_sample(bytes: &[u8], encoding: SampleEncoding) -> f32 {
     }
 }
 
+pub(super) fn decode_rgba128_float(pixel: &[u8]) -> ([f32; 3], f32) {
+    invariant_eq!(pixel.len(), PixelLayout::rgba128_float().bytes_per_pixel);
+
+    let sample = |channel: usize| read_sample::<f32>(&pixel[channel * 4..channel * 4 + 4]);
+
+    ([sample(0), sample(1), sample(2)], normalize_alpha(sample(3)))
+}
+
+#[inline]
+pub(super) fn decode_rgba128_float_simd<const N: usize>(
+    chunk: &[[u8; 16]; N],
+) -> ([Simd<f32, N>; 3], Simd<f32, N>) {
+    let mut red = [0.0f32; N];
+    let mut green = [0.0f32; N];
+    let mut blue = [0.0f32; N];
+    let mut alpha = [0.0f32; N];
+
+    for (lane, pixel) in chunk.iter().enumerate() {
+        let (color, a) = decode_rgba128_float(pixel);
+        [red[lane], green[lane], blue[lane]] = color;
+        alpha[lane] = a;
+    }
+
+    (
+        [Simd::from_array(red), Simd::from_array(green), Simd::from_array(blue)],
+        Simd::from_array(alpha),
+    )
+}
+
 pub(super) fn decode_bgr101010(pixel: &[u8]) -> [f32; 3] {
     rec2100_pq_to_scrgb(unpack_bgr101010(pixel))
 }
