@@ -372,8 +372,12 @@ fn fill_bgr101010_row(
 }
 
 #[inline]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "clamped to 0..=1023 immediately above"
+)]
 fn clip_10_bit(value: i64) -> u32 {
-    u32::try_from(value.clamp(0, 1023)).expect("clamped 10-bit sample fits u32")
+    value.clamp(0, 1023) as u32
 }
 
 #[inline]
@@ -1738,6 +1742,11 @@ fn highpass_mode(lowpass: &[i32], components: usize, macroblock: usize) -> u8 {
 }
 
 fn quant_map(qp: u8, scaled: bool, scaled_shift: u8) -> i32 {
+    debug_assert!(
+        scaled_shift <= 1,
+        "quant_map is only proven safe for scaled_shift 0 or 1"
+    );
+
     if qp == 0 {
         return 1;
     }
