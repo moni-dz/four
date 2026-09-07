@@ -2075,15 +2075,24 @@ fn decode_flexbits_packet(
                     .try_into()
                     .expect("block slice has length 16");
 
+                if flex_bits == 0 {
+                    for coefficient in TRANSPOSE.into_iter().skip(1) {
+                        values[coefficient] = values[coefficient]
+                            .checked_shl(u32::from(model_bits))
+                            .ok_or_else(|| {
+                                reader.error(ErrorKind::InvalidCodestream(
+                                    "highpass coefficient overflow",
+                                ))
+                            })?;
+                    }
+                    continue;
+                }
+
                 for coefficient in TRANSPOSE.into_iter().skip(1) {
                     let vlc = values[coefficient];
 
-                    let refinement = if flex_bits == 0 {
-                        0
-                    } else {
-                        i32::try_from(reader.read_u32(flex_bits)?)
-                            .expect("at most 15 flexbits fit i32")
-                    };
+                    let refinement = i32::try_from(reader.read_u32(flex_bits)?)
+                        .expect("at most 15 flexbits fit i32");
 
                     let flex = match vlc.cmp(&0) {
                         Ordering::Greater => refinement,
