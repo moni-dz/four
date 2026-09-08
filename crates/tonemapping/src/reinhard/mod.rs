@@ -8,6 +8,7 @@ use std::simd::{Select, StdFloat, cmp::SimdPartialOrd, num::SimdFloat};
 use super::{
     LinearRGB, LinearRGBPlanes, MaxCll, OrderedLevel, ToneMapper, WhitePoint, WhitePointError,
 };
+use crate::math::recip;
 use crate::simd::{COLOR_LANES, F32x8, map_colors, map_planes};
 use thiserror::Error;
 
@@ -125,7 +126,7 @@ pub struct LuminanceReinhard;
 impl ToneMapper for LuminanceReinhard {
     #[inline]
     fn map(&self, color: LinearRGB) -> LinearRGB {
-        let scale = 1.0 / (1.0 + color.luminance());
+        let scale = recip(F32x8::splat(1.0 + color.luminance()))[0];
         LinearRGB::displayable(color.components().map(|component| component * scale))
     }
 
@@ -148,7 +149,7 @@ fn luminance_reinhard_batch(colors: &mut LinearRGBPlanes) {
             ),
         );
 
-        let scale = one / (one + luminance);
+        let scale = recip(one + luminance);
 
         components.map(|component| component * scale)
     });
@@ -403,7 +404,7 @@ impl ToneMapper for ReinhardJodie {
     #[inline]
     fn map(&self, color: LinearRGB) -> LinearRGB {
         let components = color.components();
-        let luminance_scale = 1.0 / (1.0 + color.luminance());
+        let luminance_scale = recip(F32x8::splat(1.0 + color.luminance()))[0];
         let component_mapped = components.map(|component| component / (1.0 + component));
         let luminance_mapped = components.map(|component| component * luminance_scale);
 
@@ -434,7 +435,7 @@ fn reinhard_jodie_batch(colors: &mut LinearRGBPlanes) {
             ),
         );
 
-        let luminance_scale = one / (one + luminance);
+        let luminance_scale = recip(one + luminance);
         let component_mapped = components.map(|component| component / (one + component));
         let luminance_mapped = components.map(|component| component * luminance_scale);
 

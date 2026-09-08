@@ -1,4 +1,4 @@
-//! Approximates `log2` and `exp2` over SIMD `f32` lanes.
+//! Approximates `log2`, `exp2`, and `recip` over SIMD `f32` lanes.
 //!
 //! Scalar wrappers share the SIMD implementation for bit parity. Tests enforce four-ULP accuracy.
 
@@ -7,6 +7,53 @@ use std::simd::{
     cmp::{SimdPartialEq, SimdPartialOrd},
     num::{SimdFloat, SimdInt, SimdUint},
 };
+
+use crate::simd::F32x8;
+
+/// Approximates `1.0 / x` via AVX `vrcpps` plus one Newton-Raphson step.
+///
+/// Falls back to a plain divide off x86_64 or without AVX at runtime.
+#[inline]
+#[expect(
+    unsafe_code,
+    reason = "AVX raw intrinsics"
+)]
+pub(crate) fn recip(x: F32x8) -> F32x8 {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx") {
+        // SAFETY: AVX support is present.
+        return unsafe { recip_avx(x) };
+    }
+
+    F32x8::splat(1.0) / x
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx")]
+#[expect(
+    unsafe_code,
+    reason = "AVX raw intrinsics"
+)]
+unsafe fn recip_avx(x: F32x8) -> F32x8 {
+    use std::arch::x86_64::{
+        _mm256_loadu_ps, _mm256_mul_ps, _mm256_rcp_ps, _mm256_set1_ps, _mm256_storeu_ps,
+        _mm256_sub_ps,
+    };
+
+    let input = x.to_array();
+    // SAFETY: `input` is fully-initialized.
+    unsafe {
+        let v = _mm256_loadu_ps(input.as_ptr());
+        let approx = _mm256_rcp_ps(v);
+        // Newton-Raphson
+        let two = _mm256_set1_ps(2.0);
+        let refined = _mm256_mul_ps(approx, _mm256_sub_ps(two, _mm256_mul_ps(v, approx)));
+
+        let mut output = [0.0f32; 8];
+        _mm256_storeu_ps(output.as_mut_ptr(), refined);
+        F32x8::from_array(output)
+    }
+}
 
 /// Minimax coefficients for `log(1 + t) - t + t^2/2`, from Cephes' `logf`.
 const LOG_POLYNOMIAL: [f32; 9] = [
@@ -44,9 +91,11 @@ pub(crate) fn polynomial<const N: usize, const DEGREE: usize>(
     coefficients: [f32; DEGREE],
 ) -> Simd<f32, N> {
     let mut accumulator = Simd::splat(coefficients[0]);
+
     for coefficient in &coefficients[1..] {
         accumulator = accumulator.mul_add(value, Simd::splat(*coefficient));
     }
+
     accumulator
 }
 
@@ -76,6 +125,7 @@ pub fn log2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
     // the series converges far too slowly.
     let lend = mantissa.simd_gt(Simd::splat(SQRT_TWO));
     let mantissa = lend.select(mantissa * Simd::splat(0.5), mantissa);
+
     let exponent = lend
         .select(exponent + Simd::splat(1), exponent)
         .cast::<f32>();
@@ -83,6 +133,7 @@ pub fn log2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
     // log(mantissa) = t + t^3 * P(t) - t^2 / 2, with t = mantissa - 1.
     let t = mantissa - Simd::splat(1.0);
     let squared = t * t;
+
     let corrected = (t * squared).mul_add(
         polynomial(t, LOG_POLYNOMIAL),
         squared * Simd::splat(-0.5) + t,

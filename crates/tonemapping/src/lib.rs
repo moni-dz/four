@@ -934,9 +934,9 @@ mod aces;
 mod bt2446;
 mod clamp;
 mod hable;
+mod math;
 mod reinhard;
 mod simd;
-mod transcendental;
 
 #[doc(inline)]
 pub use aces::{ACESApproximate, ACESFitted};
@@ -953,7 +953,7 @@ pub use reinhard::{
     ReinhardJodie, estimate_luminance_white_point,
 };
 #[doc(inline)]
-pub use transcendental::{exp2, log2};
+pub use math::{exp2, log2};
 
 #[inline]
 fn sanitize_component(component: f32) -> f32 {

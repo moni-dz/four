@@ -7,7 +7,7 @@ use std::simd::{
 
 use super::{LinearRGB, LinearRGBPlanes, ToneMapper};
 use crate::simd::map_planes;
-use crate::transcendental::{
+use crate::math::{
     exp2, exp2_bounded, exp2_scalar, log2, log2_positive_normal, log2_scalar,
 };
 
@@ -187,7 +187,6 @@ fn bt2446a_simd(components: &[F32x16; 3]) -> [[f32; BT2446_LANES]; 3] {
     })
 }
 
-// Match the SIMD primitive order so batch tails remain bit-identical.
 fn bt2446a(color: LinearRGB) -> LinearRGB {
     let nonlinear = color.components().map(|component| {
         let normalized = (component / HDR_TO_SDR_PEAK_RATIO).clamp(0.0, 1.0);
@@ -235,7 +234,6 @@ fn bt2446a_luma(input_luma: f32) -> f32 {
     let compressed_luma = if perceptual_luma <= 0.739_9 {
         1.077_0 * perceptual_luma
     } else if perceptual_luma < 0.990_9 {
-        // Horner form via `mul_add`, matching the batch path's fused rounding exactly.
         perceptual_luma.mul_add(perceptual_luma.mul_add(-1.151_0, 2.781_1), -0.630_2)
     } else {
         0.5 * perceptual_luma + 0.5
