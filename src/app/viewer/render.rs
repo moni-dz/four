@@ -5,22 +5,21 @@ use std::sync::Arc;
 
 use gpui::{
     Anchor, AnchoredPositionMode, CursorStyle, Image as GPUIImage, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, Role, ScrollWheelEvent, SharedString, Toggled,
-    Window, WindowControlArea, anchored, deferred, div, img, point, prelude::*, px, rgb, rgba,
+    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, SharedString, Window,
+    WindowControlArea, anchored, deferred, div, img, point, prelude::*, px, rgb, rgba,
 };
-use tonemapping::{MaxCLLMode, ToneMappingMethod};
+use tonemapping::ToneMappingMethod;
 
 use super::geometry::{clamp_pan, fit_scale, zoom_to_cursor_pan};
 use super::{
-    COLOR_ACCENT_GREEN, COLOR_CHECKBOX_BORDER, COLOR_CONTROL_BACKGROUND, COLOR_CONTROL_BORDER,
-    COLOR_CONTROL_HOVER, COLOR_MENU_ITEM_HOVER, COLOR_METADATA_OVERLAY_BACKGROUND,
-    COLOR_PANEL_BACKGROUND, COLOR_PANEL_BORDER, COLOR_SELECTED_BACKGROUND, COLOR_TEXT_HINT,
-    COLOR_TEXT_MENU, COLOR_TEXT_SECONDARY, CONTEXT_MENU_HEIGHT, CONTEXT_MENU_ITEM_HEIGHT,
-    CONTEXT_MENU_WIDTH, DRAG_REGION_HEIGHT, HDROptions, MAX_CLL_CHECKBOX_SIZE,
-    MAX_CLL_SELECTOR_HEIGHT, METADATA_FIELD_GAP, METADATA_LABEL_WIDTH, METADATA_OVERLAY_MARGIN,
-    Root, SCROLL_LINE_HEIGHT, TONE_MAPPING_LABEL_WIDTH, TONE_MAPPING_MENU_ITEM_HEIGHT,
-    TONE_MAPPING_MENU_MARGIN, TONE_MAPPING_MENU_WIDTH, TONE_MAPPING_SELECTOR_HEIGHT,
-    TONE_MAPPING_TITLEBAR_WIDTH, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP_BASE,
+    COLOR_ACCENT_GREEN, COLOR_CONTROL_BACKGROUND, COLOR_CONTROL_BORDER, COLOR_CONTROL_HOVER,
+    COLOR_MENU_ITEM_HOVER, COLOR_PANEL_BACKGROUND, COLOR_PANEL_BORDER, COLOR_SELECTED_BACKGROUND,
+    COLOR_STATUS_BAR_BACKGROUND, COLOR_TEXT_HINT, COLOR_TEXT_MENU, COLOR_TEXT_SECONDARY,
+    CONTEXT_MENU_HEIGHT, CONTEXT_MENU_ITEM_HEIGHT, CONTEXT_MENU_WIDTH, DRAG_REGION_HEIGHT,
+    HDROptions, LABEL_ROW_GAP, Root, SCROLL_LINE_HEIGHT, TONE_MAPPING_LABEL_WIDTH,
+    TONE_MAPPING_MENU_ITEM_HEIGHT, TONE_MAPPING_MENU_MARGIN, TONE_MAPPING_MENU_SNAP_MARGIN,
+    TONE_MAPPING_MENU_WIDTH, TONE_MAPPING_SELECTOR_HEIGHT, TONE_MAPPING_TITLEBAR_WIDTH, ZOOM_MAX,
+    ZOOM_MIN, ZOOM_STEP_BASE,
 };
 
 impl Root {
@@ -111,84 +110,13 @@ impl Root {
             .w_full()
             .flex()
             .items_center()
-            .gap(px(METADATA_FIELD_GAP))
+            .gap(px(LABEL_ROW_GAP))
             .child(
                 div()
                     .w(px(TONE_MAPPING_LABEL_WIDTH))
                     .flex_none()
                     .text_color(rgb(COLOR_TEXT_SECONDARY))
                     .child("Tone mapper"),
-            )
-            .child(selector)
-    }
-
-    pub(super) fn render_max_cll_selector(
-        selected_mode: MaxCLLMode,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let checked = selected_mode == MaxCLLMode::TrueMaximum;
-        let next_mode = toggled_max_cll_mode(selected_mode);
-        let description = if checked {
-            "True maximum"
-        } else {
-            "99.99th percentile"
-        };
-
-        let selector = div()
-            .id("max-cll-selector")
-            .role(Role::CheckBox)
-            .aria_label("Use true maximum MaxCLL")
-            .aria_toggled(if checked {
-                Toggled::True
-            } else {
-                Toggled::False
-            })
-            .h(px(MAX_CLL_SELECTOR_HEIGHT))
-            .min_w_0()
-            .flex_1()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .rounded_sm()
-            .border_1()
-            .border_color(rgba(COLOR_CONTROL_BORDER))
-            .bg(rgb(COLOR_CONTROL_BACKGROUND))
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(COLOR_CONTROL_HOVER)))
-            .child(
-                div()
-                    .size(px(MAX_CLL_CHECKBOX_SIZE))
-                    .flex_none()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_xs()
-                    .border_1()
-                    .border_color(rgba(COLOR_CHECKBOX_BORDER))
-                    .when(checked, |checkbox| {
-                        checkbox.bg(rgb(COLOR_SELECTED_BACKGROUND))
-                    })
-                    .text_color(rgb(COLOR_ACCENT_GREEN))
-                    .child(if checked { "✓" } else { "" }),
-            )
-            .child(description)
-            .on_click(cx.listener(move |root, _, window, cx| {
-                root.select_max_cll_mode(next_mode, window, cx);
-            }));
-
-        div()
-            .w_full()
-            .flex()
-            .items_center()
-            .gap(px(METADATA_FIELD_GAP))
-            .pb_1()
-            .child(
-                div()
-                    .w(px(METADATA_LABEL_WIDTH))
-                    .flex_none()
-                    .text_color(rgb(COLOR_TEXT_SECONDARY))
-                    .child("MaxCLL"),
             )
             .child(selector)
     }
@@ -205,7 +133,7 @@ impl Root {
                     px(TONE_MAPPING_SELECTOR_HEIGHT + TONE_MAPPING_MENU_MARGIN),
                 ))
                 .position_mode(AnchoredPositionMode::Local)
-                .snap_to_window_with_margin(px(METADATA_OVERLAY_MARGIN))
+                .snap_to_window_with_margin(px(TONE_MAPPING_MENU_SNAP_MARGIN))
                 .child(
                     div()
                         .occlude()
@@ -387,7 +315,7 @@ impl Root {
             .flex()
             .items_center()
             .text_sm()
-            .bg(rgb(COLOR_METADATA_OVERLAY_BACKGROUND))
+            .bg(rgb(COLOR_STATUS_BAR_BACKGROUND))
             .child(
                 div()
                     .h_full()
@@ -416,13 +344,6 @@ impl Root {
                         )),
                 )
             })
-    }
-}
-
-pub(super) const fn toggled_max_cll_mode(mode: MaxCLLMode) -> MaxCLLMode {
-    match mode {
-        MaxCLLMode::Percentile99_99 => MaxCLLMode::TrueMaximum,
-        MaxCLLMode::TrueMaximum => MaxCLLMode::Percentile99_99,
     }
 }
 

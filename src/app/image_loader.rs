@@ -82,7 +82,6 @@ pub(super) struct DisplayedImage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct HDROptions {
     tone_mapping: ToneMappingMethod,
-    max_cll_mode: MaxCLLMode,
 }
 
 impl HDROptions {
@@ -90,22 +89,8 @@ impl HDROptions {
         self.tone_mapping
     }
 
-    pub(super) const fn max_cll_mode(self) -> MaxCLLMode {
-        self.max_cll_mode
-    }
-
     pub(super) const fn with_tone_mapping(self, tone_mapping: ToneMappingMethod) -> Self {
-        Self {
-            tone_mapping,
-            ..self
-        }
-    }
-
-    pub(super) const fn with_max_cll_mode(self, max_cll_mode: MaxCLLMode) -> Self {
-        Self {
-            max_cll_mode,
-            ..self
-        }
+        Self { tone_mapping }
     }
 }
 
@@ -113,7 +98,6 @@ impl Default for HDROptions {
     fn default() -> Self {
         Self {
             tone_mapping: ToneMappingMethod::default(),
-            max_cll_mode: MaxCLLMode::Percentile99_99,
         }
     }
 }
@@ -203,8 +187,11 @@ impl SourceFormat {
 
             Self::JPEGXR => jpeg_xr::decode_with_metadata_and_options(
                 bytes,
-                jpeg_xr::DecodeOptions::new(hdr_options.tone_mapping(), hdr_options.max_cll_mode())
-                    .with_hdr_metrics(false),
+                jpeg_xr::DecodeOptions::new(
+                    hdr_options.tone_mapping(),
+                    MaxCLLMode::Percentile99_99,
+                )
+                .with_hdr_metrics(false),
             )
             .or_raise(|| image_decode_error(path))
             .map(|decoded| {

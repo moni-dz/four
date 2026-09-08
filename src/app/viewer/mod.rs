@@ -14,12 +14,10 @@ use gpui::{
     App, FocusHandle, Focusable, MouseDownEvent, PathPromptOptions, Pixels, Point, SharedString,
     Window, actions, div, prelude::*, px, rgb,
 };
-use tonemapping::{MaxCLLMode, ToneMappingMethod};
+use tonemapping::ToneMappingMethod;
 
 use decode_scheduler::{DecodeJob, DecodePayload, LatestLoadCoordinator, LoadPurpose, LoadRequest};
 use geometry::zoom_to_cursor_pan;
-#[cfg(test)]
-use render::toggled_max_cll_mode;
 
 use super::image_loader::{
     DisplayedImage, HDROptions, LoadError, LoadResult, LoadedImage, format_load_error, load_image,
@@ -31,11 +29,8 @@ const CONTEXT_MENU_PADDING: f32 = 8.0;
 const CONTEXT_MENU_HEIGHT: f32 = CONTEXT_MENU_PADDING + CONTEXT_MENU_ITEM_HEIGHT * 2.0;
 const CONTEXT_MENU_WIDTH: f32 = 180.0;
 const DRAG_REGION_HEIGHT: f32 = 40.0;
-const METADATA_FIELD_GAP: f32 = 6.0;
-const METADATA_LABEL_WIDTH: f32 = 140.0;
-const METADATA_OVERLAY_MARGIN: f32 = 12.0;
-const MAX_CLL_CHECKBOX_SIZE: f32 = 16.0;
-const MAX_CLL_SELECTOR_HEIGHT: f32 = 30.0;
+const LABEL_ROW_GAP: f32 = 6.0;
+const TONE_MAPPING_MENU_SNAP_MARGIN: f32 = 12.0;
 const TONE_MAPPING_MENU_ITEM_HEIGHT: f32 = 30.0;
 const TONE_MAPPING_MENU_MARGIN: f32 = 4.0;
 const TONE_MAPPING_MENU_WIDTH: f32 = 292.0;
@@ -63,16 +58,14 @@ const COLOR_PANEL_BORDER: u32 = 0x0045_4545;
 const COLOR_MENU_ITEM_HOVER: u32 = 0x003d_3d3d;
 /// Background of the status bar and its embedded controls' resting state.
 const COLOR_CONTROL_BACKGROUND: u32 = 0x0024_2424;
-/// Hover background for the tone-mapping and `MaxCLL` selector controls.
+/// Hover background for the tone-mapping selector control.
 const COLOR_CONTROL_HOVER: u32 = 0x0032_3232;
-/// Border for the tone-mapping and `MaxCLL` selector controls (translucent white).
+/// Border for the tone-mapping selector control (translucent white).
 const COLOR_CONTROL_BORDER: u32 = 0xff_ff_ff_2e;
-/// Border for the `MaxCLL` checkbox (translucent white).
-const COLOR_CHECKBOX_BORDER: u32 = 0xff_ff_ff_55;
-/// Background of a selected tone-mapping method or a checked `MaxCLL` checkbox.
+/// Background of a selected tone-mapping method.
 const COLOR_SELECTED_BACKGROUND: u32 = 0x0038_3838;
 /// Background of the status bar strip along the window's bottom edge.
-const COLOR_METADATA_OVERLAY_BACKGROUND: u32 = 0x0020_2020;
+const COLOR_STATUS_BAR_BACKGROUND: u32 = 0x0020_2020;
 
 pub(super) const WINDOW_MIN_WIDTH: f32 = 1280.0;
 pub(super) const WINDOW_MIN_HEIGHT: f32 = 720.0;
@@ -501,16 +494,6 @@ impl Root {
         self.select_hdr_options(options, window, cx);
     }
 
-    fn select_max_cll_mode(
-        &mut self,
-        max_cll_mode: MaxCLLMode,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let options = self.preferred_hdr_options.with_max_cll_mode(max_cll_mode);
-        self.select_hdr_options(options, window, cx);
-    }
-
     fn select_hdr_options(
         &mut self,
         options: HDROptions,
@@ -658,10 +641,6 @@ mod tests {
         assert_eq!(
             root.preferred_hdr_options.tone_mapping(),
             ToneMappingMethod::BT2446
-        );
-        assert_eq!(
-            root.preferred_hdr_options.max_cll_mode(),
-            MaxCLLMode::Percentile99_99
         );
     }
 
@@ -816,35 +795,24 @@ mod tests {
     }
 
     #[test]
-    fn tone_mapping_and_max_cll_changes_compose_in_one_reload() {
+    fn a_second_tone_mapping_change_supersedes_the_first_pending_request() {
         let mut root = Root::new(ViewerState::empty());
         let active = HDROptions::default();
-        let true_maximum = active.with_max_cll_mode(MaxCLLMode::TrueMaximum);
+        let first = active.with_tone_mapping(ToneMappingMethod::ACESFitted);
 
-        let max_cll_request = root
-            .begin_hdr_options_selection(true_maximum, active)
-            .expect("a MaxCLL change starts a request");
+        let first_request = root
+            .begin_hdr_options_selection(first, active)
+            .expect("a tone-mapping change starts a request");
 
-        let combined = root
-            .preferred_hdr_options
-            .with_tone_mapping(ToneMappingMethod::ACESFitted);
+        let second = active.with_tone_mapping(ToneMappingMethod::Reinhard);
 
-        let combined_request = root
-            .begin_hdr_options_selection(combined, active)
-            .expect("a composed HDR option change starts a new request");
+        let second_request = root
+            .begin_hdr_options_selection(second, active)
+            .expect("a second tone-mapping change starts a new request");
 
-        assert!(!root.accepts_load_request(max_cll_request));
-        assert!(root.accepts_load_request(combined_request));
-        assert_eq!(root.pending_hdr_options, Some((combined_request, combined)));
-        assert_eq!(combined.tone_mapping(), ToneMappingMethod::ACESFitted);
-        assert_eq!(combined.max_cll_mode(), MaxCLLMode::TrueMaximum);
-    }
-
-    #[test]
-    fn max_cll_toggle_returns_to_the_percentile_mode() {
-        assert_eq!(
-            toggled_max_cll_mode(toggled_max_cll_mode(MaxCLLMode::Percentile99_99)),
-            MaxCLLMode::Percentile99_99
-        );
+        assert!(!root.accepts_load_request(first_request));
+        assert!(root.accepts_load_request(second_request));
+        assert_eq!(root.pending_hdr_options, Some((second_request, second)));
+        assert_eq!(second.tone_mapping(), ToneMappingMethod::Reinhard);
     }
 }
