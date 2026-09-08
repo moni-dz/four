@@ -3,12 +3,12 @@ use std::backtrace::Backtrace;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::num::NonZeroUsize;
-use std::simd::{Select, StdFloat, cmp::SimdPartialOrd, num::SimdFloat};
+use std::simd::{Select, Simd, StdFloat, cmp::SimdPartialOrd, num::SimdFloat};
 
 use super::{
     LinearRGB, LinearRGBPlanes, MaxCLL, OrderedLevel, ToneMapper, WhitePoint, WhitePointError,
 };
-use crate::math::recip;
+use crate::math::{recip, recip_for_target};
 use crate::simd::{COLOR_LANES, F32x8, map_colors, map_planes};
 use thiserror::Error;
 
@@ -76,46 +76,49 @@ impl ExtendedReinhard {
 impl ToneMapper for ExtendedReinhard {
     #[inline]
     fn map(&self, color: LinearRGB) -> LinearRGB {
-        let white_squared = self.white_point.level().powi(2);
-        extended_reinhard(color, white_squared)
+        let white_squared_recip = 1.0 / self.white_point.level().powi(2);
+        extended_reinhard(color, white_squared_recip)
     }
 
     #[inline]
     fn map_in_place(&self, colors: &mut [LinearRGB]) {
-        let white_squared = self.white_point.level().powi(2);
+        // Computed once for the whole slice: every pixel below divided by the same white point
+        // would otherwise repeat this division per pixel.
+        let white_squared_recip = 1.0 / self.white_point.level().powi(2);
         for color in colors {
-            *color = extended_reinhard(*color, white_squared);
+            *color = extended_reinhard(*color, white_squared_recip);
         }
     }
 
     #[inline]
     fn map_planes_in_place(&self, colors: &mut LinearRGBPlanes) {
-        let white_squared = self.white_point.level().powi(2);
+        let white_squared_recip = 1.0 / self.white_point.level().powi(2);
         map_planes(
             colors,
             COLOR_LANES,
-            |colors| extended_reinhard_batch(colors, white_squared),
+            |colors| extended_reinhard_batch(colors, white_squared_recip),
             self,
         );
     }
 }
 
 #[multiversion(targets = "simd")]
-fn extended_reinhard_batch(colors: &mut LinearRGBPlanes, white_squared: f32) {
+fn extended_reinhard_batch(colors: &mut LinearRGBPlanes, white_squared_recip: f32) {
     let one = F32x8::splat(1.0);
-    let white_squared = F32x8::splat(white_squared);
+    let white_squared_recip = F32x8::splat(white_squared_recip);
     map_colors(colors, |components| {
-        components
-            .map(|component| component * (one + component / white_squared) / (one + component))
+        components.map(|component| {
+            component * (one + component * white_squared_recip) / (one + component)
+        })
     });
 }
 
 #[inline]
-fn extended_reinhard(color: LinearRGB, white_squared: f32) -> LinearRGB {
+fn extended_reinhard(color: LinearRGB, white_squared_recip: f32) -> LinearRGB {
     LinearRGB::displayable(
-        color
-            .components()
-            .map(|component| component * (1.0 + component / white_squared) / (1.0 + component)),
+        color.components().map(|component| {
+            component * (1.0 + component * white_squared_recip) / (1.0 + component)
+        }),
     )
 }
 
@@ -126,7 +129,7 @@ pub struct LuminanceReinhard;
 impl ToneMapper for LuminanceReinhard {
     #[inline]
     fn map(&self, color: LinearRGB) -> LinearRGB {
-        let scale = recip(F32x8::splat(1.0 + color.luminance()))[0];
+        let scale = recip(Simd::<f32, 1>::splat(1.0 + color.luminance()))[0];
         LinearRGB::displayable(color.components().map(|component| component * scale))
     }
 
@@ -136,7 +139,17 @@ impl ToneMapper for LuminanceReinhard {
     }
 }
 
-#[multiversion(targets = "simd")]
+#[multiversion(targets(
+    "x86_64+avx512f+avx512vl",
+    "x86_64+avx512f",
+    "x86_64+avx+fma",
+    "x86_64+avx",
+    "x86_64+sse2",
+    "x86+avx2+fma",
+    "x86+sse4.2",
+    "x86+sse2",
+    "aarch64+neon",
+))]
 fn luminance_reinhard_batch(colors: &mut LinearRGBPlanes) {
     let one = F32x8::splat(1.0);
 
@@ -149,7 +162,7 @@ fn luminance_reinhard_batch(colors: &mut LinearRGBPlanes) {
             ),
         );
 
-        let scale = recip(one + luminance);
+        let scale = recip_for_target!(one + luminance);
 
         components.map(|component| component * scale)
     });
@@ -359,27 +372,27 @@ impl ToneMapper for ExtendedLuminanceReinhard {
     #[inline]
     fn map(&self, color: LinearRGB) -> LinearRGB {
         let luminance = color.luminance();
-        let white_squared = self.white_point.luminance().powi(2);
-        let scale = (1.0 + luminance / white_squared) / (1.0 + luminance);
+        let white_squared_recip = 1.0 / self.white_point.luminance().powi(2);
+        let scale = (1.0 + luminance * white_squared_recip) / (1.0 + luminance);
         LinearRGB::displayable(color.components().map(|component| component * scale))
     }
 
     #[inline]
     fn map_planes_in_place(&self, colors: &mut LinearRGBPlanes) {
-        let white_squared = self.white_point.luminance().powi(2);
+        let white_squared_recip = 1.0 / self.white_point.luminance().powi(2);
         map_planes(
             colors,
             COLOR_LANES,
-            |colors| extended_luminance_reinhard_batch(colors, white_squared),
+            |colors| extended_luminance_reinhard_batch(colors, white_squared_recip),
             self,
         );
     }
 }
 
 #[multiversion(targets = "simd")]
-fn extended_luminance_reinhard_batch(colors: &mut LinearRGBPlanes, white_squared: f32) {
+fn extended_luminance_reinhard_batch(colors: &mut LinearRGBPlanes, white_squared_recip: f32) {
     let one = F32x8::splat(1.0);
-    let white_squared = F32x8::splat(white_squared);
+    let white_squared_recip = F32x8::splat(white_squared_recip);
 
     map_colors(colors, |components| {
         let luminance = components[2].mul_add(
@@ -390,7 +403,7 @@ fn extended_luminance_reinhard_batch(colors: &mut LinearRGBPlanes, white_squared
             ),
         );
 
-        let scale = (one + luminance / white_squared) / (one + luminance);
+        let scale = (one + luminance * white_squared_recip) / (one + luminance);
 
         components.map(|component| component * scale)
     });
@@ -404,7 +417,7 @@ impl ToneMapper for ReinhardJodie {
     #[inline]
     fn map(&self, color: LinearRGB) -> LinearRGB {
         let components = color.components();
-        let luminance_scale = recip(F32x8::splat(1.0 + color.luminance()))[0];
+        let luminance_scale = recip(Simd::<f32, 1>::splat(1.0 + color.luminance()))[0];
         let component_mapped = components.map(|component| component / (1.0 + component));
         let luminance_mapped = components.map(|component| component * luminance_scale);
 
@@ -422,7 +435,17 @@ impl ToneMapper for ReinhardJodie {
     }
 }
 
-#[multiversion(targets = "simd")]
+#[multiversion(targets(
+    "x86_64+avx512f+avx512vl",
+    "x86_64+avx512f",
+    "x86_64+avx+fma",
+    "x86_64+avx",
+    "x86_64+sse2",
+    "x86+avx2+fma",
+    "x86+sse4.2",
+    "x86+sse2",
+    "aarch64+neon",
+))]
 fn reinhard_jodie_batch(colors: &mut LinearRGBPlanes) {
     let one = F32x8::splat(1.0);
 
@@ -435,7 +458,7 @@ fn reinhard_jodie_batch(colors: &mut LinearRGBPlanes) {
             ),
         );
 
-        let luminance_scale = recip(one + luminance);
+        let luminance_scale = recip_for_target!(one + luminance);
         let component_mapped = components.map(|component| component / (one + component));
         let luminance_mapped = components.map(|component| component * luminance_scale);
 

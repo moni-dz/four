@@ -6,7 +6,9 @@ use std::simd::{
 };
 
 use super::{LinearRGB, LinearRGBPlanes, ToneMapper};
-use crate::math::{exp2, exp2_bounded, exp2_scalar, log2, log2_positive_normal, log2_scalar};
+use crate::math::{
+    exp2, exp2_bounded, exp2_scalar, log2, log2_positive_normal, log2_scalar, recip,
+};
 use crate::simd::map_planes;
 
 const BT2446_LANES: usize = 16;
@@ -118,13 +120,20 @@ fn bt2446a_planes(colors: &mut LinearRGBPlanes) {
 }
 
 #[inline]
+#[allow(clippy::similar_names, reason = "cb/cr mirror the CB_DIVISOR/CR_DIVISOR constants")]
 fn bt2446a_simd(components: &[F32x16; 3]) -> [[f32; BT2446_LANES]; 3] {
     let zero = F32x16::splat(0.0);
     let one = F32x16::splat(1.0);
+    let peak_ratio_inv = F32x16::splat(1.0 / HDR_TO_SDR_PEAK_RATIO);
+    let transfer_exponent_inv = F32x16::splat(1.0 / 2.4);
+    let log2_rho_hdr_inv = F32x16::splat(1.0 / LOG2_RHO_HDR);
+    let rho_sdr_minus_one_inv = F32x16::splat(1.0 / (RHO_SDR - 1.0));
+    let cb_divisor_inv = F32x16::splat(1.0 / CB_DIVISOR);
+    let cr_divisor_inv = F32x16::splat(1.0 / CR_DIVISOR);
 
     let nonlinear = components.map(|component| {
-        let normalized = (component / F32x16::splat(HDR_TO_SDR_PEAK_RATIO)).simd_clamp(zero, one);
-        exp2(log2(normalized) * F32x16::splat(1.0 / 2.4))
+        let normalized = (component * peak_ratio_inv).simd_clamp(zero, one);
+        exp2(log2(normalized) * transfer_exponent_inv)
     });
 
     let input_luma = nonlinear[2].mul_add(
@@ -137,8 +146,8 @@ fn bt2446a_simd(components: &[F32x16; 3]) -> [[f32; BT2446_LANES]; 3] {
 
     // `input_luma` is a sum of nonnegative terms (each `nonlinear` channel and `BT2020_LUMA`
     // weight is nonnegative), so this argument is always finite and at least `1.0`.
-    let perceptual_luma = log2_positive_normal(one + F32x16::splat(RHO_HDR - 1.0) * input_luma)
-        * F32x16::splat(1.0 / LOG2_RHO_HDR);
+    let perceptual_luma =
+        log2_positive_normal(one + F32x16::splat(RHO_HDR - 1.0) * input_luma) * log2_rho_hdr_inv;
 
     let compressed_luma = perceptual_luma.simd_le(F32x16::splat(0.739_9)).select(
         F32x16::splat(1.077_0) * perceptual_luma,
@@ -153,15 +162,16 @@ fn bt2446a_simd(components: &[F32x16; 3]) -> [[f32; BT2446_LANES]; 3] {
 
     // `perceptual_luma` is in `0.0..=~1.0` (a knee function of a `0.0..=1.0`-ish input), so this
     // argument stays near `0.0..=LOG2_RHO_SDR`, far inside `exp2_bounded`'s safe range.
-    let output_luma = (exp2_bounded(compressed_luma * F32x16::splat(LOG2_RHO_SDR)) - one)
-        / F32x16::splat(RHO_SDR - 1.0);
+    let output_luma =
+        (exp2_bounded(compressed_luma * F32x16::splat(LOG2_RHO_SDR)) - one) * rho_sdr_minus_one_inv;
 
     let color_scale = input_luma
         .simd_eq(zero)
-        .select(zero, output_luma / (F32x16::splat(1.1) * input_luma));
+        .select(zero, output_luma * recip(F32x16::splat(1.1) * input_luma));
 
-    let blue_difference = color_scale * (nonlinear[2] - input_luma) / F32x16::splat(CB_DIVISOR);
-    let red_difference = color_scale * (nonlinear[0] - input_luma) / F32x16::splat(CR_DIVISOR);
+    let blue_difference = color_scale * (nonlinear[2] - input_luma) * cb_divisor_inv;
+    let red_difference = color_scale * (nonlinear[0] - input_luma) * cr_divisor_inv;
+
     let adjusted_luma = red_difference
         .simd_max(zero)
         .mul_add(F32x16::splat(-0.1), output_luma);
@@ -187,7 +197,7 @@ fn bt2446a_simd(components: &[F32x16; 3]) -> [[f32; BT2446_LANES]; 3] {
 
 fn bt2446a(color: LinearRGB) -> LinearRGB {
     let nonlinear = color.components().map(|component| {
-        let normalized = (component / HDR_TO_SDR_PEAK_RATIO).clamp(0.0, 1.0);
+        let normalized = (component * (1.0 / HDR_TO_SDR_PEAK_RATIO)).clamp(0.0, 1.0);
         exp2_scalar(log2_scalar(normalized) * (1.0 / 2.4))
     });
 
@@ -201,11 +211,11 @@ fn bt2446a(color: LinearRGB) -> LinearRGB {
     let color_scale = if input_luma == 0.0 {
         0.0
     } else {
-        output_luma / (1.1 * input_luma)
+        output_luma * recip(Simd::<f32, 1>::splat(1.1 * input_luma))[0]
     };
 
-    let blue_difference = color_scale * (nonlinear[2] - input_luma) / CB_DIVISOR;
-    let red_difference = color_scale * (nonlinear[0] - input_luma) / CR_DIVISOR;
+    let blue_difference = color_scale * (nonlinear[2] - input_luma) * (1.0 / CB_DIVISOR);
+    let red_difference = color_scale * (nonlinear[0] - input_luma) * (1.0 / CR_DIVISOR);
     let adjusted_luma = red_difference.max(0.0).mul_add(-0.1, output_luma);
 
     let output_nonlinear = [
@@ -237,5 +247,5 @@ fn bt2446a_luma(input_luma: f32) -> f32 {
         0.5 * perceptual_luma + 0.5
     };
 
-    (exp2_scalar(compressed_luma * LOG2_RHO_SDR) - 1.0) / (RHO_SDR - 1.0)
+    (exp2_scalar(compressed_luma * LOG2_RHO_SDR) - 1.0) * (1.0 / (RHO_SDR - 1.0))
 }

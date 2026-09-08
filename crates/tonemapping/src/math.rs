@@ -8,45 +8,82 @@ use std::simd::{
     num::{SimdFloat, SimdInt, SimdUint},
 };
 
-use crate::simd::F32x8;
+/// Select instructions in the enclosing `#[multiversion]` function, without another dispatcher
+/// or SIMD ABI boundary inside its loop.
+macro_rules! recip_for_target {
+    ($x:expr) => {{
+        let x = $x;
+        #[cfg(target_arch = "x86_64")]
+        {
+            use multiversion::target::target_cfg_f;
+            use std::arch::x86_64::*;
+            use std::simd::Simd;
 
-/// Approximates `1.0 / x` via AVX `vrcpps` plus one Newton-Raphson step.
-///
-/// Falls back to a plain divide off x86_64 or without AVX at runtime.
-#[inline]
-#[expect(unsafe_code, reason = "AVX raw intrinsics")]
-pub(crate) fn recip(x: F32x8) -> F32x8 {
-    #[cfg(target_arch = "x86_64")]
-    if is_x86_feature_detected!("avx") {
-        // SAFETY: AVX support is present.
-        return unsafe { recip_avx(x) };
-    }
+            // Pad only the last register. Constant lane counts let LLVM remove the copies;
+            // even vectors shorter than a register use RCP instead of a divide.
+            macro_rules! estimate {
+                ($width:literal, $rcp:ident) => {{
+                    let input = x.to_array();
+                    let mut output = input;
+                    for (src, dst) in input.chunks($width).zip(output.chunks_mut($width)) {
+                        let mut lanes = [1.0; $width];
+                        lanes[..src.len()].copy_from_slice(src);
+                        let lanes = Simd::<f32, $width>::from_array(lanes);
+                        // SAFETY: the enclosing multiversioned function enables the selected
+                        // instruction's features. SIMD/native conversions preserve all lanes.
+                        #[expect(unsafe_code, reason = "hardware reciprocal intrinsic")]
+                        let approx = unsafe { Simd::<f32, $width>::from($rcp(lanes.into())) };
+                        dst.copy_from_slice(&approx.to_array()[..src.len()]);
+                    }
+                    Simd::from_array(output)
+                }};
+            }
 
-    F32x8::splat(1.0) / x
+            let approx = if x.len() > 8 && target_cfg_f!(target_feature = "avx512f") {
+                estimate!(16, _mm512_rcp14_ps)
+            } else if x.len() > 4 && target_cfg_f!(target_feature = "avx") {
+                if target_cfg_f!(all(target_feature = "avx512f", target_feature = "avx512vl")) {
+                    estimate!(8, _mm256_rcp14_ps)
+                } else {
+                    estimate!(8, _mm256_rcp_ps)
+                }
+            } else if target_cfg_f!(all(target_feature = "avx512f", target_feature = "avx512vl")) {
+                estimate!(4, _mm_rcp14_ps)
+            } else {
+                estimate!(4, _mm_rcp_ps)
+            };
+
+            let two = Simd::splat(2.0);
+            if target_cfg_f!(any(target_feature = "fma", target_feature = "avx512f")) {
+                approx * std::simd::StdFloat::mul_add(-x, approx, two)
+            } else {
+                approx * (two - x * approx)
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            std::simd::Simd::splat(1.0) / x
+        }
+    }};
 }
+pub(crate) use recip_for_target;
 
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx")]
-#[expect(unsafe_code, reason = "AVX raw intrinsics")]
-unsafe fn recip_avx(x: F32x8) -> F32x8 {
-    use std::arch::x86_64::{
-        _mm256_loadu_ps, _mm256_mul_ps, _mm256_rcp_ps, _mm256_set1_ps, _mm256_storeu_ps,
-        _mm256_sub_ps,
-    };
-
-    let input = x.to_array();
-    // SAFETY: `input` is fully-initialized.
-    unsafe {
-        let v = _mm256_loadu_ps(input.as_ptr());
-        let approx = _mm256_rcp_ps(v);
-        // Newton-Raphson
-        let two = _mm256_set1_ps(2.0);
-        let refined = _mm256_mul_ps(approx, _mm256_sub_ps(two, _mm256_mul_ps(v, approx)));
-
-        let mut output = [0.0f32; 8];
-        _mm256_storeu_ps(output.as_mut_ptr(), refined);
-        F32x8::from_array(output)
-    }
+/// Approximates `1.0 / x` with a hardware estimate and one Newton-Raphson step.
+///
+/// Intended for tone-mapping denominators `1 + luminance`, in `1.0..=1e19`. Zero, subnormal,
+/// non-finite inputs and reciprocal underflow are outside this approximation's contract.
+/// Non-x86-64 targets use division. Inside multiversioned loops use `recip_for_target!` to avoid
+/// dispatching again for each vector.
+#[multiversion::multiversion(targets(
+    "x86_64+avx512f+avx512vl",
+    "x86_64+avx512f",
+    "x86_64+avx+fma",
+    "x86_64+avx",
+    "x86_64+sse2",
+))]
+#[inline]
+pub(crate) fn recip<const N: usize>(x: Simd<f32, N>) -> Simd<f32, N> {
+    recip_for_target!(x)
 }
 
 /// Minimax coefficients for `log(1 + t) - t + t^2/2`, from Cephes' `logf`.
@@ -246,7 +283,7 @@ pub(crate) fn exp2_scalar(value: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{exp2, exp2_bounded, exp2_scalar, log2, log2_positive_normal, log2_scalar};
+    use super::{exp2, exp2_bounded, exp2_scalar, log2, log2_positive_normal, log2_scalar, recip};
     use std::simd::Simd;
 
     /// Returns the distance between two floats in units in the last place.
@@ -340,6 +377,80 @@ mod tests {
             );
         }
         assert!(exp2(Simd::<f32, 1>::splat(f32::NAN))[0].is_nan());
+    }
+
+    #[test]
+    fn recip_matches_a_plain_divide_at_every_lane_width() {
+        fn check<const N: usize>(reciprocal: fn(Simd<f32, N>) -> Simd<f32, N>) {
+            for exponent in -120..=120 {
+                for step in 0..64_u16 {
+                    let values = std::array::from_fn(|lane| {
+                        let mantissa =
+                            1.0 + f32::from((step + u16::try_from(lane).unwrap()) % 64) / 64.0;
+                        let sign = if lane % 2 == 0 { 1.0 } else { -1.0 };
+                        sign * mantissa * 2.0_f32.powi(exponent)
+                    });
+                    let actual = reciprocal(std::hint::black_box(Simd::from_array(values)));
+                    for (actual, value) in actual.to_array().into_iter().zip(values) {
+                        assert!(
+                            ulp_distance(actual, 1.0 / value) <= 4,
+                            "recip({value}) = {actual}, N = {N}"
+                        );
+                    }
+                }
+            }
+        }
+
+        macro_rules! widths {
+            ($reciprocal:ident) => {
+                check::<1>($reciprocal);
+                check::<2>($reciprocal);
+                check::<3>($reciprocal);
+                check::<4>($reciprocal);
+                check::<5>($reciprocal);
+                check::<8>($reciprocal);
+                check::<12>($reciprocal);
+                check::<13>($reciprocal);
+                check::<16>($reciprocal);
+                check::<32>($reciprocal);
+                check::<64>($reciprocal);
+            };
+        }
+
+        widths!(recip);
+
+        // Compile with RUSTFLAGS=-Ctarget-cpu=x86-64 to exercise each ISA independently.
+        #[cfg(target_arch = "x86_64")]
+        {
+            macro_rules! backend {
+                ($name:ident, $target:literal, $supported:expr) => {
+                    #[multiversion::multiversion(targets($target), attrs(inline(never)))]
+                    fn $name<const N: usize>(x: Simd<f32, N>) -> Simd<f32, N> {
+                        recip_for_target!(x)
+                    }
+                    if $supported {
+                        widths!($name);
+                    }
+                };
+            }
+            backend!(sse, "x86_64+sse2", true);
+            backend!(avx, "x86_64+avx", is_x86_feature_detected!("avx"));
+            backend!(
+                avx_fma,
+                "x86_64+avx+fma",
+                is_x86_feature_detected!("avx") && is_x86_feature_detected!("fma")
+            );
+            backend!(
+                avx512,
+                "x86_64+avx512f",
+                is_x86_feature_detected!("avx512f")
+            );
+            backend!(
+                avx512vl,
+                "x86_64+avx512f+avx512vl",
+                is_x86_feature_detected!("avx512f") && is_x86_feature_detected!("avx512vl")
+            );
+        }
     }
 
     #[test]

@@ -59,27 +59,31 @@ impl ScaledClamp {
 impl ToneMapper for ScaledClamp {
     #[inline]
     fn map(&self, color: LinearRGB) -> LinearRGB {
-        let divisor = self.white_point.level();
-        LinearRGB::displayable(color.components().map(|component| component / divisor))
+        // A precomputed reciprocal, shared by every component below, turns three divisions into
+        // one division and three multiplies.
+        let scale = 1.0 / self.white_point.level();
+        LinearRGB::displayable(color.components().map(|component| component * scale))
     }
 
     #[inline]
     fn map_planes_in_place(&self, colors: &mut LinearRGBPlanes) {
-        let divisor = self.white_point.level();
+        let scale = 1.0 / self.white_point.level();
         map_planes(
             colors,
             COLOR_LANES,
-            |colors| scaled_clamp_batch(colors, divisor),
+            |colors| scaled_clamp_batch(colors, scale),
             self,
         );
     }
 }
 
 #[multiversion(targets = "simd")]
-fn scaled_clamp_batch(colors: &mut LinearRGBPlanes, divisor: f32) {
-    let divisor = F32x8::splat(divisor);
+fn scaled_clamp_batch(colors: &mut LinearRGBPlanes, scale: f32) {
+    // `scale` is one reciprocal shared by every pixel chunk in the image, computed once by the
+    // caller rather than divided out again on each chunk.
+    let scale = F32x8::splat(scale);
 
     map_colors(colors, |components| {
-        components.map(|component| component / divisor)
+        components.map(|component| component * scale)
     });
 }

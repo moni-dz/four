@@ -391,8 +391,8 @@ pub struct NativeJPEGXR {
 
 #[derive(Debug)]
 enum NativePixels {
-    BGR101010(::jpegxr::BGR101010Image),
-    RGBAF32(::jpegxr::RGBAF32Image),
+    BGR101010(jpegxr::BGR101010Image),
+    RGBAF32(jpegxr::RGBAF32Image),
 }
 
 impl NativePixels {
@@ -455,7 +455,7 @@ pub fn decode_native(bytes: &[u8]) -> Result<NativeJPEGXR> {
     }
 
     let pixels = match pixel_format {
-        ::jpegxr::PixelFormat::BGR101010 => {
+        jpegxr::PixelFormat::BGR101010 => {
             let native_image = decoder
                 .decode_bgr101010()
                 .map_err(|source| codec_error(&source))?;
@@ -466,7 +466,7 @@ pub fn decode_native(bytes: &[u8]) -> Result<NativeJPEGXR> {
             );
             NativePixels::BGR101010(native_image)
         }
-        ::jpegxr::PixelFormat::RGBA128_FLOAT => {
+        jpegxr::PixelFormat::RGBA128_FLOAT => {
             let native_image = decoder
                 .decode_rgba_f32()
                 .map_err(|source| codec_error(&source))?;
