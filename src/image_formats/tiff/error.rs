@@ -24,10 +24,8 @@ pub enum TIFFError {
 pub enum TIFFLimit {
     /// Maximum decoded buffer size available to the codec.
     ///
-    /// `actual` is the raw sample buffer size computed before decoding. It is `None` when the
-    /// codec's own `TIFFError::LimitsExceeded` fires on an internal allocation (for example
-    /// while reading IFD tags) before that size is known, since that variant carries no
-    /// observed byte count.
+    /// `actual` is the raw sample-buffer size computed before decoding. It is `None` when the
+    /// codec rejects an internal allocation before that size is known.
     CodecBufferBytes {
         /// The raw buffer size that exceeded `max`, when known.
         actual: Option<u64>,

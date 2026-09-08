@@ -52,9 +52,8 @@ pub(crate) fn polynomial<const N: usize, const DEGREE: usize>(
 
 /// Returns the base-two logarithm of each lane.
 ///
-/// Zero and negative inputs return negative infinity and `NaN` respectively, matching
-/// [`f32::log2`]. Subnormal inputs are scaled into the normal range first, so they are as accurate
-/// as any other value.
+/// Zero and negative inputs return negative infinity and `NaN`, matching [`f32::log2`]. Subnormal
+/// inputs are scaled into the normal range.
 #[must_use]
 #[inline]
 pub fn log2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
@@ -136,10 +135,9 @@ pub fn exp2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
     value.is_nan().select(Simd::splat(f32::NAN), result)
 }
 
-/// `log2`, but for callers that can prove `value` is always finite and at least `1.0`.
+/// `log2`, for finite values at least `1.0`.
 ///
-/// Skips the subnormal, zero, negative, infinite and `NaN` handling `log2` needs for the general
-/// case: none of those apply once the caller has bounded its argument away from them.
+/// Omits handling for subnormal, zero, negative, infinite, and `NaN` inputs.
 ///
 /// Callers must not rely on a defined result outside `1.0..=f32::MAX`.
 #[must_use]
@@ -166,11 +164,10 @@ pub(crate) fn log2_positive_normal<const N: usize>(value: Simd<f32, N>) -> Simd<
     corrected.mul_add(Simd::splat(LOG2_E), exponent)
 }
 
-/// `exp2`, but for callers that can prove `value` is always finite and stays well clear of the
-/// `-150.0..=128.0` extremes `exp2` guards against.
+/// `exp2`, for finite values away from the `-150.0..=128.0` extremes.
 ///
-/// Skips the input clamp and the underflow/overflow/`NaN` selects `exp2` needs for the general
-/// case. Callers must not rely on a defined result outside roughly `-16.0..=16.0`.
+/// Omits input clamping and underflow, overflow, and `NaN` handling. Results are defined only
+/// roughly in `-16.0..=16.0`.
 #[must_use]
 #[inline]
 pub(crate) fn exp2_bounded<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
@@ -185,13 +182,13 @@ pub(crate) fn exp2_bounded<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> 
     fractional * scale
 }
 
-/// Returns the base-two logarithm of `value`, by the same code the vector path uses.
+/// Returns the base-two logarithm of `value` using the vector path.
 #[inline]
 pub(crate) fn log2_scalar(value: f32) -> f32 {
     log2(Simd::<f32, 1>::splat(value))[0]
 }
 
-/// Returns two raised to the power of `value`, by the same code the vector path uses.
+/// Returns two raised to the power of `value` using the vector path.
 #[inline]
 pub(crate) fn exp2_scalar(value: f32) -> f32 {
     exp2(Simd::<f32, 1>::splat(value))[0]

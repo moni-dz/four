@@ -1,13 +1,5 @@
-//! Pins the decoded output of every fixture so a change cannot alter pixels unnoticed.
-//!
-//! Each fixture is checked three ways. Dimensions catch a structural break. An FNV-1a-64 hash over
-//! the whole RGBA buffer catches any change at all, down to a single bit. A four-by-four
-//! average-pooled thumbnail catches the same changes but reports *how far* the output moved, which
-//! is what tells a deliberate sub-ULP shift apart from a real regression.
-//!
-//! Re-record a golden only alongside a change that is expected to alter output, in its own commit,
-//! stating the reason and the magnitude of the difference. Set `FOUR_RECORD_GOLDEN=1` to print the
-//! constants for the current build.
+//! Checks fixture dimensions, an FNV-1a-64 RGBA hash, and a four-by-four pooled thumbnail.
+//! Re-record expected output changes with `FOUR_RECORD_GOLDEN=1` and document the difference.
 
 use four::{DecodedImage, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
 
@@ -42,8 +34,7 @@ fn decode(file: &str, bytes: &[u8]) -> DecodedImage {
 
 /// Returns the FNV-1a-64 hash of `bytes`.
 ///
-/// Inlined rather than pulled from a crate: the golden test needs a stable digest, not a good one,
-/// and a dependency here would have to be trusted to never change its output across versions.
+/// Inlined for a stable test digest.
 fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {
@@ -55,8 +46,7 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 
 /// Average-pools `image` into a four-by-four RGBA thumbnail.
 ///
-/// Averaging in `u32` keeps every source pixel in the result, so a one-level shift in a single
-/// pixel still moves the pooled value on a small fixture while staying stable under rounding.
+/// Averages in `u32` to retain source-pixel contributions.
 fn thumbnail(image: &DecodedImage) -> [[u8; 4]; 16] {
     const SIDE: usize = 4;
 
@@ -158,9 +148,8 @@ const EXHAUSTIVE_PREFIX: usize = 512;
 
 /// Every fixture decodes without panicking at any truncation point.
 ///
-/// Truncation is the cheapest way to reach the error paths of a bit-oriented decoder, and those
-/// paths are the ones an untrusted file exercises. Nothing here asserts a particular error, only
-/// that a short read never panics, hangs, or reads out of bounds.
+/// Truncation exercises bit-oriented decoder error paths. The test checks that short reads do not
+/// panic, hang, or read out of bounds.
 #[test]
 fn truncated_fixtures_fail_without_panicking() {
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");

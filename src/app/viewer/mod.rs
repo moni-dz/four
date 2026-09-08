@@ -18,23 +18,22 @@ use tonemapping::{MaxCLLMode, ToneMappingMethod};
 
 use decode_scheduler::{DecodeJob, DecodePayload, LatestLoadCoordinator, LoadPurpose, LoadRequest};
 use geometry::zoom_to_cursor_pan;
-use render::context_menu_height;
 #[cfg(test)]
 use render::toggled_max_cll_mode;
 
 use super::image_loader::{
-    DisplayedImage, HDROptions, ImageMetadata, LoadError, LoadResult, LoadedImage, MetadataField,
-    format_load_error, load_image, load_image_with,
+    DisplayedImage, HDROptions, LoadError, LoadResult, LoadedImage, format_load_error, load_image,
+    load_image_with,
 };
 
 const CONTEXT_MENU_ITEM_HEIGHT: f32 = 36.0;
 const CONTEXT_MENU_PADDING: f32 = 8.0;
+const CONTEXT_MENU_HEIGHT: f32 = CONTEXT_MENU_PADDING + CONTEXT_MENU_ITEM_HEIGHT * 2.0;
 const CONTEXT_MENU_WIDTH: f32 = 180.0;
 const DRAG_REGION_HEIGHT: f32 = 40.0;
 const METADATA_FIELD_GAP: f32 = 6.0;
 const METADATA_LABEL_WIDTH: f32 = 140.0;
 const METADATA_OVERLAY_MARGIN: f32 = 12.0;
-const METADATA_OVERLAY_WIDTH: f32 = 480.0;
 const MAX_CLL_CHECKBOX_SIZE: f32 = 16.0;
 const MAX_CLL_SELECTOR_HEIGHT: f32 = 30.0;
 const TONE_MAPPING_MENU_ITEM_HEIGHT: f32 = 30.0;
@@ -50,8 +49,6 @@ const COLOR_APP_BACKGROUND: u32 = 0x0015_1515;
 const COLOR_TEXT_PRIMARY: u32 = 0x00d8_d8d8;
 /// Secondary text: field labels, muted captions, the tone-mapping menu caret.
 const COLOR_TEXT_SECONDARY: u32 = 0x009d_9d9d;
-/// Text inside the metadata overlay's value column.
-const COLOR_TEXT_VALUE: u32 = 0x00e8_e8e8;
 /// Hint text shown when no image is loaded.
 const COLOR_TEXT_HINT: u32 = 0x0088_8888;
 /// Text in the right-click context menu and tone-mapping method list.
@@ -70,15 +67,11 @@ const COLOR_CONTROL_BACKGROUND: u32 = 0x0024_2424;
 const COLOR_CONTROL_HOVER: u32 = 0x0032_3232;
 /// Border for the tone-mapping and `MaxCLL` selector controls (translucent white).
 const COLOR_CONTROL_BORDER: u32 = 0xff_ff_ff_2e;
-/// Border of the status bar strip (translucent white).
-const COLOR_STATUS_BAR_BORDER: u32 = 0xff_ff_ff_22;
 /// Border for the `MaxCLL` checkbox (translucent white).
 const COLOR_CHECKBOX_BORDER: u32 = 0xff_ff_ff_55;
 /// Background of a selected tone-mapping method or a checked `MaxCLL` checkbox.
 const COLOR_SELECTED_BACKGROUND: u32 = 0x0038_3838;
 /// Background of the status bar strip along the window's bottom edge.
-const COLOR_STATUS_BAR_BACKGROUND: u32 = 0x0d_0d_0d_e8;
-/// Background of the metadata overlay panel.
 const COLOR_METADATA_OVERLAY_BACKGROUND: u32 = 0x0020_2020;
 
 pub(super) const WINDOW_MIN_WIDTH: f32 = 1280.0;
@@ -174,26 +167,17 @@ impl ViewerState {
             Self::Empty { .. } | Self::Failed { .. } => None,
         }
     }
-
-    fn has_image(&self) -> bool {
-        self.displayed().is_some()
-    }
 }
 
 pub(super) struct Root {
     context_menu_position: Option<Point<Pixels>>,
     decode_coordinator: LatestLoadCoordinator<DecodePayload>,
-    /// Mouse position at the last drag event during an active left-drag pan; `None` when not
-    /// panning. Updated every move so a pan change from another source (e.g. a scroll-wheel zoom)
-    /// in between two drag events is preserved instead of overwritten from a stale anchor.
+    /// Last mouse position during an active left-drag pan.
     drag_anchor: Option<Point<Pixels>>,
-    /// Lazily created on first access, since `Root::new` runs in plain unit tests with no `App`
-    /// available to call `cx.focus_handle()`.
+    /// Lazily created because unit tests construct `Root` without an `App`.
     focus_handle: OnceCell<FocusHandle>,
-    hdr_metrics_request: Option<LoadRequest>,
     last_window_title: Option<SharedString>,
     load_generation: u64,
-    metadata_visible: bool,
     /// Pan offset in pixels, relative to the image being centered in the content area.
     pan: Point<Pixels>,
     pending_hdr_options: Option<(LoadRequest, HDROptions)>,
@@ -216,10 +200,8 @@ impl Root {
             decode_coordinator: LatestLoadCoordinator::new(),
             drag_anchor: None,
             focus_handle: OnceCell::new(),
-            hdr_metrics_request: None,
             last_window_title: None,
             load_generation: 0,
-            metadata_visible: false,
             pan: Point::default(),
             pending_hdr_options: None,
             preferred_hdr_options,
@@ -232,13 +214,11 @@ impl Root {
     fn show_context_menu(&mut self, event: &MouseDownEvent, window: &Window) {
         let mut position = event.position;
         let viewport_size = window.viewport_size();
-        let menu_height = context_menu_height(self.viewer.has_image());
-
         // `.max(min_*)` on each ceiling guarantees min <= max even if the viewport is smaller than
         // the menu, so clamping to the floor afterward can never push the position back past the
         // ceiling.
         let max_x = (viewport_size.width - px(CONTEXT_MENU_WIDTH)).max(px(0.0));
-        let max_y = (viewport_size.height - px(menu_height)).max(px(DRAG_REGION_HEIGHT));
+        let max_y = (viewport_size.height - px(CONTEXT_MENU_HEIGHT)).max(px(DRAG_REGION_HEIGHT));
         position.x = position.x.clamp(px(0.0), max_x);
         position.y = position.y.clamp(px(DRAG_REGION_HEIGHT), max_y);
 
@@ -290,8 +270,7 @@ impl Root {
         cx.notify();
     }
 
-    /// Sets the window title only when it actually changed, so title bookkeeping isn't tied to
-    /// render frequency (mirrors Zed's `Workspace::apply_window_title`).
+    /// Updates the window title when it changes.
     pub(super) fn sync_window_title(&mut self, window: &mut Window) {
         let title = self.viewer.status().clone();
         if self.last_window_title.as_ref() == Some(&title) {
@@ -386,7 +365,6 @@ impl Root {
                 root.dismiss_menus();
 
                 let request = root.begin_load_request();
-                root.hdr_metrics_request = None;
                 root.pending_hdr_options = None;
 
                 root.schedule_decode(
@@ -394,7 +372,6 @@ impl Root {
                         request,
                         payload: DecodePayload {
                             hdr_options: root.preferred_hdr_options,
-                            include_hdr_metrics: false,
                             path: Arc::from(path),
                             purpose: LoadPurpose::Image,
                         },
@@ -424,29 +401,21 @@ impl Root {
         let DecodeJob { request, payload } = job;
         let DecodePayload {
             hdr_options,
-            include_hdr_metrics,
             path,
             purpose,
         } = payload;
 
         cx.spawn_in(window, async move |root, cx| {
             let result = cx
-                .background_spawn(async move {
-                    load_image_with(path.as_ref(), hdr_options, include_hdr_metrics)
-                })
+                .background_spawn(async move { load_image_with(path.as_ref(), hdr_options) })
                 .await;
 
             let _ = root.update_in(cx, move |root, window, cx| {
                 let next = root.decode_coordinator.complete(request);
-                if root.hdr_metrics_request == Some(request) {
-                    root.hdr_metrics_request = None;
-                }
 
                 let applied = match purpose {
                     LoadPurpose::Image => root.apply_load_result(request, result),
-                    LoadPurpose::HdrMetrics | LoadPurpose::HDROptions => {
-                        root.apply_hdr_options_result(request, result)
-                    }
+                    LoadPurpose::HDROptions => root.apply_hdr_options_result(request, result),
                 };
 
                 if let Some(next) = next {
@@ -462,8 +431,7 @@ impl Root {
         .detach();
     }
 
-    /// Runs `apply` only if `request` is still current, bracketed by the "status is never blank"
-    /// invariant and the context-menu reset every load-result application performs.
+    /// Applies a current request and resets the context menu.
     fn apply_result_with(&mut self, request: LoadRequest, apply: impl FnOnce(&mut Self)) -> bool {
         if !self.accepts_load_request(request) {
             return false;
@@ -489,7 +457,6 @@ impl Root {
             let load_succeeded = result.is_ok();
             root.viewer.apply_result(result);
             if load_succeeded {
-                root.metadata_visible = false;
                 root.tone_mapping_menu_open = false;
                 root.reset_zoom();
             }
@@ -566,60 +533,13 @@ impl Root {
             return;
         };
 
-        self.hdr_metrics_request = self.metadata_visible.then_some(request);
-
         self.schedule_decode(
             DecodeJob {
                 request,
                 payload: DecodePayload {
                     hdr_options: options,
-                    include_hdr_metrics: self.metadata_visible,
                     path: source_path,
                     purpose: LoadPurpose::HDROptions,
-                },
-            },
-            window,
-            cx,
-        );
-        cx.notify();
-    }
-
-    fn toggle_metadata(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dismiss_menus();
-        self.metadata_visible = !self.metadata_visible;
-
-        if !self.metadata_visible {
-            cx.notify();
-            return;
-        }
-
-        let Some(displayed) = self.viewer.displayed() else {
-            cx.notify();
-            return;
-        };
-        let Some(active_options) = displayed.hdr_options else {
-            cx.notify();
-            return;
-        };
-        if displayed.metadata.has_hdr_metrics || self.hdr_metrics_request.is_some() {
-            cx.notify();
-            return;
-        }
-
-        let path = Arc::clone(&displayed.source_path);
-        let options = self
-            .pending_hdr_options
-            .map_or(active_options, |(_, options)| options);
-        let request = self.begin_load_request();
-        self.hdr_metrics_request = Some(request);
-        self.schedule_decode(
-            DecodeJob {
-                request,
-                payload: DecodePayload {
-                    hdr_options: options,
-                    include_hdr_metrics: true,
-                    path,
-                    purpose: LoadPurpose::HdrMetrics,
                 },
             },
             window,
@@ -650,11 +570,9 @@ impl Render for Root {
 
         let context_menu_position = self.context_menu_position;
         let displayed = self.viewer.displayed();
-        let has_image = displayed.is_some();
 
         let image = displayed.map(|displayed| Arc::clone(&displayed.image));
         let image_dims = displayed.map(|displayed| (displayed.width, displayed.height));
-        let metadata = displayed.map(|displayed| Arc::clone(&displayed.metadata));
         let active_hdr_options = displayed.and_then(|displayed| displayed.hdr_options);
 
         let hdr_options = active_hdr_options.map(|active_options| {
@@ -662,7 +580,6 @@ impl Render for Root {
                 .map_or(active_options, |(_, pending_options)| pending_options)
         });
 
-        let metadata_visible = self.metadata_visible;
         let tone_mapping_menu_open = self.tone_mapping_menu_open;
         let status = self.viewer.status().clone();
         let focus_handle = self.focus_handle(cx);
@@ -698,16 +615,8 @@ impl Render for Root {
                 cx,
             ))
             .child(self.render_image_content(image, image_dims, window, cx))
-            .when_some(metadata.filter(|_| metadata_visible), |root, metadata| {
-                root.child(Self::render_metadata_overlay(&metadata, hdr_options, cx))
-            })
             .when_some(context_menu_position, |root, position| {
-                root.child(Self::render_context_menu(
-                    position,
-                    has_image,
-                    metadata_visible,
-                    cx,
-                ))
+                root.child(Self::render_context_menu(position, cx))
             })
     }
 }
@@ -734,10 +643,6 @@ mod tests {
                 image: Arc::new(GPUIImage::empty()),
                 width: 1,
                 height: 1,
-                metadata: Arc::new(ImageMetadata {
-                    fields: Vec::new(),
-                    has_hdr_metrics: false,
-                }),
                 source_path: Arc::from(Path::new("test.jxr")),
                 hdr_options: Some(options),
             },
@@ -746,11 +651,9 @@ mod tests {
     }
 
     #[test]
-    fn image_information_is_hidden_by_default() {
+    fn menus_are_closed_and_tone_mapping_defaults_are_bt2446_on_a_fresh_root() {
         let root = Root::new(ViewerState::empty());
 
-        assert!(!root.metadata_visible);
-        assert!(root.hdr_metrics_request.is_none());
         assert!(!root.tone_mapping_menu_open);
         assert_eq!(
             root.preferred_hdr_options.tone_mapping(),
@@ -760,11 +663,6 @@ mod tests {
             root.preferred_hdr_options.max_cll_mode(),
             MaxCLLMode::Percentile99_99
         );
-    }
-
-    #[test]
-    fn context_menu_adds_an_item_for_a_loaded_image() {
-        assert!(context_menu_height(true) > context_menu_height(false));
     }
 
     #[test]

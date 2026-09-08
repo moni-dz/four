@@ -1,8 +1,8 @@
 //! Validates bounded GIF animations and decodes their first frame into RGBA8 pixels.
 //!
-//! Every frame is decoded to validate the animation and bound its eventual full-canvas memory.
-//! The first frame is composited at its descriptor offset on a transparent logical screen for the
-//! shared still-image representation. Playback is delegated to the display layer.
+//! Every frame is decoded to validate the animation and bound full-canvas memory. The first frame
+//! is composited at its descriptor offset on a transparent logical screen. Playback belongs to the
+//! display layer.
 
 mod error;
 
@@ -33,13 +33,13 @@ pub fn has_signature(bytes: &[u8]) -> bool {
 
 /// Validates a GIF animation and decodes its first frame without performing I/O.
 ///
-/// Frames are expanded to RGBA by the codec. The first is composited on a transparent logical
-/// screen, while every later frame is decoded and checked against the animation resource bounds.
+/// The codec expands frames to RGBA. The first frame is composited on a transparent logical screen;
+/// later frames are decoded and checked against animation resource bounds.
 ///
 /// # Errors
 ///
-/// Returns [`GIFError`] when the GIF is malformed, has no frame, exceeds a resource bound, or a
-/// decoded frame is inconsistent with its descriptor.
+/// Returns [`GIFError`] for malformed input, missing frames, resource-limit failures, and frame
+/// descriptor mismatches.
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     if !has_signature(bytes) {
         return Err(error(GIFError::Signature));

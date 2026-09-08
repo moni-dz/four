@@ -1,11 +1,7 @@
 #![feature(f16, f32_from_f16, portable_simd)]
 #![warn(missing_docs)]
-//! Decodes images into a small, format-independent RGBA representation.
-//!
-//! The crate provides GIF, JPEG, JPEG XL, JPEG XR, PNG, and TIFF decoding into RGBA8 pixels.
-//! Maintained codecs handle ordinary formats while the handwritten JPEG implementation preserves
-//! arithmetic entropy decoding. Decoding is sans-I/O: callers supply encoded bytes and retain
-//! control over file, network, and resource policy.
+//! Decodes GIF, JPEG, JPEG XL, JPEG XR, PNG, and TIFF images into RGBA8 pixels.
+//! Callers supply encoded bytes and control I/O and resource policy.
 
 // Every invariant names the exact expression in its panic message. Centralizing that mechanical
 // part prevents a future assertion from silently losing the diagnostic.
@@ -62,9 +58,9 @@ macro_rules! invariant_ne {
 // exposes its source varies (boxed vs. bare error), so that's the one thing callers supply.
 macro_rules! format_error_boilerplate {
     ($name:literal, $error:ty, source = |$source:ident| $source_expr:expr) => {
-        /// An exception carrying an error and its propagation frames.
+        /// An error with propagation frames.
         pub type Error = exn::Exn<$error>;
-        /// The result returned by this format's decoder operations.
+        /// Result returned by this format's decoder operations.
         pub type Result<T> = exn::Result<T, $error>;
 
         impl std::error::Error for $error {
@@ -76,7 +72,7 @@ macro_rules! format_error_boilerplate {
             }
         }
 
-        /// Raises a leaf error at its validation site.
+        /// Creates a leaf error at its validation site.
         #[track_caller]
         pub(super) fn error(error: $error) -> Error {
             invariant!(

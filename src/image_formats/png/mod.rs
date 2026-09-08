@@ -1,8 +1,8 @@
 //! Decodes bounded PNG images into row-major RGBA8 pixels.
 //!
-//! The `png` crate validates the chunk stream, checksums, DEFLATE data, filters, and Adam7
-//! interlacing. This adapter applies the viewer's resource limits and normalizes the decoded
-//! grayscale, grayscale-alpha, RGB, or RGBA samples to the shared RGBA8 representation.
+//! The `png` crate validates chunks, checksums, DEFLATE data, filters, and Adam7 interlacing.
+//! The adapter applies resource limits and normalizes grayscale, grayscale-alpha, RGB, and RGBA
+//! samples to RGBA8.
 
 mod error;
 
@@ -28,14 +28,13 @@ pub fn has_signature(bytes: &[u8]) -> bool {
 
 /// Decodes a PNG image without performing I/O.
 ///
-/// Text and embedded ICC metadata are ignored because the shared output contract contains only
-/// pixels. Palette expansion, transparency expansion, 16-to-8-bit reduction, and Adam7
-/// deinterlacing are performed by the codec.
+/// Text and embedded ICC metadata are ignored. The codec handles palette and transparency
+/// expansion, 16-to-8-bit reduction, and Adam7 deinterlacing.
 ///
 /// # Errors
 ///
-/// Returns [`PNGError`] when the PNG is malformed, corrupt, exceeds a resource bound, or cannot be
-/// represented by the shared RGBA8 contract.
+/// Returns [`PNGError`] for malformed or corrupt input, resource-limit failures, and unsupported
+/// output formats.
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     if !has_signature(bytes) {
         return Err(error(PNGError::Signature));

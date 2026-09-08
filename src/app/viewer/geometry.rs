@@ -2,8 +2,7 @@
 
 use gpui::{Pixels, Point, point, px};
 
-/// Scale that fits an `image_w`×`image_h` image inside `content_w`×`content_h`, preserving
-/// aspect ratio (matches gpui's `ObjectFit::Contain`, which this replaces).
+/// Scale that fits an image inside a content area while preserving aspect ratio.
 #[expect(
     clippy::cast_precision_loss,
     reason = "image dimensions stay far below f32's 2^24 exact-integer range"
@@ -21,8 +20,7 @@ pub(super) fn fit_scale(content_w: Pixels, content_h: Pixels, image_w: u32, imag
     (content_w / image_w as f32).min(content_h / image_h as f32)
 }
 
-/// Clamps a pan offset so a `display`-sized image centered in a `content`-sized container can't
-/// be dragged fully out of view.
+/// Clamps a pan offset for a centered image in a content area.
 pub(super) fn clamp_pan(
     pan: Point<Pixels>,
     display_w: Pixels,
@@ -36,8 +34,7 @@ pub(super) fn clamp_pan(
     point(pan.x.clamp(-max_x, max_x), pan.y.clamp(-max_y, max_y))
 }
 
-/// Pan offset that keeps the image point under `cursor_offset` (relative to the content-area
-/// center) fixed while the effective scale changes from `old_scale` to `new_scale`.
+/// Pan offset that keeps the image point under `cursor_offset` fixed across a scale change.
 pub(super) fn zoom_to_cursor_pan(
     cursor_offset: Point<Pixels>,
     old_pan: Point<Pixels>,

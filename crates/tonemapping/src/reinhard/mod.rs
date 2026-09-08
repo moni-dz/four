@@ -41,9 +41,8 @@ fn reinhard_batch(colors: &mut LinearRGBPlanes) {
 
 /// Applies the white-point Reinhard curve independently to each component.
 ///
-/// Components at the white point map to one, while brighter components clip at the display
-/// boundary. For a still image, [`MaxCll`] supplies a `max(R, G, B)` white point. This is a
-/// component-wise adaptation of the global operator in [Reinhard et al.].
+/// Components at the white point map to one; brighter components clip at the display boundary.
+/// [`MaxCll`] supplies a `max(R, G, B)` white point for still images.
 ///
 /// [Reinhard et al.]: https://www.cs.utah.edu/docs/techreports/2002/pdf/UUCS-02-001.pdf
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -157,8 +156,7 @@ fn luminance_reinhard_batch(colors: &mut LinearRGBPlanes) {
 
 /// Identifies a positive finite luminance that maps to display white.
 ///
-/// This type is distinct from [`MaxCll`], which is computed from `max(R, G, B)` rather than
-/// luminance.
+/// Unlike [`MaxCll`], this value is based on luminance rather than `max(R, G, B)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LuminanceWhitePoint(WhitePoint);
 
@@ -189,8 +187,7 @@ impl TryFrom<f32> for LuminanceWhitePoint {
 
 /// Estimates a p99.99 luminance white point for a complete still image.
 ///
-/// This adapts [Smith and Zink]'s per-frame `MaxCLL` outlier percentile to Rec. 709 luminance. It is
-/// an analogous statistic for luminance-based curves, not `MaxCLL`.
+/// Adapts [Smith and Zink]'s per-frame `MaxCLL` percentile to Rec. 709 luminance.
 ///
 /// [Smith and Zink]: https://doi.org/10.5594/JMI.2021.3090176
 #[must_use]
@@ -222,8 +219,7 @@ pub struct LuminanceWhitePointEstimator {
 impl LuminanceWhitePointEstimator {
     /// Creates an estimator sized for `pixel_count` observations.
     ///
-    /// Retains the brightest `floor(pixel_count / 10_000) + 1` luminances, which bounds memory
-    /// while producing the same answer as sorting them all.
+    /// Retains the brightest `floor(pixel_count / 10_000) + 1` luminances.
     #[must_use]
     pub fn new(pixel_count: NonZeroUsize) -> Self {
         let retained = pixel_count.get() / 10_000 + 1;
@@ -256,8 +252,7 @@ impl LuminanceWhitePointEstimator {
 
     /// Folds `other` into this estimate.
     ///
-    /// Both estimators must have been created with the same pixel count, so that they retain the
-    /// same number of samples. This is what lets a caller split an image across worker threads.
+    /// The estimators must use the same pixel count.
     ///
     /// # Panics
     ///
@@ -281,7 +276,7 @@ impl LuminanceWhitePointEstimator {
         }
     }
 
-    /// Finishes the estimate after exactly the declared number of observations.
+    /// Finishes the estimate after the declared number of observations.
     ///
     /// Returns `Ok(None)` when every observed color mapped to zero luminance, since no positive
     /// white point exists to report.
@@ -337,7 +332,7 @@ impl LuminanceWhitePointCountError {
 
 /// Applies extended Reinhard to luminance while retaining color ratios.
 ///
-/// This follows the global white-point operator described by [Reinhard et al.].
+/// Uses the global white-point operator described by [Reinhard et al.].
 ///
 /// [Reinhard et al.]: https://www.cs.utah.edu/docs/techreports/2002/pdf/UUCS-02-001.pdf
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -452,8 +447,8 @@ fn reinhard_jodie_batch(colors: &mut LinearRGBPlanes) {
 
 /// Applies a generalized Reinhard based on the Mobius transform.
 ///
-/// Scalar evaluation permits algebraic floating-point optimizations, so results are approximate
-/// and may vary slightly across builds and targets.
+/// Scalar evaluation may vary slightly across builds and targets because of floating-point
+/// reassociation.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Mobius {
     white_point: LuminanceWhitePoint,
@@ -463,11 +458,8 @@ pub struct Mobius {
 impl Mobius {
     /// Creates an operator with the supplied white point and `transition`.
     ///
-    /// `transition` is the scene level below which input passes through unchanged; the curve
-    /// compresses everything above it up to `white_point`. It must therefore be positive, finite,
-    /// and strictly less than `white_point`'s luminance. `white_point`'s luminance must itself
-    /// exceed display white (`1.0`): the curve compresses scene light down to display white, so a
-    /// white point at or below `1.0` has nothing to compress and is outside this operator's domain.
+    /// `transition` is the unchanged scene level below `white_point`. It must be positive, finite,
+    /// and below the white point's luminance. The white point must exceed display white (`1.0`).
     ///
     /// # Errors
     ///
@@ -510,8 +502,7 @@ impl Mobius {
 /// Reports why a [`Mobius`] operator could not be constructed.
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
 pub enum MobiusError {
-    /// The white point's luminance does not exceed display white (`1.0`), so there is nothing
-    /// above display white for the curve to compress.
+    /// The white point's luminance does not exceed display white (`1.0`).
     #[error("Mobius white point must exceed display white (1.0), got {0}")]
     WhitePointNotAboveDisplayWhite(f32),
     /// `transition` is zero, negative, non-finite, or not less than the white point's luminance.
@@ -556,15 +547,12 @@ impl ToneMapper for Mobius {
 
 /// The minimum per-pixel signal fed into the Mobius curve.
 ///
-/// `mobius_signal` and `mobius_batch` divide by the input signal to preserve hue. Flooring it here
-/// avoids dividing by zero for a fully black pixel; `1e-6` is far enough below any representable
-/// display level that the resulting scale is indistinguishable from the true (undefined) limit.
+/// Floor for the per-pixel signal used by the Mobius curve.
 const MOBIUS_SIGNAL_FLOOR: f32 = 1e-6;
 
 /// The minimum denominator when computing the Mobius curve's `b` coefficient.
 ///
-/// `peak - 1.0` is that denominator. It reaches zero only when the resolved white point maps
-/// exactly to display white, which would otherwise divide by zero.
+/// Floor for the Mobius `b` coefficient denominator.
 const MOBIUS_COEFFICIENT_FLOOR: f32 = 1e-6;
 
 #[inline]

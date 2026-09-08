@@ -1,5 +1,5 @@
-//! Builds the GPUI element tree: context menu, metadata overlay, tone-mapping controls, image
-//! surface, status bar, and the mouse handlers that back the image surface.
+//! Builds the GPUI element tree: context menu, tone-mapping controls, image surface, status bar,
+//! and the mouse handlers that back the image surface.
 
 use std::sync::Arc;
 
@@ -14,21 +14,18 @@ use super::geometry::{clamp_pan, fit_scale, zoom_to_cursor_pan};
 use super::{
     COLOR_ACCENT_GREEN, COLOR_CHECKBOX_BORDER, COLOR_CONTROL_BACKGROUND, COLOR_CONTROL_BORDER,
     COLOR_CONTROL_HOVER, COLOR_MENU_ITEM_HOVER, COLOR_METADATA_OVERLAY_BACKGROUND,
-    COLOR_PANEL_BACKGROUND, COLOR_PANEL_BORDER, COLOR_SELECTED_BACKGROUND,
-    COLOR_STATUS_BAR_BACKGROUND, COLOR_STATUS_BAR_BORDER, COLOR_TEXT_HINT, COLOR_TEXT_MENU,
-    COLOR_TEXT_SECONDARY, COLOR_TEXT_VALUE, CONTEXT_MENU_ITEM_HEIGHT, CONTEXT_MENU_PADDING,
-    CONTEXT_MENU_WIDTH, DRAG_REGION_HEIGHT, HDROptions, ImageMetadata, MAX_CLL_CHECKBOX_SIZE,
+    COLOR_PANEL_BACKGROUND, COLOR_PANEL_BORDER, COLOR_SELECTED_BACKGROUND, COLOR_TEXT_HINT,
+    COLOR_TEXT_MENU, COLOR_TEXT_SECONDARY, CONTEXT_MENU_HEIGHT, CONTEXT_MENU_ITEM_HEIGHT,
+    CONTEXT_MENU_WIDTH, DRAG_REGION_HEIGHT, HDROptions, MAX_CLL_CHECKBOX_SIZE,
     MAX_CLL_SELECTOR_HEIGHT, METADATA_FIELD_GAP, METADATA_LABEL_WIDTH, METADATA_OVERLAY_MARGIN,
-    METADATA_OVERLAY_WIDTH, MetadataField, Root, SCROLL_LINE_HEIGHT, TONE_MAPPING_LABEL_WIDTH,
-    TONE_MAPPING_MENU_ITEM_HEIGHT, TONE_MAPPING_MENU_MARGIN, TONE_MAPPING_MENU_WIDTH,
-    TONE_MAPPING_SELECTOR_HEIGHT, TONE_MAPPING_TITLEBAR_WIDTH, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP_BASE,
+    Root, SCROLL_LINE_HEIGHT, TONE_MAPPING_LABEL_WIDTH, TONE_MAPPING_MENU_ITEM_HEIGHT,
+    TONE_MAPPING_MENU_MARGIN, TONE_MAPPING_MENU_WIDTH, TONE_MAPPING_SELECTOR_HEIGHT,
+    TONE_MAPPING_TITLEBAR_WIDTH, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP_BASE,
 };
 
 impl Root {
     pub(super) fn render_context_menu(
         position: Point<Pixels>,
-        has_image: bool,
-        metadata_visible: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         assert!(
@@ -48,7 +45,7 @@ impl Root {
                 .left(position.x)
                 .top(position.y)
                 .w(px(CONTEXT_MENU_WIDTH))
-                .h(px(context_menu_height(has_image)))
+                .h(px(CONTEXT_MENU_HEIGHT))
                 .p_1()
                 .rounded_md()
                 .shadow_lg()
@@ -65,51 +62,9 @@ impl Root {
                     menu_item("open-image", "Open image…")
                         .on_click(cx.listener(|root, _, window, cx| root.open_image(window, cx))),
                 )
-                .when(has_image, |menu| {
-                    let label = if metadata_visible {
-                        "Hide image info"
-                    } else {
-                        "Show image info"
-                    };
-                    menu.child(menu_item("toggle-image-info", label).on_click(
-                        cx.listener(|root, _, window, cx| root.toggle_metadata(window, cx)),
-                    ))
-                })
                 .child(menu_item("quit", "Quit").on_click(|_, _, cx| cx.quit())),
         )
         .priority(1)
-    }
-
-    pub(super) fn render_metadata_overlay(
-        metadata: &ImageMetadata,
-        hdr_options: Option<HDROptions>,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        assert_ne!(
-            metadata.fields.len(),
-            0,
-            "metadata overlay requires at least one field to display"
-        );
-
-        div()
-            .absolute()
-            .left(px(METADATA_OVERLAY_MARGIN))
-            .top(px(DRAG_REGION_HEIGHT + METADATA_OVERLAY_MARGIN))
-            .w(px(METADATA_OVERLAY_WIDTH))
-            .p_3()
-            .rounded_md()
-            .border_1()
-            .border_color(rgba(COLOR_STATUS_BAR_BORDER))
-            .shadow_lg()
-            .bg(rgba(COLOR_STATUS_BAR_BACKGROUND))
-            .font_family("Consolas")
-            .text_sm()
-            .flex()
-            .flex_col()
-            .when_some(hdr_options, |overlay, options| {
-                overlay.child(Self::render_max_cll_selector(options.max_cll_mode(), cx))
-            })
-            .children(metadata.fields.iter().map(metadata_field))
     }
 
     pub(super) fn render_tone_mapping_selector(
@@ -471,11 +426,6 @@ pub(super) const fn toggled_max_cll_mode(mode: MaxCLLMode) -> MaxCLLMode {
     }
 }
 
-pub(super) const fn context_menu_height(has_image: bool) -> f32 {
-    let item_count = if has_image { 3.0 } else { 2.0 };
-    CONTEXT_MENU_PADDING + CONTEXT_MENU_ITEM_HEIGHT * item_count
-}
-
 fn menu_item(identifier: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
     assert_ne!(
         identifier.len(),
@@ -525,40 +475,4 @@ fn tone_mapping_menu_item(
                 .child(if method == active_method { "✓" } else { "" }),
         )
         .child(method.label())
-}
-
-fn metadata_field(field: &MetadataField) -> gpui::Div {
-    assert_ne!(
-        field.label.len(),
-        0,
-        "metadata field label must not be blank"
-    );
-    assert_ne!(
-        field.value.len(),
-        0,
-        "metadata field value for {:?} must not be blank",
-        field.label
-    );
-
-    div()
-        .w_full()
-        .flex()
-        .items_start()
-        .gap(px(METADATA_FIELD_GAP))
-        .py_0p5()
-        .when(field.starts_section, Styled::mt_2)
-        .child(
-            div()
-                .w(px(METADATA_LABEL_WIDTH))
-                .flex_none()
-                .text_color(rgb(COLOR_TEXT_SECONDARY))
-                .child(field.label),
-        )
-        .child(
-            div()
-                .min_w_0()
-                .flex_1()
-                .text_color(rgb(COLOR_TEXT_VALUE))
-                .child(field.value.clone()),
-        )
 }

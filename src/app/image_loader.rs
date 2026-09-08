@@ -1,4 +1,4 @@
-//! Loads bounded images and builds metadata for display.
+//! Loads bounded images.
 
 use std::borrow::Cow;
 use std::fmt;
@@ -75,7 +75,6 @@ pub(super) struct DisplayedImage {
     pub(super) image: Arc<GPUIImage>,
     pub(super) width: u32,
     pub(super) height: u32,
-    pub(super) metadata: Arc<ImageMetadata>,
     pub(super) source_path: Arc<Path>,
     pub(super) hdr_options: Option<HDROptions>,
 }
@@ -122,101 +121,6 @@ impl Default for HDROptions {
 pub(super) struct LoadedImage {
     pub(super) displayed: DisplayedImage,
     pub(super) status: SharedString,
-}
-
-#[derive(Debug)]
-pub(super) struct ImageMetadata {
-    pub(super) fields: Vec<MetadataField>,
-    pub(super) has_hdr_metrics: bool,
-}
-
-impl ImageMetadata {
-    fn new(path: &Path, decoded: &DecodedImageState) -> Self {
-        let (width, height) = decoded.image.dimensions();
-        assert!(width > 0, "decoded image width must be nonzero");
-        assert!(height > 0, "decoded image height must be nonzero");
-        assert!(
-            decoded.byte_count <= IMAGE_FILE_BYTES_MAX,
-            "decoded byte count {} exceeds the configured {IMAGE_FILE_BYTES_MAX}-byte limit",
-            decoded.byte_count
-        );
-
-        let divisor = greatest_common_divisor(width, height);
-        let pixel_count = u64::from(width) * u64::from(height);
-        let (pixels, remainder) = decoded.image.rgba8().as_chunks::<4>();
-        assert_eq!(
-            remainder.len(),
-            0,
-            "decoded RGBA8 buffer length must be a multiple of 4"
-        );
-        let transparency = pixels.iter().any(|pixel| pixel[3] != u8::MAX);
-
-        let mut fields = vec![
-            MetadataField::new("Image", display_file_name(path).into_owned()),
-            MetadataField::new("Folder", display_parent(path)),
-            MetadataField::new("File size", format_file_size(decoded.byte_count)),
-            MetadataField::new("Format", decoded.source_format.label()),
-            MetadataField::new("Dimensions", format!("{width} × {height} px")),
-            MetadataField::new(
-                "Aspect ratio",
-                format!("{}:{}", width / divisor, height / divisor),
-            ),
-            MetadataField::new("Pixels", format_pixel_count(pixel_count)),
-        ];
-
-        let has_hdr_metrics = decoded
-            .jpeg_xr_metadata
-            .is_some_and(|metadata| metadata.max_cll_scrgb().is_some());
-
-        if let Some(metadata) = decoded.jpeg_xr_metadata {
-            fields.extend(jpeg_xr_metadata_fields(metadata));
-        }
-
-        fields.push(MetadataField::section("Output", "RGBA · 8 bpc"));
-        fields.push(MetadataField::new(
-            "Transparency",
-            if transparency { "Present" } else { "None" },
-        ));
-
-        assert!(
-            fields.iter().all(|field| !field.value.is_empty()),
-            "every metadata field value must be nonempty"
-        );
-        Self {
-            fields,
-            has_hdr_metrics,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct MetadataField {
-    pub(super) label: &'static str,
-    pub(super) value: SharedString,
-    pub(super) starts_section: bool,
-}
-
-impl MetadataField {
-    fn new(label: &'static str, value: impl Into<SharedString>) -> Self {
-        let value = value.into();
-        assert_ne!(label.len(), 0, "metadata field label must not be blank");
-        assert_ne!(
-            value.len(),
-            0,
-            "metadata field value for {label:?} must not be blank"
-        );
-        Self {
-            label,
-            value,
-            starts_section: false,
-        }
-    }
-
-    fn section(label: &'static str, value: impl Into<SharedString>) -> Self {
-        let mut field = Self::new(label, value);
-        field.starts_section = true;
-        field
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -283,7 +187,6 @@ impl SourceFormat {
         bytes: &[u8],
         path: &Path,
         hdr_options: HDROptions,
-        include_hdr_metrics: bool,
     ) -> LoadResult<DecodedSource> {
         match self {
             Self::GIF => gif::decode(bytes)
@@ -301,7 +204,7 @@ impl SourceFormat {
             Self::JPEGXR => jpeg_xr::decode_with_metadata_and_options(
                 bytes,
                 jpeg_xr::DecodeOptions::new(hdr_options.tone_mapping(), hdr_options.max_cll_mode())
-                    .with_hdr_metrics(include_hdr_metrics),
+                    .with_hdr_metrics(false),
             )
             .or_raise(|| image_decode_error(path))
             .map(|decoded| {
@@ -337,13 +240,6 @@ impl DecodedSource {
     }
 }
 
-struct DecodedImageState {
-    image: DecodedImage,
-    byte_count: u64,
-    source_format: SourceFormat,
-    jpeg_xr_metadata: Option<jpeg_xr::JPEGXRMetadata>,
-}
-
 fn image_decode_error(path: &Path) -> LoadError {
     LoadError::new(format!("Could not decode {}", path.display()))
 }
@@ -352,161 +248,6 @@ fn display_file_name(path: &Path) -> Cow<'_, str> {
     path.file_name()
         .unwrap_or(path.as_os_str())
         .to_string_lossy()
-}
-
-fn display_parent(path: &Path) -> SharedString {
-    let Some(parent) = path.parent() else {
-        return SharedString::from(".");
-    };
-
-    let parent = parent.as_os_str().to_string_lossy();
-
-    if parent.is_empty() {
-        SharedString::from(".")
-    } else {
-        SharedString::from(parent.into_owned())
-    }
-}
-
-fn format_jpeg_xr_channels(metadata: jpeg_xr::JPEGXRMetadata) -> &'static str {
-    match (
-        metadata.color_channels(),
-        metadata.has_alpha(),
-        metadata.is_bgr(),
-    ) {
-        (1, false, _) => "Gray",
-        (1, true, _) => "GrayA",
-        (3, false, false) => "RGB",
-        (3, true, false) => "RGBA",
-        (3, false, true) => "BGR",
-        (3, true, true) => "BGRA",
-        _ => "Color",
-    }
-}
-
-fn format_jpeg_xr_dynamic_range(metadata: jpeg_xr::JPEGXRMetadata) -> String {
-    let dynamic_range = if metadata.is_hdr() { "HDR" } else { "SDR" };
-    let channels = format_jpeg_xr_channels(metadata);
-    let bits_per_channel = metadata.bits_per_channel();
-
-    format!("{dynamic_range} ({channels} @ {bits_per_channel}-bpc)")
-}
-
-fn jpeg_xr_metadata_fields(metadata: jpeg_xr::JPEGXRMetadata) -> Vec<MetadataField> {
-    let mut fields = vec![MetadataField::new(
-        "Dynamic Range",
-        format_jpeg_xr_dynamic_range(metadata),
-    )];
-
-    if metadata.max_cll_scrgb().is_some() {
-        fields.extend(jpeg_xr_hdr_fields(metadata));
-    }
-
-    fields
-}
-
-fn jpeg_xr_hdr_fields(metadata: jpeg_xr::JPEGXRMetadata) -> [MetadataField; 6] {
-    let max_cll = metadata
-        .max_cll_scrgb()
-        .expect("HDR JPEG XR metadata includes MaxCLL");
-
-    let max_cll_channel = metadata
-        .max_cll_channel()
-        .expect("HDR JPEG XR metadata includes a MaxCLL channel");
-
-    let max_luminance = metadata
-        .max_luminance_nits()
-        .expect("HDR JPEG XR metadata includes maximum luminance");
-
-    let average_luminance = metadata
-        .average_luminance_nits()
-        .expect("HDR JPEG XR metadata includes average luminance");
-
-    let min_luminance = metadata
-        .min_luminance_nits()
-        .expect("HDR JPEG XR metadata includes minimum luminance");
-
-    let rec709 = metadata
-        .rec709_percentage()
-        .expect("HDR JPEG XR metadata includes Rec. 709 coverage");
-
-    let dci_p3 = metadata
-        .dci_p3_percentage()
-        .expect("HDR JPEG XR metadata includes DCI-P3 coverage");
-
-    [
-        MetadataField::section(
-            "MaxCLL (scRGB)",
-            format!("{max_cll:.3} ({})", max_cll_channel.symbol()),
-        ),
-        MetadataField::new("Max Luminance", format!("{max_luminance:.3} cd / m²")),
-        MetadataField::new("Avg. Luminance", format!("{average_luminance:.3} cd / m²")),
-        MetadataField::new("Min Luminance", format!("{min_luminance:.3} cd / m²")),
-        MetadataField::section("Rec. 709", format!("{rec709:.4} %")),
-        MetadataField::new("DCI-P3", format!("{dci_p3:.4} %")),
-    ]
-}
-
-fn greatest_common_divisor(mut left: u32, mut right: u32) -> u32 {
-    assert!(
-        left > 0,
-        "greatest_common_divisor requires a nonzero left operand"
-    );
-    assert!(
-        right > 0,
-        "greatest_common_divisor requires a nonzero right operand"
-    );
-
-    while right != 0 {
-        (left, right) = (right, left % right);
-    }
-
-    assert!(
-        left > 0,
-        "greatest common divisor of two positive integers must be positive"
-    );
-    left
-}
-
-fn format_file_size(bytes: u64) -> String {
-    const KIBIBYTE: u64 = 1024;
-
-    if bytes >= MEBIBYTE_BYTES {
-        format_hundredths(bytes, MEBIBYTE_BYTES, "MiB")
-    } else if bytes >= KIBIBYTE {
-        format_hundredths(bytes, KIBIBYTE, "KiB")
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-fn format_pixel_count(pixels: u64) -> String {
-    const MEGAPIXEL: u64 = 1_000_000;
-
-    if pixels >= MEGAPIXEL {
-        format_hundredths(pixels, MEGAPIXEL, "MP")
-    } else {
-        format!("{pixels} px")
-    }
-}
-
-fn format_hundredths(value: u64, unit: u64, suffix: &str) -> String {
-    assert!(
-        unit > 0,
-        "format_hundredths requires a nonzero unit divisor"
-    );
-    assert_ne!(
-        suffix.len(),
-        0,
-        "format_hundredths requires a nonblank suffix"
-    );
-
-    let scaled = value
-        .checked_mul(100)
-        .and_then(|value| value.checked_add(unit / 2))
-        .expect("bounded image metadata fits fixed-point display arithmetic")
-        / unit;
-    format!("{}.{:02} {suffix}", scaled / 100, scaled % 100)
 }
 
 fn validate_image_file_size(path: &Path, byte_count: u64) -> LoadResult<()> {
@@ -528,14 +269,10 @@ fn display_image(source_format: SourceFormat, bytes: Vec<u8>, decoded: &DecodedI
 }
 
 pub(super) fn load_image(path: &Path) -> LoadResult<LoadedImage> {
-    load_image_with(path, HDROptions::default(), false)
+    load_image_with(path, HDROptions::default())
 }
 
-pub(super) fn load_image_with(
-    path: &Path,
-    hdr_options: HDROptions,
-    include_hdr_metrics: bool,
-) -> LoadResult<LoadedImage> {
+pub(super) fn load_image_with(path: &Path, hdr_options: HDROptions) -> LoadResult<LoadedImage> {
     let file = File::open(path)
         .or_raise(|| LoadError::new(format!("Could not open {}", path.display())))?;
 
@@ -559,30 +296,24 @@ pub(super) fn load_image_with(
     let extension = path.extension().map(|value| value.to_string_lossy());
     let source_format = SourceFormat::detect(&bytes, extension.as_deref());
 
-    let decoded = source_format.decode(&bytes, path, hdr_options, include_hdr_metrics)?;
-    let decoded = DecodedImageState {
-        image: decoded.image,
-        byte_count,
-        source_format,
-        jpeg_xr_metadata: decoded.jpeg_xr_metadata,
-    };
+    let decoded = source_format.decode(&bytes, path, hdr_options)?;
 
     let (width, height) = decoded.image.dimensions();
-    let metadata = Arc::new(ImageMetadata::new(path, &decoded));
-
-    let image = Arc::new(display_image(source_format, bytes, &decoded.image));
+    assert!(width > 0, "decoded image width must be nonzero");
+    assert!(height > 0, "decoded image height must be nonzero");
 
     let active_hdr_options = decoded
         .jpeg_xr_metadata
         .filter(|metadata| metadata.is_hdr())
         .map(|_| hdr_options);
 
+    let image = Arc::new(display_image(source_format, bytes, &decoded.image));
+
     let loaded = LoadedImage {
         displayed: DisplayedImage {
             image,
             width,
             height,
-            metadata,
             source_path: Arc::from(path),
             hdr_options: active_hdr_options,
         },
@@ -689,20 +420,6 @@ mod tests {
         assert!(message.contains("JPEG codec error"));
         assert_eq!(load_error.frame().children().len(), 1);
         assert!(load_error.frame().children()[0].children().is_empty());
-    }
-
-    #[test]
-    fn overlay_formats_bounded_file_and_pixel_sizes() {
-        assert_eq!(format_file_size(999), "999 B");
-        assert_eq!(format_file_size(14_669_660), "13.99 MiB");
-        assert_eq!(format_pixel_count(3_686_400), "3.69 MP");
-    }
-
-    #[test]
-    fn overlay_reduces_image_aspect_ratios() {
-        let divisor = greatest_common_divisor(2560, 1440);
-
-        assert_eq!((2560 / divisor, 1440 / divisor), (16, 9));
     }
 
     #[test]

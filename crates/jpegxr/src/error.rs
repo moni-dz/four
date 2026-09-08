@@ -54,7 +54,7 @@ impl Error {
         self.offset
     }
 
-    /// Returns the backtrace captured when this error was created.
+    /// Returns the captured backtrace.
     #[must_use]
     pub fn backtrace(&self) -> &Backtrace {
         &self.backtrace
@@ -72,8 +72,7 @@ impl Error {
         matches!(self.kind, ErrorKind::InvalidSignature)
     }
 
-    /// Returns whether the codestream uses a feature this decoder does not implement, or the
-    /// pixel format is not one this decoder supports.
+    /// Returns whether the codestream or pixel format is unsupported.
     #[must_use]
     pub const fn is_unsupported(&self) -> bool {
         matches!(
@@ -99,9 +98,7 @@ impl Error {
 
     /// Returns whether any declared resource size exceeds a decoder bound.
     ///
-    /// This is a superset of [`Error::is_dimension_limit_exceeded`] and
-    /// [`Error::is_pixel_count_limit_exceeded`], which narrow to those two common cases; other
-    /// bounded resources (tag payloads, tile counts, output buffers, ...) are only reported here.
+    /// Includes dimension, pixel-count, tag-payload, tile-count, and output-buffer limits.
     #[must_use]
     pub const fn is_limit_exceeded(&self) -> bool {
         matches!(self.kind, ErrorKind::LimitExceeded(_))

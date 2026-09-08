@@ -199,8 +199,7 @@ mod tests {
 
     /// Evaluates the ITU T.81 inverse DCT directly, in f64.
     ///
-    /// Written from the specification's double sum rather than from the implementation, so it is
-    /// an independent expectation rather than a restatement of the code under test.
+    /// Uses the specification's double sum as an independent reference.
     fn reference_inverse(coefficients: &[i32; 64]) -> [f64; 64] {
         fn normalization(frequency: usize) -> f64 {
             if frequency == 0 {

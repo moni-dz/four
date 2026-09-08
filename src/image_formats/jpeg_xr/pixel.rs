@@ -1,6 +1,4 @@
-//! Native JPEG XR pixel-layout description and per-pixel sample decode, including the PQ EOTF,
-//! packed BGR101010, half-float, fixed-point, and RGBE sample paths (each with a scalar and SIMD
-//! twin where the hot pixel-writing loops in `normalize` need it).
+//! JPEG XR pixel layouts and sample decoding, including scalar and SIMD paths.
 
 use std::simd::{
     Simd, StdFloat,
@@ -245,10 +243,8 @@ pub(super) fn decode_bgr101010_simd<const N: usize>(packed: Simd<u32, N>) -> [Si
 
 /// Looks up `indexes` (each `0..1024`) in [`PQ_10BIT`].
 ///
-/// `Simd::gather_or`'s index type is pointer-width, so the portable path pays for a
-/// software-widened per-lane address computation and scalarizes instead of using a real
-/// gather instruction. On x86-64/AVX2, where a hardware gather takes 32-bit indices
-/// directly, call it explicitly instead.
+/// The portable `Simd::gather_or` path uses pointer-width indices. On x86-64/AVX2, use the
+/// hardware gather path with 32-bit indices.
 #[inline]
 #[expect(
     unsafe_code,

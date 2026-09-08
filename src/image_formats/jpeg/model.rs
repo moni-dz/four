@@ -26,11 +26,11 @@ pub(super) enum ColorTransform {
     RGB,
 }
 
-/// A pixel column, distinct from [`PixelY`] so `rgba_pixel`/`sample` cannot receive them swapped.
+/// A pixel column.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PixelX(u32);
 
-/// A pixel row, distinct from [`PixelX`] so `rgba_pixel`/`sample` cannot receive them swapped.
+/// A pixel row.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct PixelY(u32);
 
@@ -189,9 +189,8 @@ impl Frame {
         [sample, sample, sample, 255]
     }
 
-    /// Materializes the two- or three-component color path a row at a time so the chroma-upsample
-    /// and YCbCr->RGB matrix multiply can run through [`convert_color_row`] instead of once per
-    /// pixel. Mirrors [`rgba_pixel_rows`]'s parallelism threshold exactly.
+    /// Materializes the two- or three-component color path a row at a time for
+    /// [`convert_color_row`]. Uses the [`rgba_pixel_rows`] parallelism threshold.
     fn write_color_rows(&self, transform: ColorTransform, width: usize, height: usize) -> Vec<u8> {
         let pixel_count = width * height;
 
@@ -231,10 +230,8 @@ impl Frame {
         rgba
     }
 
-    /// Returns component `component_index`'s samples for row `y`, one per output pixel. Borrows
-    /// the plane row directly when the component isn't subsampled (always true for luma); otherwise
-    /// materializes the nearest-neighbor chroma upsample once for the whole row instead of once per
-    /// pixel, using the same division [`sample`](Self::sample) performs.
+    /// Returns component `component_index`'s samples for row `y`, one per output pixel. Subsampled
+    /// components use nearest-neighbor upsampling.
     fn component_row(&self, component_index: usize, y: PixelY, width: usize) -> Cow<'_, [u8]> {
         let component = &self.components[component_index];
 
@@ -540,10 +537,7 @@ fn convert_color(first: u8, second: u8, third: u8, transform: ColorTransform) ->
     }
 }
 
-/// Vectorized sibling of [`convert_color`]: applies the same ITU-T T.871 conversion to a whole row
-/// of samples at once. Uses plain multiply/add rather than `mul_add` so its rounding matches
-/// [`convert_color`]'s bit for bit — the scalar tail calls `convert_color` directly, so the two
-/// must agree exactly, not just approximately.
+/// Applies the ITU-T T.871 conversion to a row of samples with vector operations.
 #[multiversion(targets = "simd")]
 fn convert_color_row(
     first: &[u8],

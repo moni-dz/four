@@ -7,8 +7,8 @@ use crate::simd::{COLOR_LANES, F32x8, map_colors, map_planes};
 
 /// Applies [John Hable's Uncharted 2 filmic curve] component-wise.
 ///
-/// The operator includes the article's exposure bias of two and normalizes the curve at its `11.2`
-/// reference input. Consequently, a scene component of `5.6` maps to display white.
+/// Uses the article's exposure bias of two and normalizes at its `11.2` reference input. A scene
+/// component of `5.6` maps to display white.
 ///
 /// [John Hable's Uncharted 2 filmic curve]: https://filmicworlds.com/blog/filmic-tonemapping-operators/
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

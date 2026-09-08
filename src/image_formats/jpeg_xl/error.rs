@@ -33,10 +33,8 @@ pub enum JPEGXLLimit {
     },
     /// Maximum memory tracked while decoding the codestream.
     ///
-    /// `jxl-oxide`'s allocation-tracker error (`jxl_grid::OutOfMemory`) does carry the failed
-    /// allocation's own byte count via `OutOfMemory::bytes()`, but that type is reachable only
-    /// by adding `jxl_grid` as a direct dependency: `jxl-oxide` re-exports `AllocTracker` but
-    /// not the error type it raises. Only the configured maximum is reported here.
+    /// Reports the configured maximum. The current direct dependencies do not expose the
+    /// allocation-tracker error's byte count.
     DecoderMemory(usize),
     /// Maximum accepted decoded pixel count.
     Pixels {

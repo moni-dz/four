@@ -1,8 +1,8 @@
 //! Decodes bounded TIFF images into row-major RGBA8 pixels.
 //!
-//! The `tiff` crate parses and decompresses the first image directory. This adapter accepts
-//! chunky and planar integer grayscale, grayscale-alpha, RGB, RGBA, CMYK, and CMYK-alpha samples,
-//! scales their declared bit depth to eight bits, and normalizes them to the shared RGBA8 output.
+//! The `tiff` crate parses and decompresses the first image directory. The adapter accepts chunky
+//! and planar integer grayscale, grayscale-alpha, RGB, RGBA, CMYK, and CMYK-alpha samples, scales
+//! their declared bit depth to eight bits, and normalizes them to RGBA8.
 
 mod error;
 
@@ -41,13 +41,13 @@ pub fn has_signature(bytes: &[u8]) -> bool {
 
 /// Decodes the first TIFF image directory without performing I/O.
 ///
-/// Integer samples between one and 64 bits are scaled to RGBA8. Palette, YCbCr, Lab, multiband,
-/// signed-integer, and floating-point representations return a structured unsupported error.
+/// Integer samples from one to 64 bits are scaled to RGBA8. Palette, YCbCr, Lab, multiband,
+/// signed-integer, and floating-point representations return an unsupported error.
 ///
 /// # Errors
 ///
-/// Returns [`TIFFError`] when the TIFF is malformed, exceeds a resource bound, uses an unsupported
-/// sample representation, or the codec output is inconsistent with its declared layout.
+/// Returns [`TIFFError`] for malformed input, resource-limit failures, unsupported sample
+/// representations, and inconsistent codec output.
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     if !has_signature(bytes) {
         return Err(error(TIFFError::Signature));
@@ -113,8 +113,7 @@ enum PixelKind {
     CMYKA,
 }
 
-/// A TIFF sample's declared bit depth, already known to be within the `1..=64` range this decoder
-/// scales to eight bits.
+/// A TIFF sample bit depth in the supported `1..=64` range.
 #[nutype(
     validate(greater_or_equal = 1, less_or_equal = 64),
     derive(Clone, Copy, Debug, Eq, PartialEq)

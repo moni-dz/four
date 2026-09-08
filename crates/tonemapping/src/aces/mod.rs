@@ -27,8 +27,7 @@ const ACES_OUTPUT_MATRIX: [[f32; 3]; 3] = [
     [-0.003_27, -0.072_76, 1.076_02],
 ];
 
-/// Rational-fit coefficients for one channel of [Stephen Hill's fitted ACES curve]: `x*(x+A)-B`
-/// over `x*(C*x+D)+E`. Shared by the scalar and SIMD evaluations so the two stay bit-identical.
+/// Rational-fit coefficients for one channel of [Stephen Hill's fitted ACES curve].
 ///
 /// [Stephen Hill's fitted ACES curve]: https://64.github.io/tonemapping/
 const ACES_FIT_A: f32 = 0.024_578_6;
@@ -39,8 +38,7 @@ const ACES_FIT_E: f32 = 0.238_081;
 
 /// Applies [Stephen Hill's fitted ACES reference and display transform].
 ///
-/// This compact fit uses the article's linear sRGB input and output matrices. It is a practical
-/// filmic curve rather than a complete Academy Color Encoding System pipeline.
+/// Uses the article's linear sRGB input and output matrices; not a complete ACES pipeline.
 ///
 /// [Stephen Hill's fitted ACES reference and display transform]: https://64.github.io/tonemapping/
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

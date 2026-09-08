@@ -63,8 +63,7 @@ pub fn has_signature(bytes: &[u8]) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`JPEGError`] when the input is malformed, exceeds a resource bound, or uses a JPEG
-/// feature that this decoder does not support.
+/// Returns [`JPEGError`] for malformed input, resource-limit failures, and unsupported features.
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     if uses_arithmetic_coding(bytes) {
         parser::decode(bytes)

@@ -12,19 +12,5 @@ thiserror = { workspace = true }
 zerocopy = { workspace = true }
 multiversion = { workspace = true }
 
-[dev-dependencies]
-divan = { workspace = true }
-mimalloc = { workspace = true }
-
 [lints]
 workspace = true
-
-[[bench]]
-name = "decode"
-harness = false
-test = false
-
-[[bench]]
-name = "tile_merge"
-harness = false
-test = false

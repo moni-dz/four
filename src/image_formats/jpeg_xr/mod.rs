@@ -1,13 +1,9 @@
 //! Decodes bounded JPEG XR images and tone-maps HDR pixels to SDR RGBA8.
 //!
-//! When metadata or a selected white-point method requires it, `MaxCLL` is estimated from the
-//! 99.99th-percentile `max(R, G, B)` light level. This excludes isolated outliers from the
-//! white-point statistic; only white-point methods may clip values above that threshold.
-//! [`DecodeOptions`] can instead select the true maximum. Callers can also select any built-in
-//! [`ToneMappingMethod`]; white-point methods use matching statistics estimated from the decoded
-//! image.
-//! A wholly empty, non-premultiplied HDR alpha plane is treated as unspecified and made opaque,
-//! matching JPEG XR screenshots that store zero in an otherwise unused alpha channel.
+//! Metadata and white-point methods use a 99.99th-percentile `max(R, G, B)` light level by default;
+//! [`DecodeOptions`] can select the true maximum. White-point methods may clip values above the
+//! selected threshold. Other [`ToneMappingMethod`] variants use their own statistics.
+//! An empty, non-premultiplied HDR alpha plane is treated as unspecified and made opaque.
 //!
 //! # References
 //!
@@ -59,10 +55,8 @@ pub const SIGNATURE: [u8; 4] = [0x49, 0x49, 0xbc, 0x01];
 
 const SC_RGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 
-/// `BT2446A` is calibrated against Report ITU-R BT.2446-1's own fixed convention, where an input
-/// component of `1.0` is 100 cd/m^2 (the SDR target peak). Every other tone mapper here is
-/// white-point relative and works in whatever unit the caller's linear light happens to use, but
-/// BT2446 hardcodes real nits, so scRGB (`1.0` == 80 cd/m^2) must be rescaled before it reaches it.
+/// `BT2446A` uses the report's fixed convention: `1.0` is 100 cd/m^2. Other operators are
+/// white-point relative. scRGB (`1.0` = 80 cd/m^2) is rescaled before BT.2446 conversion.
 const BT2446_INPUT_SCALE: f32 = SC_RGB_REFERENCE_WHITE_NITS / 100.0;
 
 const SOURCE_BUFFER_MAX: usize = 512 * 1024 * 1024;
@@ -132,8 +126,8 @@ impl DecodeOptions {
 
     /// Selects whether returned metadata includes image-wide HDR metrics.
     ///
-    /// Disabling metrics avoids their analysis pass unless the selected tone mapper needs an
-    /// image-derived white point. This setting only affects functions that return metadata.
+    /// Disabling metrics skips analysis unless the selected tone mapper needs an image-derived
+    /// white point. It affects only functions that return metadata.
     #[must_use]
     pub const fn with_hdr_metrics(self, include_hdr_metrics: bool) -> Self {
         Self {
@@ -238,9 +232,8 @@ impl JPEGXRMetadata {
 
     /// Returns the estimated maximum content light level in nits for HDR sources.
     ///
-    /// The estimate follows the [`MaxCLLMode`] used for decoding. SDR sources and decodes that
-    /// disable HDR metrics return `None`. A finite result above the `f32` range saturates at
-    /// `f32::MAX`.
+    /// The estimate follows the [`MaxCLLMode`] used for decoding. SDR sources and disabled metrics
+    /// return `None`. Finite results above the `f32` range saturate at `f32::MAX`.
     #[must_use]
     pub fn max_cll_nits(self) -> Option<f32> {
         self.hdr_metrics.map(|metrics| metrics.max_cll.nits())
@@ -309,8 +302,7 @@ impl JPEGXRMetadata {
 
     /// Returns the percentage of HDR pixels inside Display-P3 but outside Rec. 709.
     ///
-    /// Pixels outside Display-P3 count toward neither gamut percentage, so the two reported
-    /// percentages may sum to less than 100 percent.
+    /// Pixels outside Display-P3 count toward neither percentage; the total may be below 100%.
     #[must_use]
     pub const fn dci_p3_percentage(self) -> Option<f32> {
         match self.hdr_metrics {
@@ -328,59 +320,55 @@ pub fn has_signature(bytes: &[u8]) -> bool {
 
 /// Decodes a JPEG XR image and normalizes it to SDR RGBA8.
 ///
-/// Unsigned integer RGB and grayscale inputs retain their sRGB encoding.
-/// `PixelFormat32bppRGB101010` is unconditionally treated as BT.2100 PQ and Rec. 2020 HDR screenshot
-/// data and converted to linear scRGB. Other HDR inputs are interpreted as linear scRGB. HDR values
-/// are mapped with ITU-R BT.2446 Method A before conversion to sRGB; this default path does not
-/// estimate an image white point. Premultiplied inputs are returned with straight alpha.
+/// Unsigned integer RGB and grayscale inputs retain their sRGB encoding. `PixelFormat32bppRGB101010`
+/// is treated as BT.2100 PQ and Rec. 2020 HDR screenshot data, then converted to linear scRGB. Other
+/// HDR inputs use linear scRGB. HDR values use ITU-R BT.2446 Method A; premultiplied inputs return
+/// straight alpha.
 ///
 /// # Errors
 ///
-/// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
-/// representation that cannot be normalized to RGB.
+/// Returns [`JPEGXRError`] for malformed input, resource-limit failures, and unsupported pixel
+/// representations.
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     decode_with_options(bytes, DecodeOptions::default())
 }
 
 /// Decodes JPEG XR pixels using the selected HDR normalization `options`.
 ///
-/// SDR sources do not pass through tone mapping. Image-derived white points are floored at display
-/// white; methods without a white point apply their curves to every HDR source.
+/// SDR sources bypass tone mapping. Image-derived white points are floored at display white;
+/// methods without a white point apply their curves to HDR sources.
 ///
 /// # Errors
 ///
-/// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
-/// representation that cannot be normalized to RGB.
+/// Returns [`JPEGXRError`] for malformed input, resource-limit failures, and unsupported pixel
+/// representations.
 pub fn decode_with_options(bytes: &[u8], options: DecodeOptions) -> Result<DecodedImage> {
     Ok(decode_with_metadata_and_options(bytes, options.with_hdr_metrics(false))?.into_image())
 }
 
 /// Decodes JPEG XR pixels together with their source representation metadata.
 ///
-/// This performs the same bounded decode and HDR-to-SDR normalization as [`decode`]. For HDR
-/// sources, the returned metadata includes percentile `MaxCLL`; the default BT.2446 mapper does not
-/// use that image-derived metric.
+/// Performs the bounded decode and HDR-to-SDR normalization of [`decode`]. HDR metadata includes
+/// percentile `MaxCLL`; the default BT.2446 mapper does not use it.
 ///
 /// # Errors
 ///
-/// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
-/// representation that cannot be normalized to RGB.
+/// Returns [`JPEGXRError`] for malformed input, resource-limit failures, and unsupported pixel
+/// representations.
 pub fn decode_with_metadata(bytes: &[u8]) -> Result<DecodedJPEGXR> {
     decode_with_metadata_and_options(bytes, DecodeOptions::default())
 }
 
 /// Decodes JPEG XR pixels and metadata using the selected HDR normalization `options`.
 ///
-/// Image-dependent parameters are derived from the decoded source. Component-wise white-point
-/// methods use the selected [`MaxCLLMode`], while extended luminance Reinhard always uses p99.99
-/// Rec. 709 luminance. SDR sources do not pass through tone mapping. Image-derived white points
-/// are floored at display white; methods without a white point apply their curves to every HDR
-/// source.
+/// Image-dependent parameters come from the decoded source. Component-wise white-point methods use
+/// [`MaxCLLMode`]; extended luminance Reinhard uses p99.99 Rec. 709 luminance. SDR sources bypass
+/// tone mapping. Image-derived white points are floored at display white.
 ///
 /// # Errors
 ///
-/// Returns [`JPEGXRError`] when the input is malformed, exceeds a resource bound, or uses a pixel
-/// representation that cannot be normalized to RGB.
+/// Returns [`JPEGXRError`] for malformed input, resource-limit failures, and unsupported pixel
+/// representations.
 pub fn decode_with_metadata_and_options(
     bytes: &[u8],
     options: DecodeOptions,

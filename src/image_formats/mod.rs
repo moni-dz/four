@@ -16,10 +16,8 @@ pub mod tiff;
 ///
 /// # Safety
 ///
-/// Every element must be written before it is read, or the vector dropped without any element
-/// being read (e.g. on an error path taken before the fill completes). `T` must have no validity
-/// invariant beyond its bit pattern: callers must only use this with plain integer/float sample
-/// types, never with a type that has a `Drop` impl or restricted bit patterns.
+/// Every element must be written before it is read, or the vector must be dropped without reading
+/// it. Use only with plain integer or float sample types without restricted bit patterns or `Drop`.
 #[expect(
     unsafe_code,
     reason = "avoids zeroing output buffers a decoder immediately overwrites in full"
@@ -81,9 +79,7 @@ fn validate_dimensions_pair(&(width, height): &(u32, u32)) -> Result<(), Dimensi
 )]
 pub(crate) struct Dimensions((u32, u32));
 
-/// Maps a [`DimensionsError`] to a format-specific error via three closures, so each format keeps
-/// its own error variant shapes (some report `actual_width`/`actual_height` separately, others
-/// collapse to a single `actual: width.max(height)`) without duplicating the match.
+/// Maps a [`DimensionsError`] to a format-specific error via three closures.
 pub(crate) fn map_dimensions_error<E>(
     error: DimensionsError,
     zero: impl FnOnce() -> E,

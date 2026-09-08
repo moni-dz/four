@@ -1,25 +1,10 @@
 #![feature(error_generic_member_access, portable_simd)]
 #![warn(missing_docs)]
-//! Maps high-dynamic-range linear RGB colors into a displayable range.
+//! Maps linear HDR RGB colors to display-linear RGB.
 //!
-//! Tone-mapping operators accept [`LinearRGB`] values whose components are relative linear-light
-//! levels. A component of `1.0` conventionally represents the target display's reference white.
-//! Operators return finite components in the inclusive range `0.0..=1.0`; transfer encoding and
-//! integer quantization remain the caller's responsibility.
-//!
-//! [`Clamp`] and [`ScaledClamp`] provide clipping baselines. The Reinhard family includes
-//! component-wise, luminance-preserving, white-point, Reinhard-Jodie, and [`Mobius`] variants.
-//! [`BT2446A`] applies the standardized HDR-to-SDR conversion Method A. [`Hable`], [`ACESFitted`],
-//! and [`ACESApproximate`] provide filmic curves. [`ToneMappingMethod`] enumerates the built-in
-//! operator families.
-//!
-//! [`MaxCLLEstimator`] selects either the nearest-rank 99.99th percentile of per-pixel
-//! `max(R, G, B)` or the true maximum through [`MaxCLLMode`]. Inputs determine the unit: absolute-nit
-//! inputs produce `MaxCLL` in nits, while relative inputs produce a relative light level.
-//! The maximum-component definition follows [ITU-T H.274 section 8.10]. Percentile selection uses
-//! the per-frame outlier-rejection step proposed by [Smith and Zink]; their additional p99.5 step
-//! across frames does not apply to a still image. Luminance-based Reinhard uses the distinct
-//! [`estimate_luminance_white_point`] statistic.
+//! Operators accept relative linear-light [`LinearRGB`] values and return components in
+//! `0.0..=1.0`. [`ToneMappingMethod`] lists the built-in operators. [`MaxCLLEstimator`] provides
+//! percentile and maximum per-pixel `max(R, G, B)` statistics.
 //!
 //! # Example
 //!
@@ -36,8 +21,6 @@
 //! assert!(display_linear.components().into_iter().all(|value| (0.0..=1.0).contains(&value)));
 //! ```
 //!
-//! [ITU-T H.274 section 8.10]: https://www.itu.int/epublications/publication/itu-t-h-274-v3-2023-09-versatile-supplemental-enhancement-information-messages-for-coded-video-bitstreams
-//! [Smith and Zink]: https://doi.org/10.5594/JMI.2021.3090176
 
 use multiversion::multiversion;
 use nutype::nutype;
@@ -56,13 +39,8 @@ const REC709_LUMINANCE: [f32; 3] = [0.212_6, 0.715_2, 0.072_2];
 
 /// The largest component a [`LinearRGB`] may hold.
 ///
-/// `f32::MAX.sqrt()` is 1.844e19. Fitted ACES, approximate ACES and Hable all square a component;
-/// past this bound they produce infinity, whose difference or quotient is `NaN`, and `displayable`
-/// maps `NaN` to zero, so the brightest possible pixel would render black. Saturating once at
-/// construction — rather than at each of the many places a component is read — is what keeps the
-/// scalar and batch paths bit-identical, since `luminance` and the operators would otherwise
-/// disagree about whether the bound had been applied. Real HDR content peaks around 1e5, so this
-/// is unreachable in practice.
+/// Caps components before operators that square them can overflow. The cap also keeps scalar and
+/// batch paths consistent.
 const MAX_MAPPABLE: f32 = 1.0e19;
 const MAX_CLL_LANES: usize = 8;
 
@@ -149,9 +127,9 @@ impl From<LinearRGB> for [f32; 3] {
     }
 }
 
-/// Stores linear RGB colors in separate contiguous channel planes in the interest of trivial vectorization.
+/// Stores linear RGB colors in separate contiguous channel planes for vectorized processing.
 ///
-/// All inserted colors retain the sanitization guarantees of [`LinearRGB`].
+/// Inserted colors use [`LinearRGB`] sanitization.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct LinearRGBPlanes {
     red: Vec<f32>,
@@ -301,7 +279,7 @@ pub trait ToneMapper {
     /// Maps every color in `colors` in place.
     ///
     /// The default implementation calls [`ToneMapper::map`] for each color. Built-in operators may
-    /// override this method with a batch implementation while preserving the scalar result.
+    /// override it with a batch implementation.
     ///
     /// # Examples
     ///
@@ -325,7 +303,7 @@ pub trait ToneMapper {
     /// Maps separate red, green, and blue channel planes in place.
     ///
     /// The default implementation calls [`ToneMapper::map`] for each color. Built-in operators may
-    /// override this method with a SIMD batch implementation while preserving the scalar result.
+    /// override it with a SIMD batch implementation.
     #[inline]
     fn map_planes_in_place(&self, colors: &mut LinearRGBPlanes) {
         colors.map_from(0, self);
@@ -453,6 +431,14 @@ macro_rules! define_tone_mapping_methods {
 }
 
 define_tone_mapping_methods! {
+    /// Applies ITU-R BT.2446-1 Method A.
+    #[default]
+    BT2446 {
+        label: "ITU-R BT2446-1 A",
+        mapper: BT2446A = |_, _| BT2446A,
+        uses_white_point: false,
+        uses_luminance_white_point: false,
+    }
     /// Clips each component to the display range.
     Clamp {
         label: "Clamp",
@@ -504,12 +490,16 @@ define_tone_mapping_methods! {
         uses_white_point: false,
         uses_luminance_white_point: false,
     }
-    /// Applies the Uncharted 2 filmic curve.
-    Hable {
-        label: "Hable",
-        mapper: Hable = |_, _| Hable,
+    /// Applies a generalized Reinhard based on the Mobius transform.
+    Mobius {
+        label: "Mobius",
+        mapper: Mobius = |_, luminance_white_point: LuminanceWhitePoint| {
+            let peak = luminance_white_point.luminance().max(MOBIUS_MIN_PEAK);
+            let peak = LuminanceWhitePoint::new(peak).expect("MOBIUS_MIN_PEAK is positive and finite");
+            Mobius::new(peak, 0.3).expect("peak exceeds 1.0 by construction, so 0.3 < peak")
+        },
         uses_white_point: false,
-        uses_luminance_white_point: false,
+        uses_luminance_white_point: true,
     }
     /// Applies the fitted ACES reference and display transform.
     ACESFitted {
@@ -525,34 +515,19 @@ define_tone_mapping_methods! {
         uses_white_point: false,
         uses_luminance_white_point: false,
     }
-    /// Applies ITU-R BT.2446-1 Method A.
-    #[default]
-    BT2446 {
-        label: "ITU-R BT2446-1 A",
-        mapper: BT2446A = |_, _| BT2446A,
+    /// Applies the Uncharted 2 filmic curve.
+    Hable {
+        label: "Hable",
+        mapper: Hable = |_, _| Hable,
         uses_white_point: false,
         uses_luminance_white_point: false,
     }
-    /// Applies a generalized Reinhard based on the Mobius transform.
-    Mobius {
-        label: "Mobius",
-        mapper: Mobius = |_, luminance_white_point: LuminanceWhitePoint| {
-            let peak = luminance_white_point.luminance().max(MOBIUS_MIN_PEAK);
-            let peak = LuminanceWhitePoint::new(peak).expect("MOBIUS_MIN_PEAK is positive and finite");
-            Mobius::new(peak, 0.3).expect("peak exceeds 1.0 by construction, so 0.3 < peak")
-        },
-        uses_white_point: false,
-        uses_luminance_white_point: true,
-    }
 }
 
-/// The smallest luminance white point [`resolve`](ToneMappingMethod::resolve) will pass to
-/// [`Mobius::new`]. A white point at or below display white (`1.0`) has nothing for the Mobius
-/// curve to compress; flooring it here keeps the fixed `0.3` transition always valid instead of
-/// making the estimated white point's whole positive range a source of construction failure.
+/// Minimum luminance white point passed to [`Mobius::new`].
 const MOBIUS_MIN_PEAK: f32 = 1.0 + 1e-3;
 
-/// A scene level that cannot serve as a [`WhitePoint`].
+/// Invalid scene level for a [`WhitePoint`].
 #[derive(Clone, Copy, Debug, Error, PartialEq)]
 #[error("white point level must be positive and finite, got {0}")]
 pub struct WhitePointError(f32);
@@ -720,10 +695,8 @@ impl MaxCllPixelCountError {
 
 /// Computes a selected `MaxCLL` from a stream of linear RGB colors.
 ///
-/// Percentile mode retains the brightest `floor(pixel_count / 10_000) + 1` samples. True-maximum
-/// mode retains one sample. Declaring the count up front therefore bounds memory while producing
-/// the same result as sorting all per-pixel `max(R, G, B)` values. The percentile follows the
-/// per-frame step in [Smith and Zink's outlier-rejection method].
+/// Percentile mode retains the brightest `floor(pixel_count / 10_000) + 1` samples; true-maximum
+/// mode retains one. The percentile follows [Smith and Zink's outlier-rejection method].
 ///
 /// [Smith and Zink's outlier-rejection method]: https://doi.org/10.5594/JMI.2021.3090176
 #[derive(Debug)]
@@ -765,7 +738,7 @@ impl MaxCLLEstimator {
 
     /// Includes active-image `colors` in the `MaxCLL` estimate.
     ///
-    /// This produces the same estimate as calling [`MaxCLLEstimator::observe`] in slice order.
+    /// Equivalent to calling [`MaxCLLEstimator::observe`] in slice order.
     pub fn observe_many(&mut self, colors: &[LinearRGB]) {
         self.observed = self.observed.saturating_add(colors.len());
 
@@ -802,9 +775,8 @@ impl MaxCLLEstimator {
 
     /// Folds `other` into this estimate.
     ///
-    /// Both estimators must have been created with the same pixel count and mode, so that they
-    /// retain the same number of samples; the result is then identical to observing every colour
-    /// through one estimator. This is what lets a caller split an image across worker threads.
+    /// The estimators must use the same pixel count and mode. The result matches observing both
+    /// streams through one estimator.
     ///
     /// # Panics
     ///
@@ -827,7 +799,7 @@ impl MaxCLLEstimator {
         }
     }
 
-    /// Finishes the estimate after exactly the declared number of observations.
+    /// Finishes the estimate after the declared number of observations.
     ///
     /// # Errors
     ///
@@ -1095,7 +1067,7 @@ mod tests {
 
     /// Asserts the batch paths agree with the scalar path to within a rounding step.
     ///
-    /// For operators that permit algebraic reassociation, which cannot promise bit-equality.
+    /// Operators that permit algebraic reassociation may differ by a rounding step.
     fn assert_batch_approximates_scalar(mapper: &dyn ToneMapper, inputs: &[LinearRGB]) {
         let expected: Vec<_> = inputs
             .iter()

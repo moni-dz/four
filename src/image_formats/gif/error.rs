@@ -31,8 +31,7 @@ pub enum GIFLimit {
     },
     /// Maximum decoded bytes available to one codec frame.
     ///
-    /// The `gif` crate's `MemoryLimit`/`OutOfMemory` errors carry no observed byte count, so
-    /// only the configured maximum can be reported here.
+    /// The configured maximum; the codec's memory errors provide no observed byte count.
     CodecFrameBytes(u64),
     /// Maximum accepted width or height in pixels.
     Dimensions {

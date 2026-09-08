@@ -22,8 +22,7 @@ pub enum PNGError {
 pub enum PNGLimit {
     /// Maximum memory available to the underlying codec.
     ///
-    /// The `png` crate's `DecodingError::LimitsExceeded` carries no observed byte count, so
-    /// only the configured maximum can be reported here.
+    /// The configured maximum; `DecodingError::LimitsExceeded` provides no observed byte count.
     CodecMemory(usize),
     /// Maximum decoded byte count accepted from the codec.
     DecodedBytes {

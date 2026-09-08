@@ -1,4 +1,4 @@
-//! Coalesces image-decode requests so only the latest queued job runs after the active one.
+//! Coalesces image-decode requests behind the active job.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -11,7 +11,6 @@ pub(super) struct LoadRequest(pub(super) u64);
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum LoadPurpose {
     Image,
-    HdrMetrics,
     HDROptions,
 }
 
@@ -24,7 +23,6 @@ pub(super) struct DecodeJob<T> {
 #[derive(Debug)]
 pub(super) struct DecodePayload {
     pub(super) hdr_options: HDROptions,
-    pub(super) include_hdr_metrics: bool,
     pub(super) path: Arc<Path>,
     pub(super) purpose: LoadPurpose,
 }

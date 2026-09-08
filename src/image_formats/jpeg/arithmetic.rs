@@ -38,8 +38,7 @@ impl DCConditioning {
         Self { lower, upper }
     }
 
-    /// Parses DC conditioning bounds from a DAC segment, validating the JPEG-spec `L <= U`
-    /// ordering once instead of at every call site.
+    /// Parses DC conditioning bounds from a DAC segment and validates `L <= U`.
     pub(super) fn parse(lower: u8, upper: u8) -> Result<Self> {
         if lower > upper {
             return Err(error(JPEGError::Table(
@@ -313,12 +312,11 @@ fn decode_progressive_interleaved(
     Ok(())
 }
 
-/// A block-grid column, distinct from [`BlockY`] so `coefficient_index` cannot receive them
-/// swapped.
+/// A block-grid column.
 #[derive(Clone, Copy)]
 struct BlockX(u32);
 
-/// A block-grid row, distinct from [`BlockX`] so `coefficient_index` cannot receive them swapped.
+/// A block-grid row.
 #[derive(Clone, Copy)]
 struct BlockY(u32);
 

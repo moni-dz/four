@@ -21,41 +21,31 @@ use std::simd::{
 
 /// Largest accepted image width or height, in pixels.
 ///
-/// This is a decoder-imposed safety limit, not a T.832 requirement: it keeps pixel-count and
-/// byte-size arithmetic (and the allocations they size) representable and bounded well away from
-/// pathological memory use, while remaining far larger than any real screenshot or HDR photo
-/// dimension.
+/// Decoder-imposed limit for bounded arithmetic and allocation sizes.
 const MAX_DIMENSION: usize = 16_384;
 
 /// Largest accepted total pixel count (width × height).
 ///
-/// Bounds the size of the largest allocation this crate makes (the interleaved RGBA `f32` output
-/// buffer) to a few hundred mebibytes. This is independent of [`MAX_DIMENSION`] above, which
-/// alone cannot bound a very wide-and-short or tall-and-narrow image.
+/// Bounds the interleaved RGBA `f32` output buffer independently of [`MAX_DIMENSION`].
 const MAX_PIXELS: usize = 64 * 1024 * 1024;
 
-/// Number of 4×4 lowpass blocks handed to one Rayon job by [`inverse_lowpass_blocks`].
-///
-/// Sized to amortize per-job dispatch overhead while still splitting a typical image into several
-/// jobs.
+/// Number of 4×4 lowpass blocks per Rayon job.
 const LOWPASS_BLOCKS_PER_JOB: usize = 512;
 
 /// Rayon crossover for the lowpass inverse transform.
 ///
-/// Below this many blocks, [`inverse_lowpass_blocks`] runs serially rather than opening a
-/// parallel scope that would cover fewer than four [`LOWPASS_BLOCKS_PER_JOB`] jobs.
+/// Below this count, [`inverse_lowpass_blocks`] runs serially.
 const MIN_PARALLEL_LOWPASS_BLOCKS: usize = LOWPASS_BLOCKS_PER_JOB * 4;
 
 /// Rayon crossover for highpass macroblock dequantization and prediction.
 ///
-/// Below this many macroblocks, the work runs on the calling thread instead of splitting across
-/// Rayon's pool.
+/// Below this count, the work runs on the calling thread.
 const MIN_PARALLEL_MACROBLOCKS: usize = 512;
 
 /// Rayon crossover, in pixels, shared by the final row-fill and plane-reconstruction stages
 /// (color/alpha plane reconstruction, `BGR101010`/RGBA row filling, and band combination).
 ///
-/// Below this many pixels, per-thread dispatch overhead is not worth paying.
+/// Below this count, the work runs on the calling thread.
 const MIN_PARALLEL_PIXELS: usize = 256 * 1024;
 const PIXEL_LANES: usize = 8;
 
@@ -110,10 +100,8 @@ struct IntegerImage {
 ///
 /// # Safety
 ///
-/// Every element must be written before it is read, or the vector dropped without any element
-/// being read (e.g. on an error path taken before the fill completes). `T` must have no validity
-/// invariant beyond its bit pattern: this crate only calls this with plain integer/float sample
-/// types, never with a type that has a Drop impl or restricted bit patterns.
+/// Every element must be written before it is read, or the vector must be dropped without reading
+/// it. Use only with plain integer or float sample types without restricted bit patterns or `Drop`.
 #[expect(
     unsafe_code,
     reason = "avoids zeroing output buffers this decoder immediately overwrites in full"
@@ -131,8 +119,8 @@ unsafe fn uninit_vec<T: Copy>(len: usize) -> Vec<T> {
 
 /// Validates a plane's declared dimensions and returns `(width, height, pixel_count)`.
 ///
-/// Shared by every entry point below: each rejects a width/height that doesn't fit `usize`,
-/// exceeds [`MAX_DIMENSION`], or whose product exceeds [`MAX_PIXELS`] or overflows.
+/// Rejects dimensions that do not fit `usize`, exceed [`MAX_DIMENSION`], or exceed [`MAX_PIXELS`]
+/// when multiplied.
 fn validated_dimensions(header: &ImageHeader, offset: usize) -> Result<(usize, usize, usize)> {
     let width = usize::try_from(header.width)
         .map_err(|_conversion_error| Error::new(ErrorKind::LimitExceeded("image width"), offset))?;
@@ -164,9 +152,7 @@ struct CropRect {
     bottom: usize,
 }
 
-/// Computes the crop rectangle a plane's margins carve out of its decoded `width`x`height`,
-/// rejecting an overflowing right/bottom edge. `width_message`/`height_message` let each call
-/// site keep its own `ErrorKind::LimitExceeded` wording (e.g. "alpha image width").
+/// Computes a plane's crop rectangle and rejects an overflowing right or bottom edge.
 fn crop_rect(
     margins: Margins,
     width: usize,
@@ -681,16 +667,12 @@ fn tile_grid(stream: &ParsedCodestream<'_>) -> Vec<Tile> {
 
 /// A tile's write-only view into a shared, macroblock-major reconstruction buffer.
 ///
-/// Lets `decode_dc_packet`/`decode_lowpass_packet` write each decoded macroblock directly into
-/// its final position, instead of into a tile-local buffer that then has to be copied in.
+/// Lets packet decoders write each macroblock directly to its final position.
 ///
 /// # Safety invariant
 ///
-/// Every `TileWriter` a given [`decode_tiles_into`] call hands out addresses a disjoint
-/// macroblock rectangle: `tile_grid` partitions the macroblock grid into non-overlapping tiles,
-/// so no two `TileWriter`s (even used concurrently on different threads) ever write the same
-/// element. `write_macroblock` only ever writes, never reads, so there is no read/write race
-/// either. The borrow tied to `'a` prevents a writer from outliving the buffer it points into.
+/// Each writer covers a disjoint macroblock rectangle. `write_macroblock` writes only within that
+/// rectangle, and `'a` ties the writer to the backing buffer.
 #[derive(Clone, Copy)]
 struct TileWriter<'a> {
     base: *mut i32,
@@ -737,8 +719,7 @@ impl TileWriter<'_> {
 ///
 /// # Safety
 ///
-/// Callers must only dereference it through a [`TileWriter`], whose own safety invariant
-/// establishes disjoint access.
+/// Dereference only through a [`TileWriter`], which provides disjoint access.
 struct SharedBase(*mut i32);
 
 #[expect(
@@ -749,9 +730,7 @@ struct SharedBase(*mut i32);
 unsafe impl Sync for SharedBase {}
 
 impl SharedBase {
-    /// Reads the pointer through a method call so a closure capturing `self.get()` captures the
-    /// whole `SharedBase` (and its `Sync` impl), not just the `*mut i32` field — Rust's disjoint
-    /// closure captures would otherwise capture the bare, non-`Sync` pointer field directly.
+    /// Returns the pointer through a method call so closures capture `SharedBase`.
     fn get(&self) -> *mut i32 {
         self.0
     }
@@ -760,8 +739,8 @@ impl SharedBase {
 /// Decodes every tile packet directly into its macroblock rectangle of `values` (`stride` values
 /// per macroblock), in parallel for large images.
 ///
-/// Tile packets are independent bitstreams whose prediction resets at tile edges, so tiles can
-/// decode in any order; each tile's [`TileWriter`] only ever touches its own rectangle.
+/// Tile packets have independent bitstreams and prediction resets. Each [`TileWriter`] covers one
+/// tile rectangle.
 fn decode_tiles_into(
     stream: &ParsedCodestream<'_>,
     values: &mut [i32],
@@ -1481,9 +1460,7 @@ const INVERSE_TRANSFORM_PERMUTATION: [usize; 16] =
 /// Builds the permuted `values` the transform stages expect, reading coefficient `input` from
 /// `source(input)`.
 ///
-/// A `source` closure lets `combine_and_transform_band` build `values` directly from the DC
-/// coefficient and the highpass block, instead of first assembling a combined `[i32; 16]` just to
-/// have this function immediately copy out of it again.
+/// `source` supplies values from the DC coefficient and highpass block.
 #[inline]
 fn permute_coefficients(source: impl Fn(usize) -> i32) -> [i64; 16] {
     let mut values = [0_i64; 16];
@@ -2290,9 +2267,7 @@ fn decode_flexbits_packet(
 
 /// The eight adaptive VLC tables the lowpass and highpass coefficient decoders share.
 ///
-/// Both bands read a first index, then a run of subsequent indices, then absolute levels, using
-/// the same tables and the same adaptation schedule. Holding them in one place keeps that schedule
-/// from drifting between the two.
+/// Both bands use the same tables and adaptation schedule.
 #[derive(Clone, Debug)]
 struct BandVLC {
     first_luma: AdaptiveVLC,
@@ -2401,9 +2376,7 @@ const HIGHPASS_MESSAGES: BandMessages = BandMessages {
 
 /// Decodes one sixteen-coefficient block from either frequency band.
 ///
-/// The lowpass and highpass decoders were sixty-six line-for-line identical lines apart from two
-/// error strings and the choice of scan table. `scan` is taken separately from `vlc` so a caller
-/// can borrow the two disjoint fields of its own context.
+/// Decodes either band with the selected scan table and error messages.
 fn decode_band_block(
     reader: &mut BitReader<'_>,
     vlc: &mut BandVLC,

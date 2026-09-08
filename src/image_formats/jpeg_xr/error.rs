@@ -15,14 +15,13 @@ pub enum JPEGXRError {
     Output(&'static str),
     /// The input does not begin with a JPEG XR file signature.
     Signature,
-    /// The source pixel representation cannot be normalized to RGBA8.
+    /// Source pixel representation is unsupported for RGBA8 normalization.
     Unsupported(String),
 }
 
 /// A bounded JPEG XR resource whose configured maximum was exceeded.
 ///
-/// `actual` is `None` when the codec rejected the input before a precise measurement was
-/// available (it reports only which bound was crossed, not by how much).
+/// `actual` is `None` when the codec reports a bound without the measured value.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum JPEGXRLimit {
     /// Maximum accepted width or height in pixels.

@@ -29,14 +29,13 @@ const LOG2_RHO_SDR: f32 = 2.510_191_7;
 
 /// Applies BT.2446 HDR-to-SDR conversion Method A.
 ///
-/// Method A converts BT.2020 display-linear HDR mastered at 1,000 cd/m^2 to display-linear SDR
-/// targeting 100 cd/m^2. In this crate's target-relative representation, an input component of
-/// `10.0` represents the HDR mastering peak and an output component of `1.0` represents the SDR
-/// target peak. Inputs outside the specified full range are clipped before conversion.
+/// Method A converts BT.2020 display-linear HDR mastered at 1,000 cd/m^2 to SDR at 100 cd/m^2. In
+/// this crate's target-relative representation, input `10.0` is the HDR peak and output `1.0` is
+/// the SDR peak. Inputs outside the specified range are clipped.
 ///
-/// The conversion follows Tables 2 and 3 of Report ITU-R BT.2446-1: it applies the `2.4` transfer
-/// function, maps BT.2020 luma through the three-stage perceptual knee, corrects chroma for the Hunt
-/// effect, reconstructs BT.2020 RGB, and returns display-linear components.
+/// The conversion applies the `2.4` transfer function, maps BT.2020 luma through the perceptual
+/// knee, corrects chroma for the Hunt effect, reconstructs BT.2020 RGB, and returns display-linear
+/// components.
 ///
 /// See [Report ITU-R BT.2446-1], Tables 2 and 3.
 ///
@@ -45,8 +44,7 @@ const LOG2_RHO_SDR: f32 = 2.510_191_7;
 /// ```
 /// use tonemapping::{BT2446A, LinearRGB, ToneMapper};
 ///
-/// // The mastering peak reaches display white. The BT.2020 luma weights do not sum to exactly
-/// // one in f32, so the result lands within a rounding step of it rather than on it.
+/// // The mastering peak maps to display white within floating-point rounding.
 /// let display_linear = BT2446A.map(LinearRGB::new([10.0; 3]));
 /// for component in display_linear.components() {
 ///     assert!((component - 1.0).abs() < 1.0e-6);

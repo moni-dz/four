@@ -12,9 +12,8 @@ pub type Result<T> = exn::Result<T, JPEGError>;
 
 /// A decoder failure classified by the JPEG grammar section that rejected the input.
 ///
-/// Keeping the classification in the type lets callers choose a recovery policy without parsing
-/// display text. Handwritten-parser failures use static details or dedicated values, while
-/// maintained-codec failures retain the codec's owned diagnostic text.
+/// The type preserves the failure category and avoids parsing display text. Handwritten-parser
+/// failures use static details or dedicated values; maintained-codec failures retain their text.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum JPEGError {
     /// An integer calculation exceeded its representable range.
@@ -58,7 +57,7 @@ pub enum JPEGError {
         /// The marker code found without its `0xFF` prefix.
         found: u8,
     },
-    /// The input uses a valid JPEG feature outside this decoder's scope.
+    /// The input uses a valid but unsupported JPEG feature.
     Unsupported(UnsupportedJPEG),
 }
 
@@ -111,7 +110,7 @@ pub enum JPEGTableKind {
     Quantization,
 }
 
-/// A valid JPEG feature that this deliberately small decoder does not implement.
+/// A valid JPEG feature not implemented by this decoder.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnsupportedJPEG {
     /// Adobe APP14 requested an unsupported color transform.
@@ -157,7 +156,7 @@ impl fmt::Display for JPEGError {
 
 impl std::error::Error for JPEGError {}
 
-/// Raises a leaf error at its validation site so `exn` records the useful source location.
+/// Creates a leaf error at its validation site.
 #[track_caller]
 pub(super) fn error(error: JPEGError) -> Error {
     invariant!(

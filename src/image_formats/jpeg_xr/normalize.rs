@@ -19,7 +19,7 @@ use super::{
     PARALLEL_PIXELS_PER_JOB, Result, SRGB_LANES, error, round_clamp_u8,
 };
 
-/// Scales scRGB into the fixed unit each tone mapper expects; only `BT2446` needs rescaling.
+/// Scales scRGB into the unit expected by the tone mapper.
 fn hdr_color_scale(method: ToneMappingMethod) -> f32 {
     if method == ToneMappingMethod::BT2446 {
         BT2446_INPUT_SCALE

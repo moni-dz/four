@@ -1,15 +1,8 @@
 //! Decodes JPEG XR images.
 //!
-//! [`Decoder`] validates the Annex A tag container and embedded T.832 codestream headers before
-//! coefficient decoding begins. Input is borrowed, so inspection does not copy compressed data.
-//! Pixel reconstruction supports the native Windows HDR screenshot profiles for packed
-//! `BGR101010` and `RGBA128Float` pixels. Other valid profiles return a precise error where
-//! [`Error::is_unsupported`] returns `true`.
-//!
-//! Codestream parsing and coefficient decoding are safe Rust. A handful of output-buffer
-//! allocations skip zero-initializing memory this crate immediately overwrites in full; each is
-//! `unsafe`, `#[expect(unsafe_code, ...)]`-annotated, and carries a coverage proof in its
-//! `SAFETY` comment.
+//! [`Decoder`] validates the Annex A container and T.832 codestream before coefficient decoding.
+//! Input is borrowed. Pixel reconstruction supports packed `BGR101010` and `RGBA128Float`; other
+//! valid profiles return an error classified by [`Error::is_unsupported`].
 
 #![feature(portable_simd)]
 #![expect(
@@ -62,13 +55,11 @@ pub struct Decoder<'a> {
 impl<'a> Decoder<'a> {
     /// Parses a JPEG XR file from `bytes`.
     ///
-    /// Parsing validates container bounds, required tags, codestream headers, image-plane headers,
-    /// and cross-layer metadata.
+    /// Validates container bounds, required tags, codestream and image-plane headers, and metadata.
     ///
     /// # Errors
     ///
-    /// Returns [`Error`] when input is truncated, malformed, unsupported, or internally
-    /// inconsistent.
+    /// Returns [`Error`] for truncated, malformed, unsupported, or inconsistent input.
     pub fn new(bytes: &'a [u8]) -> Result<Self> {
         let container = container::parse(bytes)?;
         let primary = codestream::parse(container.primary)?;
@@ -111,8 +102,7 @@ impl<'a> Decoder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error`] when coefficient data is malformed or the image is outside the currently
-    /// supported unscaled frequency-mode, YUV444, no-overlap `RGBA128Float` profile.
+    /// Returns [`Error`] for malformed coefficients or unsupported image features.
     pub fn decode_rgba_f32(&self) -> Result<RGBAF32Image> {
         if self.info.pixel_format != PixelFormat::RGBA128_FLOAT {
             return Err(Error::new(
@@ -151,8 +141,7 @@ impl<'a> Decoder<'a> {
     ///
     /// # Errors
     ///
-    /// Returns [`Error`] when coefficient data is malformed or the image is outside the currently
-    /// supported frequency-mode, YUV444, no-overlap `32bppBGR101010` profile.
+    /// Returns [`Error`] for malformed coefficients or unsupported image features.
     pub fn decode_bgr101010(&self) -> Result<BGR101010Image> {
         if self.info.pixel_format != PixelFormat::BGR101010 {
             return Err(Error::new(

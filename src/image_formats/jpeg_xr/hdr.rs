@@ -128,9 +128,7 @@ pub(super) struct AnalysisRequest {
 
 /// The measurements one worker gathers from its share of the image.
 ///
-/// Every field merges associatively, which is what lets the analysis pass run in parallel: each
-/// worker builds its own totals over a row group, and the results fold together into the answer
-/// the sequential pass would have produced.
+/// Fields merge associatively, allowing row groups to run in parallel.
 #[derive(Debug)]
 pub(super) struct AnalysisTotals {
     pub(super) accumulator: Option<HDRMetricAccumulator>,
@@ -296,7 +294,7 @@ impl HDRAnalysis {
 
 /// Gathers mergeable HDR measurements over parallel row groups.
 ///
-/// Jobs are sized in pixels so formats use comparable row-group sizes.
+/// Jobs are sized in pixels for comparable row-group sizes across formats.
 fn compute_totals(
     source: &[u8],
     row_stride: usize,
@@ -434,9 +432,8 @@ impl HDRMetricAccumulator {
 
     /// Folds `other` into these metrics.
     ///
-    /// Counts add, extremes take the wider bound, and the luminance sum adds. Summation order
-    /// changes with the number of workers, so the average luminance can move by a rounding step
-    /// between runs on differently sized machines.
+    /// Counts and sums add; extrema take the wider bound. Average luminance can vary by a rounding
+    /// step with worker count.
     fn merge(&mut self, other: Self) {
         self.pixel_count += other.pixel_count;
         self.luminance_sum_nits += other.luminance_sum_nits;

@@ -31,8 +31,7 @@ pub(crate) fn map_colors(
 
 /// Runs `batch` over the complete lane groups of `colors`, then `mapper` over the remainder.
 ///
-/// Every operator needs this same prologue, and computing the boundary after `batch` has already
-/// run would silently re-map the tail. Keeping it in one place makes that mistake unavailable.
+/// Computes the complete lane groups and scalar tail for a batch operation.
 #[inline]
 pub(crate) fn map_planes(
     colors: &mut LinearRGBPlanes,

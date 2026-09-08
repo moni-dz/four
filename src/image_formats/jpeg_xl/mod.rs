@@ -38,8 +38,8 @@ pub fn has_signature(bytes: &[u8]) -> bool {
 ///
 /// # Errors
 ///
-/// Returns [`JPEGXLError`] when the JPEG XL data is malformed, has no displayable frame, exceeds a
-/// resource bound, or cannot be rendered into the shared RGBA8 representation.
+/// Returns [`JPEGXLError`] for malformed input, missing displayable frames, resource-limit
+/// failures, and unsupported output.
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     if !has_signature(bytes) {
         return Err(error(JPEGXLError::Signature));
