@@ -639,12 +639,12 @@ pub enum MaxCLLMode {
 /// The level uses the same relative or absolute unit as the linear RGB input. It is selected from
 /// per-pixel `max(R, G, B)` values according to a [`MaxCLLMode`].
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct MaxCll {
+pub struct MaxCLL {
     level: f32,
     channel: ColorChannel,
 }
 
-impl MaxCll {
+impl MaxCLL {
     /// Returns the selected content level.
     #[must_use]
     pub const fn level(self) -> f32 {
@@ -667,13 +667,13 @@ impl MaxCll {
 /// Reports a mismatch between declared and observed `MaxCLL` pixel counts.
 #[derive(Debug, Error)]
 #[error("MaxCLL estimator expected {expected} pixels but observed {observed}")]
-pub struct MaxCllPixelCountError {
+pub struct MaxCLLPixelCountError {
     expected: usize,
     observed: usize,
     backtrace: Backtrace,
 }
 
-impl MaxCllPixelCountError {
+impl MaxCLLPixelCountError {
     /// Returns the pixel count declared when the estimator was created.
     #[must_use]
     pub const fn expected(&self) -> usize {
@@ -803,11 +803,11 @@ impl MaxCLLEstimator {
     ///
     /// # Errors
     ///
-    /// Returns [`MaxCllPixelCountError`] when the observed pixel count differs from the count passed
+    /// Returns [`MaxCLLPixelCountError`] when the observed pixel count differs from the count passed
     /// when constructing the estimator.
-    pub fn finish(self) -> Result<MaxCll, MaxCllPixelCountError> {
+    pub fn finish(self) -> Result<MaxCLL, MaxCLLPixelCountError> {
         if self.observed != self.expected.get() {
-            return Err(MaxCllPixelCountError {
+            return Err(MaxCLLPixelCountError {
                 expected: self.expected.get(),
                 observed: self.observed,
                 backtrace: Backtrace::capture(),
@@ -821,7 +821,7 @@ impl MaxCLLEstimator {
             },
             |peak| peak.0,
         );
-        Ok(MaxCll {
+        Ok(MaxCLL {
             level: peak.level,
             channel: peak.channel,
         })
@@ -947,13 +947,13 @@ pub use clamp::{Clamp, ScaledClamp};
 #[doc(inline)]
 pub use hable::Hable;
 #[doc(inline)]
+pub use math::{exp2, log2};
+#[doc(inline)]
 pub use reinhard::{
     ExtendedLuminanceReinhard, ExtendedReinhard, LuminanceReinhard, LuminanceWhitePoint,
     LuminanceWhitePointCountError, LuminanceWhitePointEstimator, Mobius, MobiusError, Reinhard,
     ReinhardJodie, estimate_luminance_white_point,
 };
-#[doc(inline)]
-pub use math::{exp2, log2};
 
 #[inline]
 fn sanitize_component(component: f32) -> f32 {
@@ -1091,7 +1091,7 @@ mod tests {
         }
     }
 
-    fn estimate_max_cll_scalarly(colors: &[LinearRGB]) -> MaxCll {
+    fn estimate_max_cll_scalarly(colors: &[LinearRGB]) -> MaxCLL {
         let mut estimator = MaxCLLEstimator::new(
             NonZeroUsize::new(colors.len()).expect("test MaxCLL input is nonempty"),
         );

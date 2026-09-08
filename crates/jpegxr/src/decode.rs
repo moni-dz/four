@@ -1161,8 +1161,7 @@ fn reconstruct(stream: &ParsedCodestream<'_>) -> Result<IntegerImage> {
     let lowpass = decode_lowpass(stream)?;
     let mut lowpass = predict_lowpass(stream, &dc, lowpass)?;
 
-    let mut highpass = decode_highpass(stream, &lowpass)?;
-    dequantize_and_predict_highpass(stream, &lowpass, &mut highpass)?;
+    let highpass = decode_highpass(stream, &lowpass)?;
 
     let (blocks, remainder) = lowpass.values.as_chunks_mut::<16>();
     debug_assert_eq!(remainder, []);
@@ -1214,66 +1213,6 @@ fn inverse_lowpass_blocks(
                 })?;
             }
         }
-    }
-
-    Ok(())
-}
-
-fn dequantize_and_predict_highpass(
-    stream: &ParsedCodestream<'_>,
-    lowpass: &PredictedLowpass,
-    highpass: &mut HighpassImage,
-) -> Result<()> {
-    let quantization = stream
-        .primary_plane
-        .highpass_quantization
-        .as_ref()
-        .ok_or_else(|| {
-            Error::new(
-                ErrorKind::Unsupported("per-tile highpass quantization"),
-                stream.offset,
-            )
-        })?;
-
-    let macroblock_count = highpass
-        .macroblock_width
-        .checked_mul(highpass.macroblock_height)
-        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded("macroblock count"), stream.offset))?;
-
-    let factors = (0..highpass.components)
-        .map(|component| {
-            quant_map(
-                quantization.components[component],
-                stream.primary_plane.scaled,
-                1,
-            )
-        })
-        .collect::<Vec<_>>();
-
-    let macroblock_len = highpass.components * 256;
-
-    let process = |macroblock: usize, values: &mut [i32]| {
-        dequantize_and_predict_highpass_macroblock(
-            values,
-            &factors,
-            lowpass.highpass_modes[macroblock],
-            stream.offset,
-        )
-    };
-
-    if macroblock_count >= MIN_PARALLEL_MACROBLOCKS {
-        highpass
-            .values
-            .par_chunks_mut(macroblock_len)
-            .with_min_len(32)
-            .enumerate()
-            .try_for_each(|(macroblock, values)| process(macroblock, values))?;
-    } else {
-        highpass
-            .values
-            .chunks_mut(macroblock_len)
-            .enumerate()
-            .try_for_each(|(macroblock, values)| process(macroblock, values))?;
     }
 
     Ok(())
@@ -1382,10 +1321,39 @@ fn combine_and_transform(
         values: unsafe { uninit_vec(value_count) },
     };
 
+    let quantization = stream
+        .primary_plane
+        .highpass_quantization
+        .as_ref()
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unsupported("per-tile highpass quantization"),
+                stream.offset,
+            )
+        })?;
+
+    let factors = (0..highpass.components)
+        .map(|component| {
+            quant_map(
+                quantization.components[component],
+                stream.primary_plane.scaled,
+                1,
+            )
+        })
+        .collect::<Vec<_>>();
+
     let band_len = width * 16;
 
     let fill_band = |band_index, band: &mut [i32]| {
-        combine_and_transform_band(band, band_index, width, lowpass, highpass, stream.offset)
+        combine_and_transform_band(
+            band,
+            band_index,
+            width,
+            lowpass,
+            highpass,
+            &factors,
+            stream.offset,
+        )
     };
 
     if value_count >= MIN_PARALLEL_PIXELS {
@@ -1412,20 +1380,36 @@ fn combine_and_transform_band(
     width: usize,
     lowpass: &PredictedLowpass,
     highpass: &HighpassImage,
+    factors: &[i32],
     offset: usize,
 ) -> Result<()> {
     let macroblock_y = band_index % lowpass.macroblock_height;
     let component = band_index / lowpass.macroblock_height;
+    let factor = [factors[component]];
 
     for macroblock_x in 0..lowpass.macroblock_width {
         let macroblock = macroblock_y * lowpass.macroblock_width + macroblock_x;
         let lowpass_start = (macroblock * lowpass.components + component) * 16;
         let highpass_start = (macroblock * highpass.components + component) * 256;
 
+        // Dequantizing and predicting this macroblock's highpass coefficients here, right
+        // before they're consumed by the transform below, avoids a second full pass over the
+        // (large) highpass coefficient buffer. Prediction only ever references an
+        // already-visited block within this same 256-value scratch (block-1 or block-4), so
+        // this per-macroblock buffer plus the ascending `block` loop below preserve the
+        // dependency order `dequantize_and_predict_highpass_macroblock` relied on.
+        let mut scratch = [0_i32; 256];
+        scratch.copy_from_slice(&highpass.values[highpass_start..highpass_start + 256]);
+        dequantize_and_predict_highpass_macroblock(
+            &mut scratch,
+            &factor,
+            lowpass.highpass_modes[macroblock],
+            offset,
+        )?;
+
         for block in 0_usize..16 {
             let dc = lowpass.values[lowpass_start + block];
-            let source =
-                &highpass.values[highpass_start + block * 16..highpass_start + (block + 1) * 16];
+            let source = &scratch[block * 16..(block + 1) * 16];
 
             // `source[0]` is highpass's own placeholder DC; substitute the real lowpass value.
             let values = permute_coefficients(|input| if input == 0 { dc } else { source[input] });

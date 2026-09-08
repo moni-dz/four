@@ -16,12 +16,14 @@ use gpui::{
 };
 use tonemapping::ToneMappingMethod;
 
-use decode_scheduler::{DecodeJob, DecodePayload, LatestLoadCoordinator, LoadPurpose, LoadRequest};
+use decode_scheduler::{
+    DecodeJob, DecodePayload, DecodeSource, LatestLoadCoordinator, LoadPurpose, LoadRequest,
+};
 use geometry::zoom_to_cursor_pan;
 
 use super::image_loader::{
     DisplayedImage, HDROptions, LoadError, LoadResult, LoadedImage, format_load_error, load_image,
-    load_image_with,
+    load_image_with, retint_jpeg_xr,
 };
 
 const CONTEXT_MENU_ITEM_HEIGHT: f32 = 36.0;
@@ -367,6 +369,7 @@ impl Root {
                             hdr_options: root.preferred_hdr_options,
                             path: Arc::from(path),
                             purpose: LoadPurpose::Image,
+                            source: DecodeSource::File,
                         },
                     },
                     window,
@@ -396,11 +399,19 @@ impl Root {
             hdr_options,
             path,
             purpose,
+            source,
         } = payload;
 
         cx.spawn_in(window, async move |root, cx| {
             let result = cx
-                .background_spawn(async move { load_image_with(path.as_ref(), hdr_options) })
+                .background_spawn(async move {
+                    match source {
+                        DecodeSource::File => load_image_with(path.as_ref(), hdr_options),
+                        DecodeSource::RetainedJpegXr(native) => {
+                            retint_jpeg_xr(&native, path.as_ref(), hdr_options)
+                        }
+                    }
+                })
                 .await;
 
             let _ = root.update_in(cx, move |root, window, cx| {
@@ -502,11 +513,17 @@ impl Root {
     ) {
         self.dismiss_menus();
 
-        let Some((active_options, source_path)) = self.viewer.displayed().and_then(|displayed| {
-            displayed
-                .hdr_options
-                .map(|active| (active, Arc::clone(&displayed.source_path)))
-        }) else {
+        let Some((active_options, source_path, native_jpeg_xr)) =
+            self.viewer.displayed().and_then(|displayed| {
+                displayed.hdr_options.map(|active| {
+                    (
+                        active,
+                        Arc::clone(&displayed.source_path),
+                        displayed.native_jpeg_xr.clone(),
+                    )
+                })
+            })
+        else {
             cx.notify();
             return;
         };
@@ -516,6 +533,11 @@ impl Root {
             return;
         };
 
+        let source = match native_jpeg_xr {
+            Some(native) => DecodeSource::RetainedJpegXr(native),
+            None => DecodeSource::File,
+        };
+
         self.schedule_decode(
             DecodeJob {
                 request,
@@ -523,6 +545,7 @@ impl Root {
                     hdr_options: options,
                     path: source_path,
                     purpose: LoadPurpose::HDROptions,
+                    source,
                 },
             },
             window,
@@ -628,6 +651,7 @@ mod tests {
                 height: 1,
                 source_path: Arc::from(Path::new("test.jxr")),
                 hdr_options: Some(options),
+                native_jpeg_xr: None,
             },
             status: "test.jxr".into(),
         })

@@ -373,6 +373,44 @@ pub fn decode_with_metadata_and_options(
     bytes: &[u8],
     options: DecodeOptions,
 ) -> Result<DecodedJPEGXR> {
+    tonemap_native(&decode_native(bytes)?, options)
+}
+
+/// A JPEG XR image decoded to its native pixel representation, before HDR-to-SDR tone mapping.
+///
+/// Entropy decoding dominates JPEG XR's cost; retain this and call [`tonemap_native`] again with
+/// different [`DecodeOptions`] to re-tone-map without repeating it.
+#[derive(Debug)]
+pub struct NativeJPEGXR {
+    width: u32,
+    height: u32,
+    row_stride: usize,
+    layout: PixelLayout,
+    pixels: NativePixels,
+}
+
+#[derive(Debug)]
+enum NativePixels {
+    BGR101010(::jpegxr::BGR101010Image),
+    RGBAF32(::jpegxr::RGBAF32Image),
+}
+
+impl NativePixels {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::BGR101010(image) => zerocopy::IntoBytes::as_bytes(image.pixels()),
+            Self::RGBAF32(image) => zerocopy::IntoBytes::as_bytes(image.pixels()),
+        }
+    }
+}
+
+/// Decodes JPEG XR pixels to their native representation, without HDR-to-SDR tone mapping.
+///
+/// # Errors
+///
+/// Returns [`JPEGXRError`] for malformed input, resource-limit failures, and unsupported pixel
+/// representations.
+pub fn decode_native(bytes: &[u8]) -> Result<NativeJPEGXR> {
     if !has_signature(bytes) {
         return Err(error(JPEGXRError::Signature));
     }
@@ -416,31 +454,59 @@ pub fn decode_with_metadata_and_options(
         )));
     }
 
-    let normalized = match pixel_format {
+    let pixels = match pixel_format {
         ::jpegxr::PixelFormat::BGR101010 => {
             let native_image = decoder
                 .decode_bgr101010()
                 .map_err(|source| codec_error(&source))?;
-            let source = zerocopy::IntoBytes::as_bytes(native_image.pixels());
 
-            invariant_eq!(source.len(), source_len);
-            normalize(source, width, height, row_stride, layout, options)?
+            invariant_eq!(
+                zerocopy::IntoBytes::as_bytes(native_image.pixels()).len(),
+                source_len
+            );
+            NativePixels::BGR101010(native_image)
         }
         ::jpegxr::PixelFormat::RGBA128_FLOAT => {
             let native_image = decoder
                 .decode_rgba_f32()
                 .map_err(|source| codec_error(&source))?;
-            let source = zerocopy::IntoBytes::as_bytes(native_image.pixels());
 
-            invariant_eq!(source.len(), source_len);
-            normalize(source, width, height, row_stride, layout, options)?
+            invariant_eq!(
+                zerocopy::IntoBytes::as_bytes(native_image.pixels()).len(),
+                source_len
+            );
+            NativePixels::RGBAF32(native_image)
         }
         _ => unreachable!("pixel format validated when selecting its layout"),
     };
-    let metadata = JPEGXRMetadata::new(layout, normalized.hdr_metrics);
+
+    Ok(NativeJPEGXR {
+        width,
+        height,
+        row_stride,
+        layout,
+        pixels,
+    })
+}
+
+/// Tone-maps an already-decoded native JPEG XR image to SDR RGBA8 using `options`.
+///
+/// # Errors
+///
+/// Returns [`JPEGXRError`] for unsupported pixel representations surfaced during normalization.
+pub fn tonemap_native(native: &NativeJPEGXR, options: DecodeOptions) -> Result<DecodedJPEGXR> {
+    let normalized = normalize(
+        native.pixels.as_bytes(),
+        native.width,
+        native.height,
+        native.row_stride,
+        native.layout,
+        options,
+    )?;
+    let metadata = JPEGXRMetadata::new(native.layout, normalized.hdr_metrics);
 
     Ok(DecodedJPEGXR {
-        image: DecodedImage::new(width, height, normalized.rgba),
+        image: DecodedImage::new(native.width, native.height, normalized.rgba),
         metadata,
     })
 }

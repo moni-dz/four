@@ -334,6 +334,10 @@ fn normalize_pixel<T: Copy>(
 
 fn scale_sample(value: u64, bit_depth: BitDepth) -> u8 {
     let bit_depth = bit_depth.into_inner();
+    if bit_depth == 8 {
+        return u8::try_from(value).unwrap_or(u8::MAX);
+    }
+
     let max = if bit_depth == 64 {
         u64::MAX
     } else {
@@ -367,6 +371,17 @@ fn codec_error(source: ::tiff::TiffError, attempted_bytes: Option<u64>) -> Error
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn eight_bit_scaling_preserves_samples_and_saturates() {
+        let depth = BitDepth::try_new(8).unwrap();
+        for value in 0..=u8::MAX {
+            assert_eq!(scale_sample(u64::from(value), depth), value);
+        }
+        for value in [256, u64::from(u16::MAX), u64::MAX] {
+            assert_eq!(scale_sample(value, depth), u8::MAX);
+        }
+    }
 
     #[test]
     fn parallel_normalization_preserves_rgba_pixel_order() {

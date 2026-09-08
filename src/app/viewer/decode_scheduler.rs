@@ -3,6 +3,8 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use four::jpeg_xr;
+
 use super::HDROptions;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -12,6 +14,15 @@ pub(super) struct LoadRequest(pub(super) u64);
 pub(super) enum LoadPurpose {
     Image,
     HDROptions,
+}
+
+/// Where a decode job reads its source pixels from.
+#[derive(Debug)]
+pub(super) enum DecodeSource {
+    /// Read and decode the file at `DecodePayload::path` from scratch.
+    File,
+    /// Re-tone-map an already-decoded native JPEG XR image; no file I/O or entropy decode.
+    RetainedJpegXr(Arc<jpeg_xr::NativeJPEGXR>),
 }
 
 #[derive(Debug)]
@@ -25,6 +36,7 @@ pub(super) struct DecodePayload {
     pub(super) hdr_options: HDROptions,
     pub(super) path: Arc<Path>,
     pub(super) purpose: LoadPurpose,
+    pub(super) source: DecodeSource,
 }
 
 // Decoders are synchronous, so an active job must finish. Keeping only the latest waiting job

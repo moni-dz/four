@@ -14,10 +14,7 @@ use crate::simd::F32x8;
 ///
 /// Falls back to a plain divide off x86_64 or without AVX at runtime.
 #[inline]
-#[expect(
-    unsafe_code,
-    reason = "AVX raw intrinsics"
-)]
+#[expect(unsafe_code, reason = "AVX raw intrinsics")]
 pub(crate) fn recip(x: F32x8) -> F32x8 {
     #[cfg(target_arch = "x86_64")]
     if is_x86_feature_detected!("avx") {
@@ -30,10 +27,7 @@ pub(crate) fn recip(x: F32x8) -> F32x8 {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx")]
-#[expect(
-    unsafe_code,
-    reason = "AVX raw intrinsics"
-)]
+#[expect(unsafe_code, reason = "AVX raw intrinsics")]
 unsafe fn recip_avx(x: F32x8) -> F32x8 {
     use std::arch::x86_64::{
         _mm256_loadu_ps, _mm256_mul_ps, _mm256_rcp_ps, _mm256_set1_ps, _mm256_storeu_ps,
@@ -153,7 +147,7 @@ pub fn log2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
     let result = value
         .simd_eq(Simd::splat(f32::INFINITY))
         .select(Simd::splat(f32::INFINITY), result);
-    
+
     value.is_nan().select(Simd::splat(f32::NAN), result)
 }
 

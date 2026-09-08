@@ -84,13 +84,14 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     }
 
     let used = output.buffer_size();
-    let samples = pixel_buffer.get(..used).ok_or_else(|| {
-        error(PNGError::Output(
+    if used > pixel_buffer.len() {
+        return Err(error(PNGError::Output(
             "PNG codec reported an invalid output length",
-        ))
-    })?;
+        )));
+    }
+    pixel_buffer.truncate(used);
 
-    let rgba = normalize_rgba(samples, output.color_type, width, height)?;
+    let rgba = normalize_rgba(pixel_buffer, output.color_type, width, height)?;
     Ok(DecodedImage::new(width, height, rgba))
 }
 
@@ -128,7 +129,7 @@ fn rgba_size(width: u32, height: u32) -> Result<usize> {
 }
 
 fn normalize_rgba(
-    samples: &[u8],
+    samples: Vec<u8>,
     color_type: ColorType,
     width: u32,
     height: u32,
@@ -159,7 +160,7 @@ fn normalize_rgba(
     }
 
     if color_type == ColorType::Rgba {
-        return Ok(samples.to_vec());
+        return Ok(samples);
     }
 
     let mut rgba = Vec::with_capacity(pixel_count * 4);
@@ -198,5 +199,22 @@ fn codec_error(source: ::png::DecodingError) -> Error {
         )))
     } else {
         error(PNGError::Codec(Box::new(source)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rgba_normalization_reuses_the_decoded_buffer() {
+        let samples = vec![10, 20, 30, 40, 50, 60, 70, 80];
+        let allocation = samples.as_ptr();
+        let rgba = normalize_rgba(samples, ColorType::Rgba, 2, 1).unwrap();
+
+        assert_eq!(rgba.as_ptr(), allocation);
+        assert_eq!(rgba, [10, 20, 30, 40, 50, 60, 70, 80]);
+        assert!(normalize_rgba(vec![0; 7], ColorType::Rgba, 2, 1).is_err());
+        assert!(normalize_rgba(vec![0; 9], ColorType::Rgba, 2, 1).is_err());
     }
 }

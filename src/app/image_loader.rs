@@ -77,6 +77,9 @@ pub(super) struct DisplayedImage {
     pub(super) height: u32,
     pub(super) source_path: Arc<Path>,
     pub(super) hdr_options: Option<HDROptions>,
+    /// The native (pre-tone-mapping) decode, retained so [`retint_jpeg_xr`] can apply a different
+    /// tone-mapping method without re-running JPEG XR's entropy decode.
+    pub(super) native_jpeg_xr: Option<Arc<jpeg_xr::NativeJPEGXR>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -174,22 +177,17 @@ impl SourceFormat {
                 .or_raise(|| image_decode_error(path))
                 .map(DecodedSource::standard),
 
-            Self::JPEGXR => jpeg_xr::decode_with_metadata_and_options(
-                bytes,
-                jpeg_xr::DecodeOptions::new(
-                    hdr_options.tone_mapping(),
-                    MaxCLLMode::Percentile99_99,
-                )
-                .with_hdr_metrics(false),
-            )
-            .or_raise(|| image_decode_error(path))
-            .map(|decoded| {
+            Self::JPEGXR => {
+                let native = jpeg_xr::decode_native(bytes).or_raise(|| image_decode_error(path))?;
+                let decoded = jpeg_xr::tonemap_native(&native, jpeg_xr_options(hdr_options))
+                    .or_raise(|| image_decode_error(path))?;
                 let metadata = decoded.metadata();
-                DecodedSource {
+                Ok(DecodedSource {
                     image: decoded.into_image(),
                     jpeg_xr_metadata: Some(metadata),
-                }
-            }),
+                    native_jpeg_xr: Some(Arc::new(native)),
+                })
+            }
 
             Self::PNG => png::decode(bytes)
                 .or_raise(|| image_decode_error(path))
@@ -205,6 +203,7 @@ impl SourceFormat {
 struct DecodedSource {
     image: DecodedImage,
     jpeg_xr_metadata: Option<jpeg_xr::JPEGXRMetadata>,
+    native_jpeg_xr: Option<Arc<jpeg_xr::NativeJPEGXR>>,
 }
 
 impl DecodedSource {
@@ -212,8 +211,14 @@ impl DecodedSource {
         Self {
             image,
             jpeg_xr_metadata: None,
+            native_jpeg_xr: None,
         }
     }
+}
+
+fn jpeg_xr_options(hdr_options: HDROptions) -> jpeg_xr::DecodeOptions {
+    jpeg_xr::DecodeOptions::new(hdr_options.tone_mapping(), MaxCLLMode::Percentile99_99)
+        .with_hdr_metrics(false)
 }
 
 fn image_decode_error(path: &Path) -> LoadError {
@@ -292,6 +297,50 @@ pub(super) fn load_image_with(path: &Path, hdr_options: HDROptions) -> LoadResul
             height,
             source_path: Arc::from(path),
             hdr_options: active_hdr_options,
+            native_jpeg_xr: decoded.native_jpeg_xr,
+        },
+        status: format!("{} — {width} × {height}", display_file_name(path)).into(),
+    };
+
+    assert_ne!(
+        loaded.status.len(),
+        0,
+        "loaded image status must not be blank"
+    );
+    Ok(loaded)
+}
+
+/// Re-tone-maps an already-decoded native JPEG XR image with different `hdr_options`.
+///
+/// Skips the file read, format detection, and entropy decode that [`load_image_with`] performs;
+/// only [`jpeg_xr::tonemap_native`] and BMP re-encoding run.
+pub(super) fn retint_jpeg_xr(
+    native: &Arc<jpeg_xr::NativeJPEGXR>,
+    path: &Path,
+    hdr_options: HDROptions,
+) -> LoadResult<LoadedImage> {
+    let decoded = jpeg_xr::tonemap_native(native, jpeg_xr_options(hdr_options))
+        .or_raise(|| image_decode_error(path))?;
+
+    let (width, height) = decoded.image().dimensions();
+    assert!(width > 0, "decoded image width must be nonzero");
+    assert!(height > 0, "decoded image height must be nonzero");
+
+    let active_hdr_options = decoded.metadata().is_hdr().then_some(hdr_options);
+    let image = Arc::new(display_image(
+        SourceFormat::JPEGXR,
+        Vec::new(),
+        &decoded.into_image(),
+    ));
+
+    let loaded = LoadedImage {
+        displayed: DisplayedImage {
+            image,
+            width,
+            height,
+            source_path: Arc::from(path),
+            hdr_options: active_hdr_options,
+            native_jpeg_xr: Some(Arc::clone(native)),
         },
         status: format!("{} — {width} × {height}", display_file_name(path)).into(),
     };

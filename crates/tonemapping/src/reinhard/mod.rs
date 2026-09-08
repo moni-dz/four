@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::simd::{Select, StdFloat, cmp::SimdPartialOrd, num::SimdFloat};
 
 use super::{
-    LinearRGB, LinearRGBPlanes, MaxCll, OrderedLevel, ToneMapper, WhitePoint, WhitePointError,
+    LinearRGB, LinearRGBPlanes, MaxCLL, OrderedLevel, ToneMapper, WhitePoint, WhitePointError,
 };
 use crate::math::recip;
 use crate::simd::{COLOR_LANES, F32x8, map_colors, map_planes};
@@ -43,7 +43,7 @@ fn reinhard_batch(colors: &mut LinearRGBPlanes) {
 /// Applies the white-point Reinhard curve independently to each component.
 ///
 /// Components at the white point map to one; brighter components clip at the display boundary.
-/// [`MaxCll`] supplies a `max(R, G, B)` white point for still images.
+/// [`MaxCLL`] supplies a `max(R, G, B)` white point for still images.
 ///
 /// [Reinhard et al.]: https://www.cs.utah.edu/docs/techreports/2002/pdf/UUCS-02-001.pdf
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -62,7 +62,7 @@ impl ExtendedReinhard {
     ///
     /// Returns `None` for an entirely black image, whose `MaxCLL` is zero.
     #[must_use]
-    pub fn from_max_cll(max_cll: MaxCll) -> Option<Self> {
+    pub fn from_max_cll(max_cll: MaxCLL) -> Option<Self> {
         max_cll.white_point().map(Self::new)
     }
 
@@ -157,7 +157,7 @@ fn luminance_reinhard_batch(colors: &mut LinearRGBPlanes) {
 
 /// Identifies a positive finite luminance that maps to display white.
 ///
-/// Unlike [`MaxCll`], this value is based on luminance rather than `max(R, G, B)`.
+/// Unlike [`MaxCLL`], this value is based on luminance rather than `max(R, G, B)`.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LuminanceWhitePoint(WhitePoint);
 

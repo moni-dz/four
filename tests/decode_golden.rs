@@ -2,6 +2,7 @@
 //! Re-record expected output changes with `FOUR_RECORD_GOLDEN=1` and document the difference.
 
 use four::{DecodedImage, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
+use tonemapping::{MaxCLLMode, ToneMappingMethod};
 
 /// One pinned fixture.
 struct Golden {
@@ -184,6 +185,51 @@ fn truncated_fixtures_fail_without_panicking() {
                 other => panic!("no decoder is registered for the {other} fixture extension"),
             };
         }
+    }
+}
+
+/// Re-tone-mapping a retained native JPEG XR decode matches decoding the same options from
+/// scratch, for every tone-mapping method the viewer can switch to.
+///
+/// This is the property the viewer's tone-mapping switch relies on: it decodes a JPEG XR source
+/// once, retains the native (pre-tone-mapping) image, and calls `jpeg_xr::tonemap_native` again
+/// on method changes instead of re-reading and re-decoding the file.
+#[test]
+fn retained_native_jpeg_xr_matches_a_fresh_decode_per_method() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/screenshot.jxr");
+    let bytes = std::fs::read(&path).expect("read screenshot.jxr fixture");
+
+    let native = jpeg_xr::decode_native(&bytes).expect("screenshot.jxr decodes natively");
+
+    for method in [
+        ToneMappingMethod::BT2446,
+        ToneMappingMethod::ExtendedReinhard,
+        ToneMappingMethod::ExtendedLuminanceReinhard,
+        ToneMappingMethod::LuminanceReinhard,
+        ToneMappingMethod::ReinhardJodie,
+    ] {
+        let options = jpeg_xr::DecodeOptions::new(method, MaxCLLMode::Percentile99_99)
+            .with_hdr_metrics(false);
+
+        let from_native = jpeg_xr::tonemap_native(&native, options).unwrap_or_else(|error| {
+            panic!("{method:?} failed to tone-map the retained native image: {error:?}")
+        });
+        let from_scratch = jpeg_xr::decode_with_metadata_and_options(&bytes, options)
+            .unwrap_or_else(|error| {
+                panic!("{method:?} failed to decode screenshot.jxr from scratch: {error:?}")
+            });
+
+        assert_eq!(
+            from_native.image().dimensions(),
+            from_scratch.image().dimensions(),
+            "{method:?} dimensions diverged between the retained and fresh decode"
+        );
+        assert_eq!(
+            from_native.image().rgba8(),
+            from_scratch.image().rgba8(),
+            "{method:?} pixels diverged between the retained and fresh decode"
+        );
     }
 }
 

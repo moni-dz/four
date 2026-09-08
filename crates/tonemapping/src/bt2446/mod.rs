@@ -6,10 +6,8 @@ use std::simd::{
 };
 
 use super::{LinearRGB, LinearRGBPlanes, ToneMapper};
+use crate::math::{exp2, exp2_bounded, exp2_scalar, log2, log2_positive_normal, log2_scalar};
 use crate::simd::map_planes;
-use crate::math::{
-    exp2, exp2_bounded, exp2_scalar, log2, log2_positive_normal, log2_scalar,
-};
 
 const BT2446_LANES: usize = 16;
 type F32x16 = Simd<f32, BT2446_LANES>;
