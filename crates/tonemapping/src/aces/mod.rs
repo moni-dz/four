@@ -104,8 +104,10 @@ fn aces_fitted_batch(colors: &mut [LinearRGB]) {
         });
 
         let fitted = transformed.map(|component| {
-            let numerator =
-                component.mul_add(component + F32x8::splat(ACES_FIT_A), -F32x8::splat(ACES_FIT_B));
+            let numerator = component.mul_add(
+                component + F32x8::splat(ACES_FIT_A),
+                -F32x8::splat(ACES_FIT_B),
+            );
 
             let denominator = component.mul_add(
                 F32x8::splat(ACES_FIT_C).mul_add(component, F32x8::splat(ACES_FIT_D)),
@@ -141,8 +143,10 @@ fn aces_fitted_planes(colors: &mut LinearRGBPlanes) {
         });
 
         let fitted = transformed.map(|component| {
-            let numerator =
-                component.mul_add(component + F32x8::splat(ACES_FIT_A), -F32x8::splat(ACES_FIT_B));
+            let numerator = component.mul_add(
+                component + F32x8::splat(ACES_FIT_A),
+                -F32x8::splat(ACES_FIT_B),
+            );
 
             let denominator = component.mul_add(
                 F32x8::splat(ACES_FIT_C).mul_add(component, F32x8::splat(ACES_FIT_D)),

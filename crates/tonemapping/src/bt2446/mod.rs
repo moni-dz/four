@@ -215,7 +215,10 @@ fn bt2446a(color: LinearRGB) -> LinearRGB {
         red_difference.mul_add(CR_DIVISOR, adjusted_luma),
         red_difference.mul_add(
             -(BT2020_LUMA[0] * CR_DIVISOR / BT2020_LUMA[1]),
-            blue_difference.mul_add(-(BT2020_LUMA[2] * CB_DIVISOR / BT2020_LUMA[1]), adjusted_luma),
+            blue_difference.mul_add(
+                -(BT2020_LUMA[2] * CB_DIVISOR / BT2020_LUMA[1]),
+                adjusted_luma,
+            ),
         ),
         blue_difference.mul_add(CB_DIVISOR, adjusted_luma),
     ];

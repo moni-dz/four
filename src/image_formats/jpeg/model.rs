@@ -241,10 +241,8 @@ impl Frame {
             y.0 * u32::from(component.vertical_sampling) / u32::from(self.max_vertical_sampling)
         };
 
-        let row_start = usize::try_from(
-            u64::from(sample_y) * u64::from(component.plane_width),
-        )
-        .expect("the bounded component plane index fits usize");
+        let row_start = usize::try_from(u64::from(sample_y) * u64::from(component.plane_width))
+            .expect("the bounded component plane index fits usize");
 
         if component.horizontal_sampling == self.max_horizontal_sampling {
             Cow::Borrowed(&component.plane[row_start..row_start + width])
@@ -594,8 +592,11 @@ fn convert_color_row(
         }
     }
 
-    for (((first, second), third), target) in
-        first_tail.iter().zip(second_tail).zip(third_tail).zip(target_tail)
+    for (((first, second), third), target) in first_tail
+        .iter()
+        .zip(second_tail)
+        .zip(third_tail)
+        .zip(target_tail)
     {
         *target = convert_color(*first, *second, *third, transform);
     }

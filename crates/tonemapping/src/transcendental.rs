@@ -28,7 +28,7 @@ const EXP2_POLYNOMIAL: [f32; 6] = [
     9.618_437e-3,
     5.550_332_5e-2,
     2.402_264_8e-1,
-    6.931_472e-1,
+    std::f32::consts::LN_2,
 ];
 
 /// `1 / ln(2)`, for converting a natural logarithm to base two.
@@ -94,12 +94,15 @@ pub fn log2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
     let result = value
         .simd_eq(Simd::splat(0.0))
         .select(Simd::splat(f32::NEG_INFINITY), result);
+
     let result = value
         .simd_lt(Simd::splat(0.0))
         .select(Simd::splat(f32::NAN), result);
+
     let result = value
         .simd_eq(Simd::splat(f32::INFINITY))
         .select(Simd::splat(f32::INFINITY), result);
+    
     value.is_nan().select(Simd::splat(f32::NAN), result)
 }
 
@@ -129,9 +132,11 @@ pub fn exp2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
     let result = value
         .simd_le(Simd::splat(-150.0))
         .select(Simd::splat(0.0), result);
+
     let result = value
         .simd_ge(Simd::splat(128.0))
         .select(Simd::splat(f32::INFINITY), result);
+
     value.is_nan().select(Simd::splat(f32::NAN), result)
 }
 
@@ -196,9 +201,7 @@ pub(crate) fn exp2_scalar(value: f32) -> f32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        exp2, exp2_bounded, exp2_scalar, log2, log2_positive_normal, log2_scalar,
-    };
+    use super::{exp2, exp2_bounded, exp2_scalar, log2, log2_positive_normal, log2_scalar};
     use std::simd::Simd;
 
     /// Returns the distance between two floats in units in the last place.

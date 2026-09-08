@@ -118,17 +118,6 @@ enum SourceFormat {
 }
 
 impl SourceFormat {
-    const fn label(self) -> &'static str {
-        match self {
-            Self::GIF => "GIF",
-            Self::JPEG => "JPEG",
-            Self::JPEGXL => "JPEG XL",
-            Self::JPEGXR => "JPEG XR",
-            Self::PNG => "PNG",
-            Self::TIFF => "TIFF",
-        }
-    }
-
     fn detect(bytes: &[u8], extension: Option<&str>) -> Self {
         if jpeg_xl::has_signature(bytes) {
             return Self::JPEGXL;

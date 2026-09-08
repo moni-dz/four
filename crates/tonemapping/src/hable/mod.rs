@@ -66,9 +66,13 @@ fn hable_partial_simd(value: F32x8) -> F32x8 {
     let toe_numerator = F32x8::splat(D * E);
     let toe_denominator = F32x8::splat(D * F);
 
-    (value.mul_add(shoulder_strength.mul_add(value, linear_angle_strength), toe_numerator)
-        / value.mul_add(shoulder_strength.mul_add(value, linear_strength), toe_denominator))
-        - F32x8::splat(TOE)
+    (value.mul_add(
+        shoulder_strength.mul_add(value, linear_angle_strength),
+        toe_numerator,
+    ) / value.mul_add(
+        shoulder_strength.mul_add(value, linear_strength),
+        toe_denominator,
+    )) - F32x8::splat(TOE)
 }
 
 #[inline]
