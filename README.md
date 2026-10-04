@@ -5,7 +5,7 @@ supported formats:
 - JPEG (including arithmetic/progressive-arithmetic coding)
 - JPEG XL
 - JPEG XR
-- PNG
+- PNG (including HDR PNGs with a PQ or HLG `cICP` chunk)
 - TIFF
 
 HDR tone mappers:

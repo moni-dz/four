@@ -179,14 +179,15 @@ impl SourceFormat {
 
             Self::JPEGXR => {
                 let native = jpeg_xr::decode_native(bytes).or_raise(|| image_decode_error(path))?;
-                let decoded = jpeg_xr::tonemap_native(&native, jpeg_xr_options(hdr_options))
+                tonemap_hdr_source(native, path, hdr_options)
+            }
+
+            Self::PNG if png::is_hdr(bytes) => {
+                let hdr = png::decode_hdr(bytes).or_raise(|| image_decode_error(path))?;
+                let (width, height) = (hdr.width(), hdr.height());
+                let native = jpeg_xr::NativeJPEGXR::from_scrgb(width, height, hdr.into_rgba())
                     .or_raise(|| image_decode_error(path))?;
-                let metadata = decoded.metadata();
-                Ok(DecodedSource {
-                    image: decoded.into_image(),
-                    jpeg_xr_metadata: Some(metadata),
-                    native_jpeg_xr: Some(Arc::new(native)),
-                })
+                tonemap_hdr_source(native, path, hdr_options)
             }
 
             Self::PNG => png::decode(bytes)
@@ -214,6 +215,22 @@ impl DecodedSource {
             native_jpeg_xr: None,
         }
     }
+}
+
+/// Tone-maps `native` (from JPEG XR or an HDR PNG) and retains it for later re-tone-mapping.
+fn tonemap_hdr_source(
+    native: jpeg_xr::NativeJPEGXR,
+    path: &Path,
+    hdr_options: HDROptions,
+) -> LoadResult<DecodedSource> {
+    let decoded = jpeg_xr::tonemap_native(&native, jpeg_xr_options(hdr_options))
+        .or_raise(|| image_decode_error(path))?;
+    let metadata = decoded.metadata();
+    Ok(DecodedSource {
+        image: decoded.into_image(),
+        jpeg_xr_metadata: Some(metadata),
+        native_jpeg_xr: Some(Arc::new(native)),
+    })
 }
 
 fn jpeg_xr_options(hdr_options: HDROptions) -> jpeg_xr::DecodeOptions {

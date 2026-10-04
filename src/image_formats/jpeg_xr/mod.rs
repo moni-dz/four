@@ -394,6 +394,8 @@ enum NativePixels {
     BGR101010(jpegxr::BGR101010Image),
     RGBAF32(jpegxr::RGBAF32Image),
     RGBAF16(jpegxr::RGBAF16Image),
+    /// Linear scRGB supplied by another codec (see [`NativeJPEGXR::from_scrgb`]).
+    ScRGB(Vec<f32>),
 }
 
 impl NativePixels {
@@ -402,7 +404,55 @@ impl NativePixels {
             Self::BGR101010(image) => zerocopy::IntoBytes::as_bytes(image.pixels()),
             Self::RGBAF32(image) => zerocopy::IntoBytes::as_bytes(image.pixels()),
             Self::RGBAF16(image) => zerocopy::IntoBytes::as_bytes(image.pixels()),
+            Self::ScRGB(pixels) => zerocopy::IntoBytes::as_bytes(pixels.as_slice()),
         }
+    }
+}
+
+impl NativeJPEGXR {
+    /// Wraps linear scRGB RGBA samples (`1.0` = 80 cd/m^2, straight alpha) from another codec so
+    /// they can share this module's HDR analysis and tone mapping.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JPEGXRError`] when the dimensions are invalid, exceed the resource limits, or do
+    /// not match `rgba.len()`.
+    #[expect(
+        clippy::missing_panics_doc,
+        reason = "validated height always fits usize"
+    )]
+    pub fn from_scrgb(width: u32, height: u32, rgba: Vec<f32>) -> Result<Self> {
+        let (width, height) = validate_dimensions(
+            i32::try_from(width).map_err(|_error| dimension_overflow_error(width))?,
+            i32::try_from(height).map_err(|_error| dimension_overflow_error(height))?,
+        )?;
+        let layout = PixelLayout::rgba128_float();
+        let row_stride = layout.row_stride(width)?;
+        let source_len = rgba
+            .len()
+            .checked_mul(std::mem::size_of::<f32>())
+            .filter(|&len| len <= SOURCE_BUFFER_MAX)
+            .ok_or_else(|| {
+                error(JPEGXRError::LimitExceeded(JPEGXRLimit::SourceBufferBytes {
+                    actual: None,
+                    max: SOURCE_BUFFER_MAX,
+                }))
+            })?;
+
+        let height_usize = usize::try_from(height).expect("validated height fits usize");
+        if row_stride.checked_mul(height_usize) != Some(source_len) {
+            return Err(error(JPEGXRError::Output(
+                "scRGB sample count does not match the image dimensions",
+            )));
+        }
+
+        Ok(Self {
+            width,
+            height,
+            row_stride,
+            layout,
+            pixels: NativePixels::ScRGB(rgba),
+        })
     }
 }
 

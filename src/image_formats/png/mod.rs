@@ -3,8 +3,12 @@
 //! The `png` crate validates chunks, checksums, DEFLATE data, filters, and Adam7 interlacing.
 //! The adapter applies resource limits and normalizes grayscale, grayscale-alpha, RGB, and RGBA
 //! samples to RGBA8.
+//!
+//! PNGs that carry a `cICP` chunk declaring PQ or HLG transfer (the PNG HDR convention) are decoded
+//! by [`decode_hdr`] to linear scRGB instead; [`is_hdr`] detects them from the header alone.
 
 mod error;
+mod hdr;
 
 use std::io::Cursor;
 
@@ -14,6 +18,7 @@ use super::{DIMENSION_MAX, DecodedImage, Dimensions, PIXELS_MAX, map_dimensions_
 use error::error;
 
 pub use error::{Error, PNGError, PNGLimit, Result};
+pub use hdr::{HDRImage, decode_hdr, is_hdr};
 
 /// The eight-byte signature at the beginning of every PNG datastream.
 pub const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
