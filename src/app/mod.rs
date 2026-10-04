@@ -21,6 +21,7 @@ pub(crate) fn run(initial_path: Option<&Path>) {
 
     application().run(move |cx: &mut App| {
         gpui_kit::init(cx);
+        gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
         cx.on_action(|_: &Quit, cx| cx.quit());
         cx.bind_keys([
             KeyBinding::new("secondary-q", Quit, None),
