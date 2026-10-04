@@ -1,11 +1,12 @@
 //! Measures cached, end-to-end decoding through each format's public API.
 
-use divan::{Bencher, counter::BytesCount};
+use divan::{AllocProfiler, Bencher, counter::BytesCount};
 use four::{DecodedImage, encode_bmp, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
 use mimalloc::MiMalloc;
 
+// Wrapping the production allocator reports allocation counts and bytes next to each timing.
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: AllocProfiler<MiMalloc> = AllocProfiler::new(MiMalloc);
 
 fn main() {
     divan::main();

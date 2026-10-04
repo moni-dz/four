@@ -14,7 +14,10 @@ use std::io::Cursor;
 
 use ::png::{BitDepth, ColorType, Decoder, Limits, Transformations};
 
-use super::{DIMENSION_MAX, DecodedImage, Dimensions, PIXELS_MAX, map_dimensions_error};
+use super::{
+    DIMENSION_MAX, DecodedImage, Dimensions, PIXELS_MAX, map_dimensions_error,
+    widen_to_rgba_in_place,
+};
 use error::error;
 
 pub use error::{Error, PNGError, PNGLimit, Result};
@@ -73,8 +76,12 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
         })));
     }
 
-    let mut pixel_buffer = vec![0; output_size];
-    let output = reader.next_frame(&mut pixel_buffer).map_err(codec_error)?;
+    // Size the buffer for the RGBA result up front, so narrower samples widen in place rather
+    // than into a second full-image allocation.
+    let mut pixel_buffer = vec![0; rgba_size];
+    let output = reader
+        .next_frame(&mut pixel_buffer[..output_size])
+        .map_err(codec_error)?;
 
     if output.width != width || output.height != height {
         return Err(error(PNGError::Output(
@@ -89,14 +96,13 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     }
 
     let used = output.buffer_size();
-    if used > pixel_buffer.len() {
+    if used > output_size {
         return Err(error(PNGError::Output(
             "PNG codec reported an invalid output length",
         )));
     }
-    pixel_buffer.truncate(used);
 
-    let rgba = normalize_rgba(pixel_buffer, output.color_type, width, height)?;
+    let rgba = normalize_rgba(pixel_buffer, used, output.color_type, width, height)?;
     Ok(DecodedImage::new(width, height, rgba))
 }
 
@@ -133,8 +139,12 @@ fn rgba_size(width: u32, height: u32) -> Result<usize> {
     })
 }
 
+/// Widens the first `used` bytes of `buffer` to RGBA8 in place.
+///
+/// `buffer` must be sized for the RGBA result; its prefix holds the codec's samples.
 fn normalize_rgba(
-    samples: Vec<u8>,
+    mut buffer: Vec<u8>,
+    used: usize,
     color_type: ColorType,
     width: u32,
     height: u32,
@@ -158,41 +168,35 @@ fn normalize_rgba(
         .checked_mul(channels)
         .ok_or_else(|| error(PNGError::Output("PNG sample count exceeds this platform")))?;
 
-    if samples.len() != expected {
+    if used != expected || buffer.len() != pixel_count * 4 {
         return Err(error(PNGError::Output(
             "PNG codec returned an unexpected sample count",
         )));
     }
 
-    if color_type == ColorType::Rgba {
-        return Ok(samples);
-    }
-
-    let mut rgba = Vec::with_capacity(pixel_count * 4);
     match color_type {
         ColorType::Grayscale => {
-            rgba.extend(samples.iter().flat_map(|&gray| [gray, gray, gray, u8::MAX]));
+            widen_to_rgba_in_place(&mut buffer, pixel_count, |[gray]| {
+                [gray, gray, gray, u8::MAX]
+            });
         }
-        ColorType::GrayscaleAlpha => rgba.extend(
-            samples
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .flat_map(|sample| [sample[0], sample[0], sample[0], sample[1]]),
-        ),
-        ColorType::Rgb => rgba.extend(
-            samples
-                .as_chunks::<3>()
-                .0
-                .iter()
-                .flat_map(|sample| [sample[0], sample[1], sample[2], u8::MAX]),
-        ),
-        ColorType::Rgba | ColorType::Indexed => {
-            unreachable!("RGBA and indexed PNG outputs were handled before sample normalization")
+        ColorType::GrayscaleAlpha => {
+            widen_to_rgba_in_place(&mut buffer, pixel_count, |[gray, alpha]| {
+                [gray, gray, gray, alpha]
+            });
+        }
+        ColorType::Rgb => {
+            widen_to_rgba_in_place(&mut buffer, pixel_count, |[red, green, blue]| {
+                [red, green, blue, u8::MAX]
+            });
+        }
+        ColorType::Rgba => {}
+        ColorType::Indexed => {
+            unreachable!("indexed PNG outputs were rejected before sample normalization")
         }
     }
 
-    Ok(rgba)
+    Ok(buffer)
 }
 
 fn codec_error(source: ::png::DecodingError) -> Error {
@@ -215,11 +219,31 @@ mod tests {
     fn rgba_normalization_reuses_the_decoded_buffer() {
         let samples = vec![10, 20, 30, 40, 50, 60, 70, 80];
         let allocation = samples.as_ptr();
-        let rgba = normalize_rgba(samples, ColorType::Rgba, 2, 1).unwrap();
+        let rgba = normalize_rgba(samples, 8, ColorType::Rgba, 2, 1).unwrap();
 
         assert_eq!(rgba.as_ptr(), allocation);
         assert_eq!(rgba, [10, 20, 30, 40, 50, 60, 70, 80]);
-        assert!(normalize_rgba(vec![0; 7], ColorType::Rgba, 2, 1).is_err());
-        assert!(normalize_rgba(vec![0; 9], ColorType::Rgba, 2, 1).is_err());
+        normalize_rgba(vec![0; 8], 7, ColorType::Rgba, 2, 1).unwrap_err();
+        normalize_rgba(vec![0; 9], 9, ColorType::Rgba, 2, 1).unwrap_err();
+    }
+
+    #[test]
+    fn narrower_samples_widen_in_the_decoded_buffer() {
+        let mut samples = vec![0; 8];
+        samples[..6].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        let allocation = samples.as_ptr();
+        let rgba = normalize_rgba(samples, 6, ColorType::Rgb, 2, 1).unwrap();
+        assert_eq!(rgba.as_ptr(), allocation);
+        assert_eq!(rgba, [1, 2, 3, 255, 4, 5, 6, 255]);
+
+        let mut samples = vec![0; 8];
+        samples[..2].copy_from_slice(&[7, 9]);
+        let rgba = normalize_rgba(samples, 2, ColorType::Grayscale, 2, 1).unwrap();
+        assert_eq!(rgba, [7, 7, 7, 255, 9, 9, 9, 255]);
+
+        let mut samples = vec![0; 8];
+        samples[..4].copy_from_slice(&[7, 8, 9, 10]);
+        let rgba = normalize_rgba(samples, 4, ColorType::GrayscaleAlpha, 2, 1).unwrap();
+        assert_eq!(rgba, [7, 7, 7, 8, 9, 9, 9, 10]);
     }
 }

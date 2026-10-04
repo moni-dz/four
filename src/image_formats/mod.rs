@@ -199,6 +199,42 @@ pub(crate) fn rgba_pixel_rows<E: Send>(
     }
 }
 
+/// Widens `pixel_count` packed `CHANNELS`-byte pixels at the start of `buffer` to RGBA8 in place.
+///
+/// `buffer` must already be `pixel_count * 4` bytes long, so a decoder can write its samples into
+/// the final RGBA allocation instead of a separate sample buffer. Each pixel is mapped by
+/// `widen`; pixels are processed back to front so no source is overwritten before it is read.
+pub(crate) fn widen_to_rgba_in_place<const CHANNELS: usize>(
+    buffer: &mut [u8],
+    pixel_count: usize,
+    widen: impl Fn([u8; CHANNELS]) -> [u8; 4],
+) {
+    const BLOCK_PIXELS: usize = 64;
+
+    invariant!(CHANNELS < 4);
+    invariant_eq!(buffer.len(), pixel_count * 4);
+
+    // A block starting at pixel `start` writes `4 * start..`, while every unread source lies below
+    // `CHANNELS * start`, so walking blocks down from the end never clobbers an unread sample.
+    // Staging each block's sources on the stack keeps the inner loop a forward, vectorizable copy.
+    let mut staged = [[0_u8; CHANNELS]; BLOCK_PIXELS];
+    let mut end = pixel_count;
+    while end > 0 {
+        let start = end.saturating_sub(BLOCK_PIXELS);
+        let staged = &mut staged[..end - start];
+        staged
+            .as_flattened_mut()
+            .copy_from_slice(&buffer[start * CHANNELS..end * CHANNELS]);
+
+        let (targets, remainder) = buffer[start * 4..end * 4].as_chunks_mut::<4>();
+        invariant!(remainder.is_empty());
+        for (target, &source) in targets.iter_mut().zip(staged.iter()) {
+            *target = widen(source);
+        }
+        end = start;
+    }
+}
+
 /// Encodes RGBA8 pixels in an uncompressed BMP V4 carrier for GPUI.
 ///
 /// # Panics
@@ -274,8 +310,32 @@ mod tests {
 
     use super::{
         BMP_DIB_HEADER_BYTES, BMP_HEADER_BYTES, DIMENSION_MAX, DecodedImage, Dimensions,
-        DimensionsError, PIXELS_MAX, encode_bmp,
+        DimensionsError, PIXELS_MAX, encode_bmp, widen_to_rgba_in_place,
     };
+
+    #[test]
+    fn in_place_widening_matches_a_fresh_copy_across_block_boundaries() {
+        // Lengths straddle the staging block so the partial front block and full blocks both run.
+        for pixel_count in [0, 1, 63, 64, 65, 129, 1_000] {
+            let samples: Vec<u8> = (0..pixel_count * 3)
+                .map(|index| u8::try_from(index % 251).expect("sample fits u8"))
+                .collect();
+            let expected: Vec<u8> = samples
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .flat_map(|&[red, green, blue]| [red, green, blue, u8::MAX])
+                .collect();
+
+            let mut buffer = vec![0; pixel_count * 4];
+            buffer[..samples.len()].copy_from_slice(&samples);
+            widen_to_rgba_in_place(&mut buffer, pixel_count, |[red, green, blue]| {
+                [red, green, blue, u8::MAX]
+            });
+
+            assert_eq!(buffer, expected, "{pixel_count} pixels");
+        }
+    }
 
     #[test]
     fn bmp_encoding_writes_top_down_bgra_pixels() {
