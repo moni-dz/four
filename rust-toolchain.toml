@@ -1,5 +1,4 @@
 [toolchain]
-# Portable SIMD is intentionally unstable, so pin the compiler for reproducible builds.
-channel = "nightly-2026-09-07"
+channel = "nightly-2026-10-03"
 components = ["clippy", "rustfmt"]
 profile = "minimal"
