@@ -293,9 +293,9 @@ mod tests {
     #[test]
     fn bmp_encoding_preserves_alpha_through_gpui() {
         let image = DecodedImage::new(1, 1, vec![1, 2, 3, 4]);
-        let carrier = gpui::Image::from_bytes(gpui::ImageFormat::Bmp, encode_bmp(&image));
+        let carrier = gpui_kit::Image::from_bytes(gpui_kit::ImageFormat::Bmp, encode_bmp(&image));
         let decoded = carrier
-            .to_image_data(gpui::SvgRenderer::new(Arc::new(())))
+            .to_image_data(gpui_kit::SvgRenderer::new(Arc::new(())))
             .expect("the BMP carrier must decode through GPUI");
 
         assert_eq!(

@@ -155,14 +155,14 @@ fn inverse_simd(coefficients: &[i32; 64]) -> [u8; 64] {
     // instead of converting and broadcasting it one lane at a time.
     let mut converted = [[0.0_f32; BLOCK_SIDE]; BLOCK_SIDE];
     let (coefficient_rows, coefficient_remainder) = coefficients.as_chunks::<BLOCK_SIDE>();
-    
+
     invariant_eq!(coefficient_remainder.len(), 0);
     for (converted, coefficients) in converted.iter_mut().zip(coefficient_rows) {
         *converted = Simd::<i32, BLOCK_SIDE>::from_array(*coefficients)
             .cast::<f32>()
             .to_array();
     }
-    
+
     let rows = converted.map(|coefficients| {
         let mut values = F32x8::splat(0.0);
 
@@ -186,7 +186,7 @@ fn inverse_simd(coefficients: &[i32; 64]) -> [u8; 64] {
         dc_difference - even_second,
         dc_sum - even_first,
     ];
-    
+
     let odd: [F32x8; 4] = std::array::from_fn(|sample| {
         rows[7].mul_add(
             scaled(sample, 7),

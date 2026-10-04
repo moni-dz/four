@@ -16,7 +16,7 @@ fn colors() -> Vec<LinearRGB> {
         state ^= state << 13;
         state ^= state >> 17;
         state ^= state << 5;
-        
+
         let unit = f32::from(u16::try_from(state >> 18).expect("14 bits fit u16")) / 16_384.0;
         (unit * 14.0 - 8.0).exp2()
     };
@@ -36,12 +36,12 @@ fn mapper(method: ToneMappingMethod) -> impl ToneMapper {
 #[divan::bench(args = ToneMappingMethod::ALL)]
 fn planes(bencher: Bencher<'_, '_>, method: ToneMappingMethod) {
     let mapper = mapper(method);
-    
+
     let source: Vec<LinearRGBPlanes> = colors()
         .chunks(BATCH_PIXELS)
         .map(|batch| batch.iter().copied().collect())
         .collect();
-    
+
     bencher
         .counter(ItemsCount::new(BATCH_PIXELS * BATCHES))
         .with_inputs(|| source.clone())

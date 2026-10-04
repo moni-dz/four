@@ -450,10 +450,10 @@ mod tests {
             for step in 1..=100_000_u32 {
                 let value = f32::from(u16::try_from(step % 50_000).unwrap() + 1) / 50_001.0
                     * if step > 50_000 { 1.0e-6 } else { 1.0 };
-                
+
                 let actual = pow_unit_interval(Simd::<f32, 1>::splat(value), exponent)[0];
                 let expected = f64::from(value).powf(f64::from(exponent));
-                
+
                 if expected < f64::from(f32::MIN_POSITIVE) {
                     assert!(
                         actual < f32::MIN_POSITIVE * 2.0,

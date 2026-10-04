@@ -157,7 +157,6 @@ fn bt2446a_simd<const N: usize>(
     let zero = Simd::splat(0.0);
     let one = Simd::splat(1.0);
 
-
     let nonlinear = components.map(|component| {
         let normalized = min_or_second(component * Simd::splat(1.0 / HDR_TO_SDR_PEAK_RATIO), one);
         pow_unit_interval(normalized, 1.0 / 2.4)

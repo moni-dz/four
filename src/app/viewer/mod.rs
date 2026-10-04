@@ -10,9 +10,13 @@ use std::sync::Arc;
 
 use exn::ErrorExt;
 
-use gpui::{
-    App, FocusHandle, Focusable, MouseDownEvent, PathPromptOptions, Pixels, Point, SharedString,
-    Window, actions, div, prelude::*, px, rgb,
+use gpui_kit::component::IndexPath;
+use gpui_kit::component::menu::ContextMenuExt as _;
+use gpui_kit::component::searchable_list::SearchableListItem;
+use gpui_kit::component::select::{SelectEvent, SelectState};
+use gpui_kit::{
+    App, Entity, FocusHandle, Focusable, PathPromptOptions, Pixels, Point, SharedString, Window,
+    actions, div, prelude::*, rgb,
 };
 use tonemapping::ToneMappingMethod;
 
@@ -26,46 +30,19 @@ use super::image_loader::{
     load_image_with, retint_jpeg_xr,
 };
 
-const CONTEXT_MENU_ITEM_HEIGHT: f32 = 36.0;
-const CONTEXT_MENU_PADDING: f32 = 8.0;
-const CONTEXT_MENU_HEIGHT: f32 = CONTEXT_MENU_PADDING + CONTEXT_MENU_ITEM_HEIGHT * 2.0;
-const CONTEXT_MENU_WIDTH: f32 = 180.0;
 const DRAG_REGION_HEIGHT: f32 = 40.0;
 const LABEL_ROW_GAP: f32 = 6.0;
-const TONE_MAPPING_MENU_SNAP_MARGIN: f32 = 12.0;
-const TONE_MAPPING_MENU_ITEM_HEIGHT: f32 = 30.0;
-const TONE_MAPPING_MENU_MARGIN: f32 = 4.0;
-const TONE_MAPPING_MENU_WIDTH: f32 = 292.0;
 const TONE_MAPPING_LABEL_WIDTH: f32 = 100.0;
 const TONE_MAPPING_TITLEBAR_WIDTH: f32 = 480.0;
-const TONE_MAPPING_SELECTOR_HEIGHT: f32 = 30.0;
 
 /// Background of the root viewer surface.
 const COLOR_APP_BACKGROUND: u32 = 0x0015_1515;
 /// Primary text on the root viewer surface.
 const COLOR_TEXT_PRIMARY: u32 = 0x00d8_d8d8;
-/// Secondary text: field labels, muted captions, the tone-mapping menu caret.
+/// Secondary text: field labels and muted captions.
 const COLOR_TEXT_SECONDARY: u32 = 0x009d_9d9d;
 /// Hint text shown when no image is loaded.
 const COLOR_TEXT_HINT: u32 = 0x0088_8888;
-/// Text in the right-click context menu and tone-mapping method list.
-const COLOR_TEXT_MENU: u32 = 0x00ff_ffff;
-/// Checkmark and selected-method accent color.
-const COLOR_ACCENT_GREEN: u32 = 0x00a9_d18e;
-/// Background shared by the context menu and the tone-mapping method list panel.
-const COLOR_PANEL_BACKGROUND: u32 = 0x0029_2929;
-/// Border shared by the context menu and the tone-mapping method list panel.
-const COLOR_PANEL_BORDER: u32 = 0x0045_4545;
-/// Hover background for context-menu and tone-mapping method-list items.
-const COLOR_MENU_ITEM_HOVER: u32 = 0x003d_3d3d;
-/// Background of the status bar and its embedded controls' resting state.
-const COLOR_CONTROL_BACKGROUND: u32 = 0x0024_2424;
-/// Hover background for the tone-mapping selector control.
-const COLOR_CONTROL_HOVER: u32 = 0x0032_3232;
-/// Border for the tone-mapping selector control (translucent white).
-const COLOR_CONTROL_BORDER: u32 = 0xff_ff_ff_2e;
-/// Background of a selected tone-mapping method.
-const COLOR_SELECTED_BACKGROUND: u32 = 0x0038_3838;
 /// Background of the status bar strip along the window's bottom edge.
 const COLOR_STATUS_BAR_BACKGROUND: u32 = 0x0020_2020;
 
@@ -82,10 +59,7 @@ const ZOOM_KEY_STEP: f32 = 1.25;
 /// Assumed line height for normalizing line-based scroll deltas into pixels.
 const SCROLL_LINE_HEIGHT: f32 = 24.0;
 
-actions!(
-    four,
-    [Quit, OpenFile, ZoomIn, ZoomOut, ZoomReset, DismissMenu]
-);
+actions!(four, [Quit, OpenFile, ZoomIn, ZoomOut, ZoomReset]);
 
 pub(super) enum ViewerState {
     Empty {
@@ -165,7 +139,6 @@ impl ViewerState {
 }
 
 pub(super) struct Root {
-    context_menu_position: Option<Point<Pixels>>,
     decode_coordinator: LatestLoadCoordinator<DecodePayload>,
     /// Last mouse position during an active left-drag pan.
     drag_anchor: Option<Point<Pixels>>,
@@ -177,7 +150,8 @@ pub(super) struct Root {
     pan: Point<Pixels>,
     pending_hdr_options: Option<(LoadRequest, HDROptions)>,
     preferred_hdr_options: HDROptions,
-    tone_mapping_menu_open: bool,
+    /// Created by [`Root::init_tone_mapping_select`] because it needs a `Window`.
+    tone_mapping_select: Option<Entity<SelectState<Vec<ToneMappingItem>>>>,
     viewer: ViewerState,
     /// Zoom multiplier on top of fit-to-window; clamped to `[ZOOM_MIN, ZOOM_MAX]`.
     zoom: f32,
@@ -191,7 +165,6 @@ impl Root {
             .unwrap_or_default();
 
         Self {
-            context_menu_position: None,
             decode_coordinator: LatestLoadCoordinator::new(),
             drag_anchor: None,
             focus_handle: OnceCell::new(),
@@ -200,41 +173,10 @@ impl Root {
             pan: Point::default(),
             pending_hdr_options: None,
             preferred_hdr_options,
-            tone_mapping_menu_open: false,
+            tone_mapping_select: None,
             viewer,
             zoom: 1.0,
         }
-    }
-
-    fn show_context_menu(&mut self, event: &MouseDownEvent, window: &Window) {
-        let mut position = event.position;
-        let viewport_size = window.viewport_size();
-        // `.max(min_*)` on each ceiling guarantees min <= max even if the viewport is smaller than
-        // the menu, so clamping to the floor afterward can never push the position back past the
-        // ceiling.
-        let max_x = (viewport_size.width - px(CONTEXT_MENU_WIDTH)).max(px(0.0));
-        let max_y = (viewport_size.height - px(CONTEXT_MENU_HEIGHT)).max(px(DRAG_REGION_HEIGHT));
-        position.x = position.x.clamp(px(0.0), max_x);
-        position.y = position.y.clamp(px(DRAG_REGION_HEIGHT), max_y);
-
-        assert!(
-            position.x >= px(0.0),
-            "context menu x position must be clamped nonnegative, got {:?}",
-            position.x
-        );
-        assert!(
-            position.y >= px(DRAG_REGION_HEIGHT),
-            "context menu y position must clear the drag region, got {:?}",
-            position.y
-        );
-
-        self.tone_mapping_menu_open = false;
-        self.context_menu_position = Some(position);
-    }
-
-    fn dismiss_menus(&mut self) {
-        self.context_menu_position = None;
-        self.tone_mapping_menu_open = false;
     }
 
     fn reset_zoom(&mut self) {
@@ -321,7 +263,6 @@ impl Root {
             "viewer status must never be blank"
         );
 
-        self.dismiss_menus();
         let paths = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -343,7 +284,6 @@ impl Root {
                 Ok(None) => None,
                 Err(prompt_error) => {
                     let _ = root.update_in(cx, |root, window, cx| {
-                        root.dismiss_menus();
                         root.viewer
                             .apply_result(Err(LoadError::new(prompt_error).raise()));
                         root.sync_window_title(window);
@@ -357,8 +297,6 @@ impl Root {
             };
 
             let _ = root.update_in(cx, |root, window, cx| {
-                root.dismiss_menus();
-
                 let request = root.begin_load_request();
                 root.pending_hdr_options = None;
 
@@ -445,8 +383,6 @@ impl Root {
             !self.viewer.status().is_empty(),
             "viewer status must never be blank before a result is applied"
         );
-        self.context_menu_position = None;
-
         apply(self);
 
         assert!(
@@ -461,7 +397,6 @@ impl Root {
             let load_succeeded = result.is_ok();
             root.viewer.apply_result(result);
             if load_succeeded {
-                root.tone_mapping_menu_open = false;
                 root.reset_zoom();
             }
         })
@@ -490,8 +425,6 @@ impl Root {
             if let Some(options) = resolved_options {
                 root.preferred_hdr_options = options;
             }
-
-            root.tone_mapping_menu_open = false;
         })
     }
 
@@ -511,8 +444,6 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.dismiss_menus();
-
         let Some((active_options, source_path, native_jpeg_xr)) =
             self.viewer.displayed().and_then(|displayed| {
                 displayed.hdr_options.map(|active| {
@@ -555,6 +486,46 @@ impl Root {
     }
 }
 
+/// A tone-mapping method as listed in the selector.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ToneMappingItem(ToneMappingMethod);
+
+impl SearchableListItem for ToneMappingItem {
+    type Value = ToneMappingMethod;
+
+    fn title(&self) -> SharedString {
+        self.0.label().into()
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.0
+    }
+}
+
+impl Root {
+    /// Builds the tone-mapping selector and routes its confirmations to [`Root::select_tone_mapping`].
+    pub(super) fn init_tone_mapping_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let items = ToneMappingMethod::ALL.map(ToneMappingItem).to_vec();
+        let selected = ToneMappingMethod::ALL
+            .iter()
+            .position(|method| *method == self.preferred_hdr_options.tone_mapping())
+            .map(IndexPath::new);
+        let select = cx.new(|cx| SelectState::new(items, selected, window, cx));
+        cx.subscribe_in(
+            &select,
+            window,
+            |root, _, event: &SelectEvent<Vec<ToneMappingItem>>, window, cx| {
+                let SelectEvent::Confirm(Some(method)) = event else {
+                    return;
+                };
+                root.select_tone_mapping(*method, window, cx);
+            },
+        )
+        .detach();
+        self.tone_mapping_select = Some(select);
+    }
+}
+
 impl Focusable for Root {
     fn focus_handle(&self, cx: &App) -> FocusHandle {
         self.focus_handle.get_or_init(|| cx.focus_handle()).clone()
@@ -567,14 +538,6 @@ impl Render for Root {
             !self.viewer.status().is_empty(),
             "viewer status must never be blank"
         );
-        assert!(
-            self.context_menu_position
-                .is_none_or(|position| position.x >= px(0.0)),
-            "context menu x position must be clamped nonnegative, got {:?}",
-            self.context_menu_position
-        );
-
-        let context_menu_position = self.context_menu_position;
         let displayed = self.viewer.displayed();
 
         let image = displayed.map(|displayed| Arc::clone(&displayed.image));
@@ -586,11 +549,22 @@ impl Render for Root {
                 .map_or(active_options, |(_, pending_options)| pending_options)
         });
 
-        let tone_mapping_menu_open = self.tone_mapping_menu_open;
         let status = self.viewer.status().clone();
         let focus_handle = self.focus_handle(cx);
 
+        if let (Some(select), Some(options)) = (&self.tone_mapping_select, hdr_options) {
+            let method = options.tone_mapping();
+            select.update(cx, |select, cx| {
+                if select.selected_value() != Some(&method) {
+                    select.set_selected_value(&method, window, cx);
+                }
+            });
+        }
+        let tone_mapping_select = hdr_options.and(self.tone_mapping_select.clone());
+
+        let open_focus = focus_handle.clone();
         div()
+            .id("viewer")
             .relative()
             .size_full()
             .flex()
@@ -603,26 +577,12 @@ impl Render for Root {
             .on_action(cx.listener(|root, _: &ZoomIn, _, cx| root.zoom_in(cx)))
             .on_action(cx.listener(|root, _: &ZoomOut, _, cx| root.zoom_out(cx)))
             .on_action(cx.listener(|root, _: &ZoomReset, _, cx| root.zoom_reset(cx)))
-            .on_action(cx.listener(|root, _: &DismissMenu, _, cx| {
-                root.dismiss_menus();
-                cx.notify();
-            }))
-            .on_mouse_down(
-                gpui::MouseButton::Right,
-                cx.listener(|root, event: &MouseDownEvent, window, cx| {
-                    root.show_context_menu(event, window);
-                    cx.notify();
-                }),
-            )
-            .child(Self::render_status_bar(
-                status,
-                hdr_options,
-                tone_mapping_menu_open,
-                cx,
-            ))
+            .child(Self::render_status_bar(status, tone_mapping_select))
             .child(self.render_image_content(image, image_dims, window, cx))
-            .when_some(context_menu_position, |root, position| {
-                root.child(Self::render_context_menu(position, cx))
+            .context_menu(move |menu, _, _| {
+                menu.action_context(open_focus.clone())
+                    .menu("Open image…", Box::new(OpenFile))
+                    .menu("Quit", Box::new(Quit))
             })
     }
 }
@@ -639,7 +599,7 @@ pub(super) fn initial_viewer(path: Option<&Path>) -> ViewerState {
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Image as GPUIImage, point};
+    use gpui_kit::Image as GPUIImage;
 
     use super::*;
 
@@ -658,10 +618,9 @@ mod tests {
     }
 
     #[test]
-    fn menus_are_closed_and_tone_mapping_defaults_are_bt2446_on_a_fresh_root() {
+    fn tone_mapping_defaults_are_bt2446_on_a_fresh_root() {
         let root = Root::new(ViewerState::empty());
 
-        assert!(!root.tone_mapping_menu_open);
         assert_eq!(
             root.preferred_hdr_options.tone_mapping(),
             ToneMappingMethod::BT2446
@@ -745,11 +704,9 @@ mod tests {
         assert!(!root.apply_load_result(first, Err(stale_error)));
         assert!(matches!(root.viewer, ViewerState::Empty { .. }));
 
-        root.context_menu_position = Some(point(px(5.0), px(DRAG_REGION_HEIGHT)));
         let current_error = LoadError::new("current load failed").raise();
         assert!(root.apply_load_result(second, Err(current_error)));
         assert!(matches!(root.viewer, ViewerState::Failed { .. }));
-        assert!(root.context_menu_position.is_none());
     }
 
     #[test]
@@ -780,18 +737,16 @@ mod tests {
     }
 
     #[test]
-    fn hdr_options_result_closes_an_open_context_menu() {
+    fn failed_hdr_reload_clears_the_pending_options() {
         let mut root = Root::new(ViewerState::empty());
         let request = root.begin_load_request();
         root.pending_hdr_options = Some((
             request,
             HDROptions::default().with_tone_mapping(ToneMappingMethod::ACESFitted),
         ));
-        root.context_menu_position = Some(point(px(5.0), px(DRAG_REGION_HEIGHT)));
         let error = LoadError::new("HDR options reload failed").raise();
 
         assert!(root.apply_hdr_options_result(request, Err(error)));
-        assert!(root.context_menu_position.is_none());
         assert!(root.pending_hdr_options.is_none());
     }
 

@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use exn::{ErrorExt, ResultExt};
-use gpui::{Image as GPUIImage, ImageFormat, SharedString};
+use gpui_kit::{Image as GPUIImage, ImageFormat, SharedString};
 use tonemapping::{MaxCLLMode, ToneMappingMethod};
 
 use four::{DecodedImage, encode_bmp, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
@@ -413,7 +413,7 @@ mod tests {
         let decoded = gif::decode(&bytes).unwrap();
         let image = display_image(SourceFormat::GIF, bytes, &decoded);
         let rendered = image
-            .to_image_data(gpui::SvgRenderer::new(Arc::new(())))
+            .to_image_data(gpui_kit::SvgRenderer::new(Arc::new(())))
             .unwrap();
 
         assert_eq!(image.format(), ImageFormat::Gif);
