@@ -4,6 +4,7 @@
 use std::sync::Arc;
 
 use gpui_kit::component::select::{Select, SelectState};
+use gpui_kit::component::status_bar::StatusBar;
 use gpui_kit::{
     CursorStyle, Entity, Image as GPUIImage, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, Pixels, ScrollWheelEvent, SharedString, Window, WindowControlArea, div, img,
@@ -12,9 +13,9 @@ use gpui_kit::{
 
 use super::geometry::{clamp_pan, fit_scale, zoom_to_cursor_pan};
 use super::{
-    COLOR_STATUS_BAR_BACKGROUND, COLOR_TEXT_HINT, COLOR_TEXT_SECONDARY, DRAG_REGION_HEIGHT,
-    LABEL_ROW_GAP, Root, SCROLL_LINE_HEIGHT, TONE_MAPPING_LABEL_WIDTH, TONE_MAPPING_TITLEBAR_WIDTH,
-    ToneMappingItem, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP_BASE,
+    COLOR_STATUS_BAR_BACKGROUND, COLOR_TEXT_HINT, COLOR_TEXT_PRIMARY, COLOR_TEXT_SECONDARY,
+    DRAG_REGION_HEIGHT, LABEL_ROW_GAP, Root, SCROLL_LINE_HEIGHT, TONE_MAPPING_LABEL_WIDTH,
+    TONE_MAPPING_TITLEBAR_WIDTH, ToneMappingItem, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP_BASE,
 };
 
 impl Root {
@@ -161,20 +162,20 @@ impl Root {
     pub(super) fn render_status_bar(
         status: SharedString,
         tone_mapping_select: Option<Entity<SelectState<Vec<ToneMappingItem>>>>,
-    ) -> gpui_kit::Div {
-        div()
+    ) -> StatusBar {
+        StatusBar::new()
             .w_full()
             .h(px(DRAG_REGION_HEIGHT))
             .flex_none()
-            .flex()
-            .items_center()
+            .px_0()
+            .py_0()
             .text_sm()
+            .text_color(rgb(COLOR_TEXT_PRIMARY))
             .bg(rgb(COLOR_STATUS_BAR_BACKGROUND))
             .child(
                 div()
                     .h_full()
-                    .min_w_0()
-                    .flex_1()
+                    .w_full()
                     .flex()
                     .items_center()
                     .overflow_hidden()
@@ -182,11 +183,10 @@ impl Root {
                     .window_control_area(WindowControlArea::Drag)
                     .child(status),
             )
-            .when_some(tone_mapping_select, |titlebar, select| {
-                titlebar.child(
+            .when_some(tone_mapping_select, |bar, select| {
+                bar.right(
                     div()
                         .w(px(TONE_MAPPING_TITLEBAR_WIDTH))
-                        .h_full()
                         .flex_none()
                         .flex()
                         .items_center()
