@@ -103,6 +103,19 @@ impl PixelLayout {
         }
     }
 
+    pub(super) const fn rgba64_half() -> Self {
+        Self {
+            encoding: SampleEncoding::Float16,
+            color_channels: 3,
+            source_channels: 4,
+            bytes_per_pixel: 8,
+            has_alpha: true,
+            premultiplied_alpha: false,
+            blue_first: false,
+            source_is_bgr: false,
+        }
+    }
+
     pub(super) fn row_stride(self, width: u32) -> Result<usize> {
         usize::try_from(width)
             .ok()

@@ -393,6 +393,7 @@ pub struct NativeJPEGXR {
 enum NativePixels {
     BGR101010(jpegxr::BGR101010Image),
     RGBAF32(jpegxr::RGBAF32Image),
+    RGBAF16(jpegxr::RGBAF16Image),
 }
 
 impl NativePixels {
@@ -400,6 +401,7 @@ impl NativePixels {
         match self {
             Self::BGR101010(image) => zerocopy::IntoBytes::as_bytes(image.pixels()),
             Self::RGBAF32(image) => zerocopy::IntoBytes::as_bytes(image.pixels()),
+            Self::RGBAF16(image) => zerocopy::IntoBytes::as_bytes(image.pixels()),
         }
     }
 }
@@ -427,6 +429,7 @@ pub fn decode_native(bytes: &[u8]) -> Result<NativeJPEGXR> {
     let layout = match pixel_format {
         ::jpegxr::PixelFormat::BGR101010 => PixelLayout::bgr101010(),
         ::jpegxr::PixelFormat::RGBA128_FLOAT => PixelLayout::rgba128_float(),
+        ::jpegxr::PixelFormat::RGBA64_HALF => PixelLayout::rgba64_half(),
         _ => {
             return Err(error(JPEGXRError::Unsupported(
                 pixel_format.name().to_owned(),
@@ -476,6 +479,17 @@ pub fn decode_native(bytes: &[u8]) -> Result<NativeJPEGXR> {
                 source_len
             );
             NativePixels::RGBAF32(native_image)
+        }
+        jpegxr::PixelFormat::RGBA64_HALF => {
+            let native_image = decoder
+                .decode_rgba_half()
+                .map_err(|source| codec_error(&source))?;
+
+            invariant_eq!(
+                zerocopy::IntoBytes::as_bytes(native_image.pixels()).len(),
+                source_len
+            );
+            NativePixels::RGBAF16(native_image)
         }
         _ => unreachable!("pixel format validated when selecting its layout"),
     };
@@ -909,6 +923,21 @@ mod tests {
         assert_eq!(decoded.image().rgba8().len(), 3840 * 2160 * 4);
         assert!(!decoded.metadata().has_alpha());
         assert!(decoded.metadata().is_hdr());
+    }
+
+    #[test]
+    #[ignore = "requires JPEGXR_RGBA64_HALF_SAMPLE to name a local HDR image"]
+    fn decodes_real_rgba64_half_sample_with_pure_rust_codec() {
+        let path =
+            std::env::var("JPEGXR_RGBA64_HALF_SAMPLE").expect("set JPEGXR_RGBA64_HALF_SAMPLE");
+        let bytes = std::fs::read(path).expect("read sample");
+        let decoded = decode_with_metadata(&bytes).expect("decode RGBA64Half HDR sample");
+
+        assert_eq!(decoded.image().dimensions(), (2560, 1440));
+        assert_eq!(decoded.image().rgba8().len(), 2560 * 1440 * 4);
+        assert!(decoded.metadata().has_alpha());
+        assert!(decoded.metadata().is_hdr());
+        assert_eq!(decoded.metadata().bits_per_channel(), 16);
     }
 
     fn float_rgb_layout() -> PixelLayout {
