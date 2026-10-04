@@ -3,7 +3,7 @@
 //! [PNG 3.0](https://www.w3.org/TR/png-3/#cICP-chunk) signals HDR through the `cICP` chunk. This
 //! module accepts full-range RGB signals with BT.709, BT.2020, or Display-P3 primaries and either
 //! the PQ (BT.2100 / SMPTE ST 2084) or HLG (BT.2100) transfer function. Samples become linear
-//! Rec. 709 RGB where `1.0` is 80 cd/m^2, the same convention as JPEG XR's floating-point formats.
+//! Rec. 709 RGB where `1.0` is 80 cd/m^2, the same scRGB convention as the [`hdr`](crate::hdr) module.
 //! HLG is rendered for a 1000 cd/m^2 display with the BT.2100 system gamma of 1.2.
 
 use std::io::Cursor;
@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn hdr_png_flows_through_jpeg_xr_tone_mapping() {
-        use crate::jpeg_xr::{DecodeOptions, NativeJPEGXR, tonemap_native};
+        use crate::hdr::{DecodeOptions, NativeHDR, tonemap_native};
 
         let samples = words(&[0, 0, 0, 40_000, 40_000, 40_000, 65_535, 65_535, 65_535]);
         let png = encode(
@@ -473,13 +473,13 @@ mod tests {
             true,
         );
         let hdr = decode_hdr(&png).unwrap();
-        let native = NativeJPEGXR::from_scrgb(hdr.width(), hdr.height(), hdr.into_rgba()).unwrap();
+        let native = NativeHDR::from_scrgb(hdr.width(), hdr.height(), hdr.into_rgba()).unwrap();
         let decoded = tonemap_native(&native, DecodeOptions::default()).unwrap();
 
         assert!(decoded.metadata().is_hdr());
         let pixels = &decoded.image().rgba;
         assert_eq!(&pixels[..4], &[0, 0, 0, 255]);
         assert!(pixels[4] > 0 && pixels[8] >= pixels[4]);
-        assert!(NativeJPEGXR::from_scrgb(2, 2, vec![0.0; 4]).is_err());
+        assert!(NativeHDR::from_scrgb(2, 2, vec![0.0; 4]).is_err());
     }
 }

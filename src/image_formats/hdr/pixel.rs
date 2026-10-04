@@ -1,4 +1,4 @@
-//! JPEG XR pixel layouts and sample decoding, including scalar and SIMD paths.
+//! pixel layouts and sample decoding, including scalar and SIMD paths.
 
 use std::simd::{
     Simd, StdFloat,
@@ -11,7 +11,7 @@ use zerocopy::FromBytes;
 
 #[cfg(test)]
 use super::F32x4;
-use super::{JPEGXRError, Result, SC_RGB_REFERENCE_WHITE_NITS, error};
+use super::{HDRError, Result, SC_RGB_REFERENCE_WHITE_NITS, error};
 
 #[expect(
     dead_code,
@@ -120,7 +120,7 @@ impl PixelLayout {
         usize::try_from(width)
             .ok()
             .and_then(|width| width.checked_mul(self.bytes_per_pixel))
-            .ok_or_else(|| error(JPEGXRError::Output("JPEG XR row stride exceeds usize")))
+            .ok_or_else(|| error(HDRError::Output("row stride exceeds usize")))
     }
 
     pub(super) fn read_pixel(self, pixel: &[u8]) -> Result<([f32; 3], f32)> {
@@ -139,11 +139,9 @@ impl PixelLayout {
 
             let start = channel * self.encoding.bytes();
             let end = start + self.encoding.bytes();
-            let bytes = pixel.get(start..end).ok_or_else(|| {
-                error(JPEGXRError::Output(
-                    "JPEG XR sample exceeds its pixel stride",
-                ))
-            })?;
+            let bytes = pixel
+                .get(start..end)
+                .ok_or_else(|| error(HDRError::Output("sample exceeds its pixel stride")))?;
 
             Ok(decode_sample(bytes, self.encoding))
         };
@@ -308,8 +306,8 @@ pub(super) fn unpack_bgr101010(pixel: &[u8]) -> [f32; 3] {
 
     let packed = read_sample::<u32>(pixel);
     let channel = |shift| {
-        let sample = u16::try_from((packed >> shift) & MASK)
-            .expect("a masked 10-bit JPEG XR sample fits u16");
+        let sample =
+            u16::try_from((packed >> shift) & MASK).expect("a masked 10-bit sample fits u16");
         f32::from(sample) * SCALE
     };
 
@@ -375,7 +373,7 @@ pub(super) fn pq_to_linear_simd<const N: usize>(encoded: Simd<f32, N>) -> Simd<f
 }
 
 fn read_sample<T: FromBytes + Sized>(bytes: &[u8]) -> T {
-    T::read_from_bytes(bytes).expect("JPEG XR sample length must match its encoding")
+    T::read_from_bytes(bytes).expect("sample length must match its encoding")
 }
 
 #[expect(
@@ -393,8 +391,8 @@ pub(super) fn half_to_f32(bits: u16) -> f32 {
 
 fn decode_rgbe(pixel: &[u8]) -> Result<[f32; 3]> {
     if pixel.len() < 4 {
-        return Err(error(JPEGXRError::Output(
-            "JPEG XR RGBE pixel is shorter than four bytes",
+        return Err(error(HDRError::Output(
+            "RGBE pixel is shorter than four bytes",
         )));
     }
 

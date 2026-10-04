@@ -1,7 +1,7 @@
 //! Checks fixture dimensions, an FNV-1a-64 RGBA hash, and a four-by-four pooled thumbnail.
 //! Re-record expected output changes with `FOUR_RECORD_GOLDEN=1` and document the difference.
 
-use four::{DecodedImage, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
+use four::{DecodedImage, gif, hdr, jpeg, jpeg_xl, jpeg_xr, png, tiff};
 use tonemapping::{MaxCLLMode, ToneMappingMethod};
 
 /// One pinned fixture.
@@ -192,7 +192,7 @@ fn truncated_fixtures_fail_without_panicking() {
 /// scratch, for every tone-mapping method the viewer can switch to.
 ///
 /// This is the property the viewer's tone-mapping switch relies on: it decodes a JPEG XR source
-/// once, retains the native (pre-tone-mapping) image, and calls `jpeg_xr::tonemap_native` again
+/// once, retains the native (pre-tone-mapping) image, and calls `hdr::tonemap_native` again
 /// on method changes instead of re-reading and re-decoding the file.
 #[test]
 fn retained_native_jpeg_xr_matches_a_fresh_decode_per_method() {
@@ -209,10 +209,10 @@ fn retained_native_jpeg_xr_matches_a_fresh_decode_per_method() {
         ToneMappingMethod::LuminanceReinhard,
         ToneMappingMethod::ReinhardJodie,
     ] {
-        let options = jpeg_xr::DecodeOptions::new(method, MaxCLLMode::Percentile99_99)
-            .with_hdr_metrics(false);
+        let options =
+            hdr::DecodeOptions::new(method, MaxCLLMode::Percentile99_99).with_hdr_metrics(false);
 
-        let from_native = jpeg_xr::tonemap_native(&native, options).unwrap_or_else(|error| {
+        let from_native = hdr::tonemap_native(&native, options).unwrap_or_else(|error| {
             panic!("{method:?} failed to tone-map the retained native image: {error:?}")
         });
         let from_scratch = jpeg_xr::decode_with_metadata_and_options(&bytes, options)

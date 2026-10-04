@@ -10,14 +10,14 @@ use tonemapping::{
 
 use super::pixel::PixelLayout;
 use super::{
-    Error, HDR_BATCH_PIXELS, JPEGXRColorChannel, JPEGXRError, PARALLEL_PIXELS_MIN,
+    Error, HDR_BATCH_PIXELS, HDRColorChannel, HDRError, PARALLEL_PIXELS_MIN,
     PARALLEL_PIXELS_PER_JOB, Result, SC_RGB_REFERENCE_WHITE_NITS, error,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct MaxCLL {
     pub(super) relative_light_level: f32,
-    pub(super) channel: JPEGXRColorChannel,
+    pub(super) channel: HDRColorChannel,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -51,7 +51,7 @@ impl HDRPixelSelection {
         let row_count = source.len() / row_stride;
         let source_pixel_count = pixels_per_row
             .checked_mul(row_count)
-            .expect("validated JPEG XR pixel count fits usize");
+            .expect("validated pixel count fits usize");
 
         invariant!(source_pixel_count > 0);
 
@@ -265,7 +265,7 @@ impl HDRAnalysis {
         if let Some(accumulator) = &accumulator {
             invariant_eq!(
                 usize::try_from(accumulator.pixel_count)
-                    .expect("the bounded JPEG XR pixel count fits usize"),
+                    .expect("the bounded pixel count fits usize"),
                 pixel_count
             );
         }
@@ -351,7 +351,7 @@ pub(super) fn finish_max_cll(estimator: MaxCLLEstimator) -> MaxCLL {
 
     MaxCLL {
         relative_light_level,
-        channel: jpeg_xr_color_channel(estimate.channel()),
+        channel: hdr_color_channel(estimate.channel()),
     }
 }
 
@@ -455,7 +455,7 @@ impl HDRMetricAccumulator {
 
         let pixel_count = f64::from(
             u32::try_from(self.pixel_count)
-                .expect("the bounded JPEG XR pixel count fits u32 metadata arithmetic"),
+                .expect("the bounded pixel count fits u32 metadata arithmetic"),
         );
 
         HDRMetrics {
@@ -529,8 +529,8 @@ fn percentage(part: u64, total: u64) -> f32 {
     invariant!(part <= total);
     invariant!(total > 0);
 
-    let part = u32::try_from(part).expect("the bounded JPEG XR pixel count fits u32");
-    let total = u32::try_from(total).expect("the bounded JPEG XR pixel count fits u32");
+    let part = u32::try_from(part).expect("the bounded pixel count fits u32");
+    let total = u32::try_from(total).expect("the bounded pixel count fits u32");
     percentage_from_u32(part, total)
 }
 
@@ -542,11 +542,11 @@ fn percentage_from_u32(part: u32, total: u32) -> f32 {
     (f64::from(part) * 100.0 / f64::from(total)) as f32
 }
 
-const fn jpeg_xr_color_channel(channel: ToneColorChannel) -> JPEGXRColorChannel {
+const fn hdr_color_channel(channel: ToneColorChannel) -> HDRColorChannel {
     match channel {
-        ToneColorChannel::Red => JPEGXRColorChannel::Red,
-        ToneColorChannel::Green => JPEGXRColorChannel::Green,
-        ToneColorChannel::Blue => JPEGXRColorChannel::Blue,
+        ToneColorChannel::Red => HDRColorChannel::Red,
+        ToneColorChannel::Green => HDRColorChannel::Green,
+        ToneColorChannel::Blue => HDRColorChannel::Blue,
     }
 }
 
@@ -568,15 +568,13 @@ pub(super) fn visit_pixels(
         }
 
         if !pixels.remainder().is_empty() {
-            return Err(error(JPEGXRError::Output(
-                "JPEG XR row contains a partial pixel",
-            )));
+            return Err(error(HDRError::Output("row contains a partial pixel")));
         }
     }
 
     if !rows.remainder().is_empty() {
-        return Err(error(JPEGXRError::Output(
-            "JPEG XR source buffer contains a partial row",
+        return Err(error(HDRError::Output(
+            "source buffer contains a partial row",
         )));
     }
 
@@ -624,7 +622,7 @@ fn visible_alpha_pixel_count_slab(
         if alpha > 0.0 {
             visible_pixels = visible_pixels
                 .checked_add(1)
-                .expect("validated JPEG XR pixel count fits usize");
+                .expect("validated pixel count fits usize");
         }
     })?;
 

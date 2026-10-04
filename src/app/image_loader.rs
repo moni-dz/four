@@ -12,7 +12,7 @@ use exn::{ErrorExt, ResultExt};
 use gpui_kit::{Image as GPUIImage, ImageFormat, SharedString};
 use tonemapping::{MaxCLLMode, ToneMappingMethod};
 
-use four::{DecodedImage, encode_bmp, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
+use four::{DecodedImage, encode_bmp, gif, hdr, jpeg, jpeg_xl, jpeg_xr, png, tiff};
 
 const ERROR_FRAMES_MAX: u32 = 8;
 const MEBIBYTE_BYTES: u64 = 1024 * 1024;
@@ -77,9 +77,9 @@ pub(super) struct DisplayedImage {
     pub(super) height: u32,
     pub(super) source_path: Arc<Path>,
     pub(super) hdr_options: Option<HDROptions>,
-    /// The native (pre-tone-mapping) decode, retained so [`retint_jpeg_xr`] can apply a different
-    /// tone-mapping method without re-running JPEG XR's entropy decode.
-    pub(super) native_jpeg_xr: Option<Arc<jpeg_xr::NativeJPEGXR>>,
+    /// The native (pre-tone-mapping) decode, retained so [`retint_hdr`] can apply a different
+    /// tone-mapping method without re-running the source decoder.
+    pub(super) native_hdr: Option<Arc<hdr::NativeHDR>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -185,7 +185,7 @@ impl SourceFormat {
             Self::PNG if png::is_hdr(bytes) => {
                 let hdr = png::decode_hdr(bytes).or_raise(|| image_decode_error(path))?;
                 let (width, height) = (hdr.width(), hdr.height());
-                let native = jpeg_xr::NativeJPEGXR::from_scrgb(width, height, hdr.into_rgba())
+                let native = hdr::NativeHDR::from_scrgb(width, height, hdr.into_rgba())
                     .or_raise(|| image_decode_error(path))?;
                 tonemap_hdr_source(native, path, hdr_options)
             }
@@ -203,38 +203,38 @@ impl SourceFormat {
 
 struct DecodedSource {
     image: DecodedImage,
-    jpeg_xr_metadata: Option<jpeg_xr::JPEGXRMetadata>,
-    native_jpeg_xr: Option<Arc<jpeg_xr::NativeJPEGXR>>,
+    hdr_metadata: Option<hdr::HDRMetadata>,
+    native_hdr: Option<Arc<hdr::NativeHDR>>,
 }
 
 impl DecodedSource {
     fn standard(image: DecodedImage) -> Self {
         Self {
             image,
-            jpeg_xr_metadata: None,
-            native_jpeg_xr: None,
+            hdr_metadata: None,
+            native_hdr: None,
         }
     }
 }
 
 /// Tone-maps `native` (from JPEG XR or an HDR PNG) and retains it for later re-tone-mapping.
 fn tonemap_hdr_source(
-    native: jpeg_xr::NativeJPEGXR,
+    native: hdr::NativeHDR,
     path: &Path,
     hdr_options: HDROptions,
 ) -> LoadResult<DecodedSource> {
-    let decoded = jpeg_xr::tonemap_native(&native, jpeg_xr_options(hdr_options))
+    let decoded = hdr::tonemap_native(&native, hdr_decode_options(hdr_options))
         .or_raise(|| image_decode_error(path))?;
     let metadata = decoded.metadata();
     Ok(DecodedSource {
         image: decoded.into_image(),
-        jpeg_xr_metadata: Some(metadata),
-        native_jpeg_xr: Some(Arc::new(native)),
+        hdr_metadata: Some(metadata),
+        native_hdr: Some(Arc::new(native)),
     })
 }
 
-fn jpeg_xr_options(hdr_options: HDROptions) -> jpeg_xr::DecodeOptions {
-    jpeg_xr::DecodeOptions::new(hdr_options.tone_mapping(), MaxCLLMode::Percentile99_99)
+fn hdr_decode_options(hdr_options: HDROptions) -> hdr::DecodeOptions {
+    hdr::DecodeOptions::new(hdr_options.tone_mapping(), MaxCLLMode::Percentile99_99)
         .with_hdr_metrics(false)
 }
 
@@ -301,7 +301,7 @@ pub(super) fn load_image_with(path: &Path, hdr_options: HDROptions) -> LoadResul
     assert!(height > 0, "decoded image height must be nonzero");
 
     let active_hdr_options = decoded
-        .jpeg_xr_metadata
+        .hdr_metadata
         .filter(|metadata| metadata.is_hdr())
         .map(|_| hdr_options);
 
@@ -314,7 +314,7 @@ pub(super) fn load_image_with(path: &Path, hdr_options: HDROptions) -> LoadResul
             height,
             source_path: Arc::from(path),
             hdr_options: active_hdr_options,
-            native_jpeg_xr: decoded.native_jpeg_xr,
+            native_hdr: decoded.native_hdr,
         },
         status: format!("{} — {width} × {height}", display_file_name(path)).into(),
     };
@@ -327,16 +327,16 @@ pub(super) fn load_image_with(path: &Path, hdr_options: HDROptions) -> LoadResul
     Ok(loaded)
 }
 
-/// Re-tone-maps an already-decoded native JPEG XR image with different `hdr_options`.
+/// Re-tone-maps an already-decoded native HDR image with different `hdr_options`.
 ///
 /// Skips the file read, format detection, and entropy decode that [`load_image_with`] performs;
-/// only [`jpeg_xr::tonemap_native`] and BMP re-encoding run.
-pub(super) fn retint_jpeg_xr(
-    native: &Arc<jpeg_xr::NativeJPEGXR>,
+/// only [`hdr::tonemap_native`] and BMP re-encoding run.
+pub(super) fn retint_hdr(
+    native: &Arc<hdr::NativeHDR>,
     path: &Path,
     hdr_options: HDROptions,
 ) -> LoadResult<LoadedImage> {
-    let decoded = jpeg_xr::tonemap_native(native, jpeg_xr_options(hdr_options))
+    let decoded = hdr::tonemap_native(native, hdr_decode_options(hdr_options))
         .or_raise(|| image_decode_error(path))?;
 
     let (width, height) = decoded.image().dimensions();
@@ -357,7 +357,7 @@ pub(super) fn retint_jpeg_xr(
             height,
             source_path: Arc::from(path),
             hdr_options: active_hdr_options,
-            native_jpeg_xr: Some(Arc::clone(native)),
+            native_hdr: Some(Arc::clone(native)),
         },
         status: format!("{} — {width} × {height}", display_file_name(path)).into(),
     };

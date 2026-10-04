@@ -27,7 +27,7 @@ use geometry::zoom_to_cursor_pan;
 
 use super::image_loader::{
     DisplayedImage, HDROptions, LoadError, LoadResult, LoadedImage, format_load_error, load_image,
-    load_image_with, retint_jpeg_xr,
+    load_image_with, retint_hdr,
 };
 
 const DRAG_REGION_HEIGHT: f32 = 40.0;
@@ -345,8 +345,8 @@ impl Root {
                 .background_spawn(async move {
                     match source {
                         DecodeSource::File => load_image_with(path.as_ref(), hdr_options),
-                        DecodeSource::RetainedJpegXr(native) => {
-                            retint_jpeg_xr(&native, path.as_ref(), hdr_options)
+                        DecodeSource::RetainedHdr(native) => {
+                            retint_hdr(&native, path.as_ref(), hdr_options)
                         }
                     }
                 })
@@ -444,13 +444,13 @@ impl Root {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((active_options, source_path, native_jpeg_xr)) =
+        let Some((active_options, source_path, native_hdr)) =
             self.viewer.displayed().and_then(|displayed| {
                 displayed.hdr_options.map(|active| {
                     (
                         active,
                         Arc::clone(&displayed.source_path),
-                        displayed.native_jpeg_xr.clone(),
+                        displayed.native_hdr.clone(),
                     )
                 })
             })
@@ -464,8 +464,8 @@ impl Root {
             return;
         };
 
-        let source = match native_jpeg_xr {
-            Some(native) => DecodeSource::RetainedJpegXr(native),
+        let source = match native_hdr {
+            Some(native) => DecodeSource::RetainedHdr(native),
             None => DecodeSource::File,
         };
 
@@ -611,7 +611,7 @@ mod tests {
                 height: 1,
                 source_path: Arc::from(Path::new("test.jxr")),
                 hdr_options: Some(options),
-                native_jpeg_xr: None,
+                native_hdr: None,
             },
             status: "test.jxr".into(),
         })

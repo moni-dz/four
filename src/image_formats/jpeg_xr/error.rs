@@ -13,6 +13,8 @@ pub enum JPEGXRError {
     LimitExceeded(JPEGXRLimit),
     /// Decoded pixels or dimensions violate the output contract.
     Output(&'static str),
+    /// HDR analysis or tone mapping of the decoded pixels failed; the cause is the child error.
+    Normalize,
     /// The input does not begin with a JPEG XR file signature.
     Signature,
     /// Source pixel representation is unsupported for RGBA8 normalization.
@@ -53,6 +55,7 @@ impl fmt::Display for JPEGXRError {
             Self::Codec(source) => write!(f, "JPEG XR codec error: {source}"),
             Self::LimitExceeded(limit) => write_limit_error(f, *limit),
             Self::Output(detail) => f.write_str(detail),
+            Self::Normalize => f.write_str("could not normalize JPEG XR pixels"),
             Self::Signature => f.write_str("expected a JPEG XR file signature"),
             Self::Unsupported(detail) => {
                 write!(f, "unsupported JPEG XR pixel format: {detail}")

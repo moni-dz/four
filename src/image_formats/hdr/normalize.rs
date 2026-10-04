@@ -12,7 +12,7 @@ use tonemapping::{
     Clamp, LinearRGB, LinearRGBPlanes, ToneMapper, ToneMappingMethod, pow_unit_interval,
 };
 
-use super::hdr::{
+use super::analysis::{
     HDRAnalysis, display_luminance_white_point, display_white_point, hdr_luminance_white_point,
     hdr_white_point,
 };
@@ -21,7 +21,7 @@ use super::pixel::{
     decode_rgba128_float_simd,
 };
 use super::{
-    BT2446_INPUT_SCALE, Error, F32x8, HDR_BATCH_PIXELS, JPEGXRError, PARALLEL_PIXELS_MIN,
+    BT2446_INPUT_SCALE, Error, F32x8, HDR_BATCH_PIXELS, HDRError, PARALLEL_PIXELS_MIN,
     PARALLEL_PIXELS_PER_JOB, Result, SRGB_LANES, error, round_clamp_u8,
 };
 
@@ -88,7 +88,7 @@ pub(super) fn write_pixel_slabs(
 
     let pixel_count = width
         .checked_mul(row_count)
-        .expect("validated JPEG XR pixel count fits usize");
+        .expect("validated pixel count fits usize");
 
     if pixel_count < PARALLEL_PIXELS_MIN {
         return writer(source, rgba);
@@ -203,7 +203,7 @@ pub(super) fn write_hdr_pixels(
 
     let pixel_count = width
         .checked_mul(row_count)
-        .expect("validated JPEG XR pixel count fits usize");
+        .expect("validated pixel count fits usize");
 
     let batch_capacity = HDR_BATCH_PIXELS.min(pixel_count);
     let mut colors = LinearRGBPlanes::with_capacity(batch_capacity);
@@ -246,7 +246,7 @@ pub(super) fn write_bgr101010_hdr_pixels(
 
     let pixel_count = width
         .checked_mul(row_count)
-        .expect("validated JPEG XR pixel count fits usize");
+        .expect("validated pixel count fits usize");
 
     let batch_capacity = HDR_BATCH_PIXELS.min(pixel_count);
     let mut colors = LinearRGBPlanes::with_capacity(batch_capacity);
@@ -300,7 +300,7 @@ pub(super) fn write_rgba128_float_hdr_pixels(
 
     let pixel_count = width
         .checked_mul(row_count)
-        .expect("validated JPEG XR pixel count fits usize");
+        .expect("validated pixel count fits usize");
 
     let batch_capacity = HDR_BATCH_PIXELS.min(pixel_count);
     let mut colors = LinearRGBPlanes::with_capacity(batch_capacity);
@@ -466,12 +466,12 @@ pub(super) fn append_hdr_pixels(
 pub(super) fn pixel_at(row: &[u8], x: usize, layout: PixelLayout) -> Result<&[u8]> {
     let start = x
         .checked_mul(layout.bytes_per_pixel)
-        .ok_or_else(|| error(JPEGXRError::Output("JPEG XR pixel offset exceeds usize")))?;
+        .ok_or_else(|| error(HDRError::Output("pixel offset exceeds usize")))?;
 
     let end = start + layout.bytes_per_pixel;
 
     row.get(start..end)
-        .ok_or_else(|| error(JPEGXRError::Output("JPEG XR pixel exceeds its decoded row")))
+        .ok_or_else(|| error(HDRError::Output("pixel exceeds its decoded row")))
 }
 
 pub(super) fn display_linear_to_srgb8(color: LinearRGB) -> [u8; 3] {
