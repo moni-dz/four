@@ -1,5 +1,9 @@
 use multiversion::multiversion;
-use std::simd::{Simd, StdFloat, num::SimdFloat};
+use std::simd::{
+    Select, Simd, StdFloat,
+    cmp::SimdPartialOrd,
+    num::{SimdFloat, SimdInt, SimdUint},
+};
 
 use super::round_clamp_u8;
 
@@ -143,54 +147,86 @@ pub(super) fn inverse(coefficients: &[i32; 64]) -> [u8; 64] {
 // Dispatch only non-flat blocks: a dispatch before the cheap DC-only path would slow down the most
 // common case. Each target gets the same portable-SIMD algorithm, plus a safe baseline copy.
 #[multiversion(targets = "simd")]
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    reason = "IDCT samples are rounded and clamped to the complete u8 range before conversion"
-)]
 fn inverse_simd(coefficients: &[i32; 64]) -> [u8; 64] {
     invariant_eq!(coefficients.len(), BLOCK_SIDE * BLOCK_SIDE);
     invariant!(coefficients[1..].iter().any(|value| *value != 0));
 
-    let mut intermediate = [[0.0_f32; BLOCK_SIDE]; BLOCK_SIDE];
-
-    // Accumulate across frequencies rather than reducing within a lane group. The previous form
-    // ran a horizontal `reduce_sum` per output sample — sixty-four latency-chained shuffle-and-add
-    // pairs per block, each ending in a scalar store. This is the transpose of pass two below.
-    for (vertical_frequency, intermediate_row) in intermediate.iter_mut().enumerate() {
-        let coefficient_start = vertical_frequency * BLOCK_SIDE;
+    // Convert whole rows at once, so pass one broadcasts each coefficient straight from memory
+    // instead of converting and broadcasting it one lane at a time.
+    let mut converted = [[0.0_f32; BLOCK_SIDE]; BLOCK_SIDE];
+    let (coefficient_rows, coefficient_remainder) = coefficients.as_chunks::<BLOCK_SIDE>();
+    
+    invariant_eq!(coefficient_remainder.len(), 0);
+    for (converted, coefficients) in converted.iter_mut().zip(coefficient_rows) {
+        *converted = Simd::<i32, BLOCK_SIDE>::from_array(*coefficients)
+            .cast::<f32>()
+            .to_array();
+    }
+    
+    let rows = converted.map(|coefficients| {
         let mut values = F32x8::splat(0.0);
 
-        for (horizontal_frequency, basis) in BASIS_TRANSPOSED.iter().enumerate() {
-            let coefficient = coefficients[coefficient_start + horizontal_frequency] as f32;
+        for (coefficient, basis) in coefficients.into_iter().zip(BASIS_TRANSPOSED.iter()) {
             values = F32x8::from_array(*basis).mul_add(F32x8::splat(coefficient), values);
         }
 
-        *intermediate_row = values.to_array();
-    }
+        values
+    });
+
+    let scaled = |sample: usize, frequency: usize| F32x8::splat(BASIS[sample][frequency] * 0.25);
+    let level_shift = F32x8::splat(LEVEL_SHIFT);
+
+    let dc_sum = (rows[0] + rows[4]).mul_add(scaled(0, 0), level_shift);
+    let dc_difference = (rows[0] - rows[4]).mul_add(scaled(1, 0), level_shift);
+    let even_first = rows[6].mul_add(scaled(0, 6), rows[2] * scaled(0, 2));
+    let even_second = rows[6].mul_add(scaled(1, 6), rows[2] * scaled(1, 2));
+    let even = [
+        dc_sum + even_first,
+        dc_difference + even_second,
+        dc_difference - even_second,
+        dc_sum - even_first,
+    ];
+    
+    let odd: [F32x8; 4] = std::array::from_fn(|sample| {
+        rows[7].mul_add(
+            scaled(sample, 7),
+            rows[5].mul_add(
+                scaled(sample, 5),
+                rows[3].mul_add(scaled(sample, 3), rows[1] * scaled(sample, 1)),
+            ),
+        )
+    });
 
     let mut samples = [0_u8; 64];
     let (sample_rows, sample_remainder) = samples.as_chunks_mut::<BLOCK_SIDE>();
     invariant_eq!(sample_remainder.len(), 0);
 
-    for (sample_row, basis_row) in sample_rows.iter_mut().zip(BASIS.iter()) {
-        let mut values = F32x8::splat(0.0);
-
-        for (intermediate_row, basis) in intermediate.iter().zip(basis_row.iter()) {
-            values = F32x8::from_array(*intermediate_row).mul_add(F32x8::splat(*basis), values);
-        }
-
-        values = (values / F32x8::splat(4.0) + F32x8::splat(LEVEL_SHIFT))
-            .round()
-            .simd_clamp(F32x8::splat(0.0), F32x8::splat(255.0));
-
-        for (sample, value) in sample_row.iter_mut().zip(values.to_array()) {
-            *sample = value as u8;
-        }
+    for (sample, (even, odd)) in even.into_iter().zip(odd).enumerate() {
+        sample_rows[sample] = encode_samples(even + odd);
+        sample_rows[BLOCK_SIDE - 1 - sample] = encode_samples(even - odd);
     }
 
     samples
+}
+
+/// Rounds level-shifted samples half away from zero and saturates them to `u8`.
+#[inline(always)]
+#[expect(
+    clippy::inline_always,
+    reason = "must compile under the calling multiversioned function's target features"
+)]
+fn encode_samples(values: F32x8) -> [u8; BLOCK_SIDE] {
+    let values = values
+        .simd_gt(F32x8::splat(0.0))
+        .select(values, F32x8::splat(0.0));
+
+    let values = values
+        .simd_lt(F32x8::splat(255.0))
+        .select(values, F32x8::splat(255.0));
+
+    #[expect(unsafe_code, reason = "an unchecked conversion is one instruction")]
+    let rounded = unsafe { (values + F32x8::splat(0.499_999_97)).to_int_unchecked::<u32>() };
+    rounded.cast::<u8>().to_array()
 }
 
 #[cfg(test)]

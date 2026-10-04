@@ -1,10 +1,16 @@
 //! Writes SDR and tone-mapped HDR pixels into the output RGBA8 buffer.
 
-use std::simd::{Select, Simd, StdFloat, cmp::SimdPartialOrd, num::SimdFloat};
+use std::simd::{
+    Select, Simd, StdFloat,
+    cmp::SimdPartialOrd,
+    num::{SimdFloat, SimdUint},
+};
 
 use multiversion::multiversion;
 use rayon::prelude::*;
-use tonemapping::{Clamp, LinearRGB, LinearRGBPlanes, ToneMapper, ToneMappingMethod, exp2, log2};
+use tonemapping::{
+    Clamp, LinearRGB, LinearRGBPlanes, ToneMapper, ToneMappingMethod, pow_unit_interval,
+};
 
 use super::hdr::{
     HDRAnalysis, display_luminance_white_point, display_white_point, hdr_luminance_white_point,
@@ -256,16 +262,9 @@ pub(super) fn write_bgr101010_hdr_pixels(
 
         for chunk in chunks {
             let packed = Simd::<u32, SRGB_LANES>::from_array((*chunk).map(u32::from_ne_bytes));
-            let [red, green, blue] = decode_bgr101010_simd(packed).map(Simd::to_array);
-
-            for ((red, green), blue) in red.into_iter().zip(green).zip(blue) {
-                colors.push(LinearRGB::new([
-                    red * color_scale,
-                    green * color_scale,
-                    blue * color_scale,
-                ]));
-                alphas.push(u8::MAX);
-            }
+            let scale = Simd::splat(color_scale);
+            colors.extend_from_lanes(decode_bgr101010_simd(packed).map(|channel| channel * scale));
+            alphas.extend_from_slice(&[u8::MAX; SRGB_LANES]);
 
             if colors.len() >= HDR_BATCH_PIXELS {
                 write_tone_mapped_batch(mapper, &mut colors, &mut alphas, rgba, &mut rgba_offset);
@@ -317,16 +316,12 @@ pub(super) fn write_rgba128_float_hdr_pixels(
         let (chunks, tail) = pixels.as_chunks::<SRGB_LANES>();
 
         for chunk in chunks {
-            let ([red, green, blue], alpha) = decode_rgba128_float_simd(chunk);
+            let (color, alpha) = decode_rgba128_float_simd(chunk);
             let scale = Simd::splat(color_scale);
-            let red = (red * scale).to_array();
-            let green = (green * scale).to_array();
-            let blue = (blue * scale).to_array();
-            let alpha = alpha.to_array();
+            colors.extend_from_lanes(color.map(|channel| channel * scale));
 
-            for (((red, green), blue), alpha) in red.into_iter().zip(green).zip(blue).zip(alpha) {
+            for alpha in alpha.to_array() {
                 has_nonzero_alpha |= alpha > 0.0;
-                colors.push(LinearRGB::new([red, green, blue]));
                 alphas.push(normalized_to_u8(alpha));
             }
 
@@ -406,24 +401,28 @@ pub(super) fn write_display_pixels(
         .zip(alpha_chunks)
         .zip(target_chunks)
     {
-        // Match `normalized_to_u8`: round half away from zero, then saturate the cast.
-        let encoded = [*red, *green, *blue].map(|channel| {
-            let srgb = linear_to_srgb_simd(F32x8::from_array(channel));
-            (srgb.simd_clamp(F32x8::splat(0.0), F32x8::splat(1.0))
-                * F32x8::splat(f32::from(u8::MAX)))
-            .round()
-            .cast::<u8>()
-            .to_array()
-        });
+        let [red, green, blue] = [*red, *green, *blue].map(|channel| {
+            let scaled =
+                linear_to_srgb_simd(F32x8::from_array(channel)) * F32x8::splat(f32::from(u8::MAX));
 
-        for lane in 0..SRGB_LANES {
-            targets[lane] = [
-                encoded[0][lane],
-                encoded[1][lane],
-                encoded[2][lane],
-                alphas[lane],
-            ];
-        }
+            // Match `normalized_to_u8`, which rounds half away from zero. sRGB output is in
+            // `0.0..1.0`, so `scaled` is in `0.0..255.0` and adding the largest `f32` below one
+            // half before truncating rounds it exactly that way.
+            #[expect(unsafe_code, reason = "an unchecked conversion is one instruction")]
+            // SAFETY: `scaled + 0.49999997` is finite and in `0.0..256.0`, so it fits `u32`.
+            unsafe {
+                (scaled + F32x8::splat(0.499_999_97)).to_int_unchecked::<u32>()
+            }
+        });
+        let alpha = Simd::<u8, SRGB_LANES>::from_array(*alphas).cast::<u32>();
+
+        // Assemble each RGBA pixel in a 32-bit lane with shifts, rather than interleaving bytes
+        // across four vectors with shuffles.
+        let pixels = red
+            | (green << Simd::splat(8))
+            | (blue << Simd::splat(16))
+            | (alpha << Simd::splat(24));
+        *targets = pixels.to_array().map(u32::to_le_bytes);
     }
 
     for ((((red, green), blue), alpha), target) in red_tail
@@ -488,12 +487,24 @@ fn linear_to_srgb(value: f32) -> f32 {
     linear_to_srgb_simd(Simd::<f32, 1>::splat(value))[0]
 }
 
-#[inline]
+/// Encodes display-linear `value` with the sRGB transfer function, returning `0.0..1.0`.
+#[inline(always)]
+#[expect(
+    clippy::inline_always,
+    reason = "must compile under the calling multiversioned function's target features"
+)]
 fn linear_to_srgb_simd<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
-    let value = value.simd_clamp(Simd::splat(0.0), Simd::splat(1.0));
+    // Compare-selects that lower to one `MAXPS` and one `MINPS`, mapping `NaN` to zero.
+    let value = value
+        .simd_gt(Simd::splat(0.0))
+        .select(value, Simd::splat(0.0));
+    let value = value
+        .simd_lt(Simd::splat(1.0))
+        .select(value, Simd::splat(1.0));
+
     let linear = value * Simd::splat(12.92);
     let nonlinear =
-        exp2(log2(value) * Simd::splat(1.0 / 2.4)) * Simd::splat(1.055) - Simd::splat(0.055);
+        pow_unit_interval(value, 1.0 / 2.4).mul_add(Simd::splat(1.055), Simd::splat(-0.055));
     value
         .simd_le(Simd::splat(0.003_130_8))
         .select(linear, nonlinear)

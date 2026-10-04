@@ -5,7 +5,7 @@ use multiversion::multiversion;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::convert::Infallible;
-use std::simd::{Simd, StdFloat, num::SimdFloat};
+use std::simd::{Select, Simd, cmp::SimdPartialOrd, num::SimdFloat};
 
 use super::{
     BLOCK_SIDE, COMPONENTS_MAX, DIMENSION_MAX, DecodedImage, Dimensions, Error, JPEGError,
@@ -578,18 +578,32 @@ fn convert_color_row(
             - red_difference * F32x8::splat(0.714_136);
         let blue_out = luminance + blue_difference * F32x8::splat(1.772);
 
+        // Match `round_clamp_u8`. Clamping commutes with rounding to the integer bounds, and for
+        // nonnegative values adding the largest `f32` below one half before truncating rounds
+        // half away from zero exactly. Each compare-select lowers to one `MAXPS` or `MINPS`.
         let encode = |values: F32x8| {
-            values
-                .round()
-                .simd_clamp(F32x8::splat(0.0), F32x8::splat(255.0))
-                .cast::<u8>()
-                .to_array()
+            let values = values
+                .simd_gt(F32x8::splat(0.0))
+                .select(values, F32x8::splat(0.0));
+            let values = values
+                .simd_lt(F32x8::splat(255.0))
+                .select(values, F32x8::splat(255.0));
+
+            #[expect(unsafe_code, reason = "an unchecked conversion is one instruction")]
+            // SAFETY: `values + 0.49999997` is finite and in `0.0..256.0`, so it fits `u32`.
+            unsafe {
+                (values + F32x8::splat(0.499_999_97)).to_int_unchecked::<u32>()
+            }
         };
         let [red_out, green_out, blue_out] = [red_out, green_out, blue_out].map(encode);
 
-        for lane in 0..COLOR_LANES {
-            targets[lane] = [red_out[lane], green_out[lane], blue_out[lane], 255];
-        }
+        // Assemble each RGBA pixel in a 32-bit lane with shifts, rather than interleaving bytes
+        // across four vectors with shuffles.
+        let pixels = red_out
+            | (green_out << Simd::splat(8))
+            | (blue_out << Simd::splat(16))
+            | Simd::splat(0xff00_0000);
+        *targets = pixels.to_array().map(u32::to_le_bytes);
     }
 
     for (((first, second), third), target) in first_tail

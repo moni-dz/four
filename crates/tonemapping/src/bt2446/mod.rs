@@ -2,12 +2,12 @@ use multiversion::multiversion;
 use std::simd::{
     Select, Simd, StdFloat,
     cmp::{SimdPartialEq, SimdPartialOrd},
-    num::SimdFloat,
 };
 
 use super::{LinearRGB, LinearRGBPlanes, ToneMapper};
 use crate::math::{
-    exp2, exp2_bounded, exp2_scalar, log2, log2_positive_normal, log2_scalar, recip,
+    exp2_bounded, log2_positive_normal, max_or_second, min_or_second, pow_unit_interval, recip,
+    recip_for_target,
 };
 use crate::simd::map_planes;
 
@@ -81,7 +81,17 @@ impl ToneMapper for BT2446A {
     }
 }
 
-#[multiversion(targets = "simd")]
+#[multiversion(targets(
+    "x86_64+avx512f+avx512vl",
+    "x86_64+avx512f",
+    "x86_64+avx2+fma",
+    "x86_64+avx",
+    "x86_64+sse4.1",
+    "x86+avx2+fma",
+    "x86+sse4.2",
+    "x86+sse2",
+    "aarch64+neon",
+))]
 fn bt2446a_batch(colors: &mut [LinearRGB]) {
     let (chunks, tail) = colors.as_chunks_mut::<BT2446_LANES>();
     debug_assert!(
@@ -93,7 +103,7 @@ fn bt2446a_batch(colors: &mut [LinearRGB]) {
         let components = [0, 1, 2]
             .map(|channel| F32x16::from_array(std::array::from_fn(|lane| chunk[lane].0[channel])));
 
-        let mapped = bt2446a_simd(&components);
+        let mapped = bt2446a_simd(&components, |x| recip_for_target!(x));
 
         for lane in 0..BT2446_LANES {
             chunk[lane] = LinearRGB([mapped[0][lane], mapped[1][lane], mapped[2][lane]]);
@@ -101,7 +111,17 @@ fn bt2446a_batch(colors: &mut [LinearRGB]) {
     }
 }
 
-#[multiversion(targets = "simd")]
+#[multiversion(targets(
+    "x86_64+avx512f+avx512vl",
+    "x86_64+avx512f",
+    "x86_64+avx2+fma",
+    "x86_64+avx",
+    "x86_64+sse4.1",
+    "x86+avx2+fma",
+    "x86+sse4.2",
+    "x86+sse2",
+    "aarch64+neon",
+))]
 fn bt2446a_planes(colors: &mut LinearRGBPlanes) {
     let [red, green, blue] = colors.channels_mut();
     let [red_chunks, green_chunks, blue_chunks] = [red, green, blue].map(|channel| {
@@ -111,7 +131,7 @@ fn bt2446a_planes(colors: &mut LinearRGBPlanes) {
 
     for ((red, green), blue) in red_chunks.iter_mut().zip(green_chunks).zip(blue_chunks) {
         let components = [*red, *green, *blue].map(F32x16::from_array);
-        let mapped = bt2446a_simd(&components);
+        let mapped = bt2446a_simd(&components, |x| recip_for_target!(x));
 
         *red = mapped[0];
         *green = mapped[1];
@@ -119,133 +139,83 @@ fn bt2446a_planes(colors: &mut LinearRGBPlanes) {
     }
 }
 
-#[inline]
-#[allow(clippy::similar_names, reason = "cb/cr mirror the CB_DIVISOR/CR_DIVISOR constants")]
-fn bt2446a_simd(components: &[F32x16; 3]) -> [[f32; BT2446_LANES]; 3] {
-    let zero = F32x16::splat(0.0);
-    let one = F32x16::splat(1.0);
-    let peak_ratio_inv = F32x16::splat(1.0 / HDR_TO_SDR_PEAK_RATIO);
-    let transfer_exponent_inv = F32x16::splat(1.0 / 2.4);
-    let log2_rho_hdr_inv = F32x16::splat(1.0 / LOG2_RHO_HDR);
-    let rho_sdr_minus_one_inv = F32x16::splat(1.0 / (RHO_SDR - 1.0));
-    let cb_divisor_inv = F32x16::splat(1.0 / CB_DIVISOR);
-    let cr_divisor_inv = F32x16::splat(1.0 / CR_DIVISOR);
+/// Maps sanitized colors, one per lane. Inlined into each multiversioned caller, so that it compiles
+/// for the caller's instruction set rather than the baseline target.
+#[inline(always)]
+#[expect(
+    clippy::inline_always,
+    reason = "must compile under the calling multiversioned function's target features"
+)]
+#[allow(
+    clippy::similar_names,
+    reason = "cb/cr mirror the CB_DIVISOR/CR_DIVISOR constants"
+)]
+fn bt2446a_simd<const N: usize>(
+    components: &[Simd<f32, N>; 3],
+    recip: impl Fn(Simd<f32, N>) -> Simd<f32, N>,
+) -> [[f32; N]; 3] {
+    let zero = Simd::splat(0.0);
+    let one = Simd::splat(1.0);
+
 
     let nonlinear = components.map(|component| {
-        let normalized = (component * peak_ratio_inv).simd_clamp(zero, one);
-        exp2(log2(normalized) * transfer_exponent_inv)
+        let normalized = min_or_second(component * Simd::splat(1.0 / HDR_TO_SDR_PEAK_RATIO), one);
+        pow_unit_interval(normalized, 1.0 / 2.4)
     });
 
     let input_luma = nonlinear[2].mul_add(
-        F32x16::splat(BT2020_LUMA[2]),
+        Simd::splat(BT2020_LUMA[2]),
         nonlinear[1].mul_add(
-            F32x16::splat(BT2020_LUMA[1]),
-            nonlinear[0] * F32x16::splat(BT2020_LUMA[0]),
+            Simd::splat(BT2020_LUMA[1]),
+            nonlinear[0] * Simd::splat(BT2020_LUMA[0]),
         ),
     );
 
-    // `input_luma` is a sum of nonnegative terms (each `nonlinear` channel and `BT2020_LUMA`
-    // weight is nonnegative), so this argument is always finite and at least `1.0`.
-    let perceptual_luma =
-        log2_positive_normal(one + F32x16::splat(RHO_HDR - 1.0) * input_luma) * log2_rho_hdr_inv;
+    let perceptual_luma = log2_positive_normal(Simd::splat(RHO_HDR - 1.0).mul_add(input_luma, one))
+        * Simd::splat(1.0 / LOG2_RHO_HDR);
 
-    let compressed_luma = perceptual_luma.simd_le(F32x16::splat(0.739_9)).select(
-        F32x16::splat(1.077_0) * perceptual_luma,
-        perceptual_luma.simd_lt(F32x16::splat(0.990_9)).select(
+    let compressed_luma = perceptual_luma.simd_le(Simd::splat(0.739_9)).select(
+        Simd::splat(1.077_0) * perceptual_luma,
+        perceptual_luma.simd_lt(Simd::splat(0.990_9)).select(
             perceptual_luma.mul_add(
-                perceptual_luma.mul_add(F32x16::splat(-1.151_0), F32x16::splat(2.781_1)),
-                F32x16::splat(-0.630_2),
+                perceptual_luma.mul_add(Simd::splat(-1.151_0), Simd::splat(2.781_1)),
+                Simd::splat(-0.630_2),
             ),
-            F32x16::splat(0.5) * perceptual_luma + F32x16::splat(0.5),
+            perceptual_luma.mul_add(Simd::splat(0.5), Simd::splat(0.5)),
         ),
     );
 
-    // `perceptual_luma` is in `0.0..=~1.0` (a knee function of a `0.0..=1.0`-ish input), so this
-    // argument stays near `0.0..=LOG2_RHO_SDR`, far inside `exp2_bounded`'s safe range.
-    let output_luma =
-        (exp2_bounded(compressed_luma * F32x16::splat(LOG2_RHO_SDR)) - one) * rho_sdr_minus_one_inv;
+    let output_luma = (exp2_bounded(compressed_luma * Simd::splat(LOG2_RHO_SDR)) - one)
+        * Simd::splat(1.0 / (RHO_SDR - 1.0));
 
     let color_scale = input_luma
         .simd_eq(zero)
-        .select(zero, output_luma * recip(F32x16::splat(1.1) * input_luma));
+        .select(zero, output_luma * recip(Simd::splat(1.1) * input_luma));
 
-    let blue_difference = color_scale * (nonlinear[2] - input_luma) * cb_divisor_inv;
-    let red_difference = color_scale * (nonlinear[0] - input_luma) * cr_divisor_inv;
+    let blue_difference = color_scale * (nonlinear[2] - input_luma) * Simd::splat(1.0 / CB_DIVISOR);
+    let red_difference = color_scale * (nonlinear[0] - input_luma) * Simd::splat(1.0 / CR_DIVISOR);
 
-    let adjusted_luma = red_difference
-        .simd_max(zero)
-        .mul_add(F32x16::splat(-0.1), output_luma);
+    let adjusted_luma = max_or_second(red_difference, zero).mul_add(Simd::splat(-0.1), output_luma);
 
     let output_nonlinear = [
-        red_difference.mul_add(F32x16::splat(CR_DIVISOR), adjusted_luma),
+        red_difference.mul_add(Simd::splat(CR_DIVISOR), adjusted_luma),
         red_difference.mul_add(
-            F32x16::splat(-(BT2020_LUMA[0] * CR_DIVISOR / BT2020_LUMA[1])),
+            Simd::splat(-(BT2020_LUMA[0] * CR_DIVISOR / BT2020_LUMA[1])),
             blue_difference.mul_add(
-                F32x16::splat(-(BT2020_LUMA[2] * CB_DIVISOR / BT2020_LUMA[1])),
+                Simd::splat(-(BT2020_LUMA[2] * CB_DIVISOR / BT2020_LUMA[1])),
                 adjusted_luma,
             ),
         ),
-        blue_difference.mul_add(F32x16::splat(CB_DIVISOR), adjusted_luma),
+        blue_difference.mul_add(Simd::splat(CB_DIVISOR), adjusted_luma),
     ];
 
-    output_nonlinear.map(|component| {
-        let bounded = component.simd_clamp(zero, one);
-
-        exp2(log2(bounded) * F32x16::splat(2.4)).to_array()
-    })
+    output_nonlinear
+        .map(|component| pow_unit_interval(min_or_second(component, one), 2.4).to_array())
 }
 
 fn bt2446a(color: LinearRGB) -> LinearRGB {
-    let nonlinear = color.components().map(|component| {
-        let normalized = (component * (1.0 / HDR_TO_SDR_PEAK_RATIO)).clamp(0.0, 1.0);
-        exp2_scalar(log2_scalar(normalized) * (1.0 / 2.4))
-    });
+    let components = color.components().map(Simd::<f32, 1>::splat);
+    let mapped = bt2446a_simd(&components, recip);
 
-    let input_luma = nonlinear[2].mul_add(
-        BT2020_LUMA[2],
-        nonlinear[1].mul_add(BT2020_LUMA[1], nonlinear[0] * BT2020_LUMA[0]),
-    );
-
-    let output_luma = bt2446a_luma(input_luma);
-
-    let color_scale = if input_luma == 0.0 {
-        0.0
-    } else {
-        output_luma * recip(Simd::<f32, 1>::splat(1.1 * input_luma))[0]
-    };
-
-    let blue_difference = color_scale * (nonlinear[2] - input_luma) * (1.0 / CB_DIVISOR);
-    let red_difference = color_scale * (nonlinear[0] - input_luma) * (1.0 / CR_DIVISOR);
-    let adjusted_luma = red_difference.max(0.0).mul_add(-0.1, output_luma);
-
-    let output_nonlinear = [
-        red_difference.mul_add(CR_DIVISOR, adjusted_luma),
-        red_difference.mul_add(
-            -(BT2020_LUMA[0] * CR_DIVISOR / BT2020_LUMA[1]),
-            blue_difference.mul_add(
-                -(BT2020_LUMA[2] * CB_DIVISOR / BT2020_LUMA[1]),
-                adjusted_luma,
-            ),
-        ),
-        blue_difference.mul_add(CB_DIVISOR, adjusted_luma),
-    ];
-
-    LinearRGB::displayable(output_nonlinear.map(|component| {
-        let bounded = component.clamp(0.0, 1.0);
-        exp2_scalar(log2_scalar(bounded) * 2.4)
-    }))
-}
-
-fn bt2446a_luma(input_luma: f32) -> f32 {
-    let perceptual_luma = log2_scalar(1.0 + (RHO_HDR - 1.0) * input_luma) * (1.0 / LOG2_RHO_HDR);
-
-    let compressed_luma = if perceptual_luma <= 0.739_9 {
-        1.077_0 * perceptual_luma
-    } else if perceptual_luma < 0.990_9 {
-        perceptual_luma.mul_add(perceptual_luma.mul_add(-1.151_0, 2.781_1), -0.630_2)
-    } else {
-        0.5 * perceptual_luma + 0.5
-    };
-
-    (exp2_scalar(compressed_luma * LOG2_RHO_SDR) - 1.0) * (1.0 / (RHO_SDR - 1.0))
+    LinearRGB::displayable(mapped.map(|[component]| component))
 }

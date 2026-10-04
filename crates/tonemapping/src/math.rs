@@ -112,11 +112,25 @@ const EXP2_POLYNOMIAL: [f32; 6] = [
 /// `1 / ln(2)`, for converting a natural logarithm to base two.
 const LOG2_E: f32 = std::f32::consts::LOG2_E;
 
-/// `sqrt(2)`, the upper end of the mantissa range the logarithm polynomial covers.
-const SQRT_TWO: f32 = std::f32::consts::SQRT_2;
+/// The bits of `sqrt(2) / 2`. Subtracting them from an input's bits splits it into an exponent and
+/// a mantissa in `[sqrt(2)/2, sqrt(2))`, where the logarithm polynomial is accurate, with integer
+/// arithmetic alone: no compare, select, or halving multiply recentres the mantissa.
+const HALF_SQRT_TWO_BITS: i32 = 0x3f35_04f3;
+
+/// `1.5 * 2^23`. Adding it to an `f32` below `2^22` in magnitude rounds to the nearest integer and
+/// leaves that integer in the low mantissa bits, which replaces a `round` and an `f32`-to-`i32`
+/// conversion with one add.
+const ROUNDING_SHIFTER: f32 = 12_582_912.0;
+
+/// `2^24`, which scales a subnormal into the normal range.
+const SUBNORMAL_SCALE: f32 = 16_777_216.0;
 
 /// Evaluates a polynomial in `value` by Horner's method, highest coefficient first.
-#[inline]
+#[inline(always)]
+#[expect(
+    clippy::inline_always,
+    reason = "must compile under the calling multiversioned function's target features"
+)]
 pub(crate) fn polynomial<const N: usize, const DEGREE: usize>(
     value: Simd<f32, N>,
     coefficients: [f32; DEGREE],
@@ -130,6 +144,84 @@ pub(crate) fn polynomial<const N: usize, const DEGREE: usize>(
     accumulator
 }
 
+/// Returns `a` where it exceeds `b`, otherwise `b`, including where either is `NaN`.
+///
+/// Matches x86 `MAXPS` operand for operand, so it lowers to one instruction where
+/// [`SimdFloat::simd_max`] needs extra `NaN` fixups.
+#[inline(always)]
+#[expect(
+    clippy::inline_always,
+    reason = "must compile under the calling multiversioned function's target features"
+)]
+pub(crate) fn max_or_second<const N: usize>(a: Simd<f32, N>, b: Simd<f32, N>) -> Simd<f32, N> {
+    a.simd_gt(b).select(a, b)
+}
+
+/// Returns `a` where it is below `b`, otherwise `b`, including where either is `NaN`.
+///
+/// The `MINPS` counterpart of [`max_or_second`].
+#[inline(always)]
+#[expect(
+    clippy::inline_always,
+    reason = "must compile under the calling multiversioned function's target features"
+)]
+pub(crate) fn min_or_second<const N: usize>(a: Simd<f32, N>, b: Simd<f32, N>) -> Simd<f32, N> {
+    a.simd_lt(b).select(a, b)
+}
+
+/// `log2` of positive, finite, normal lanes; other lanes return unspecified finite values.
+#[inline(always)]
+#[expect(
+    clippy::inline_always,
+    reason = "must compile under the calling multiversioned function's target features"
+)]
+fn log2_normal<const N: usize>(value: Simd<f32, N>, exponent_adjust: Simd<i32, N>) -> Simd<f32, N> {
+    let offset = value.to_bits().cast::<i32>() - Simd::splat(HALF_SQRT_TWO_BITS);
+    let exponent = ((offset >> Simd::splat(23)) + exponent_adjust).cast::<f32>();
+    let mantissa = Simd::<f32, N>::from_bits(
+        ((offset & Simd::splat(0x007f_ffff)) + Simd::splat(HALF_SQRT_TWO_BITS)).cast::<u32>(),
+    );
+
+    // log(mantissa) = t + t^3 * P(t) - t^2 / 2, with t = mantissa - 1.
+    let t = mantissa - Simd::splat(1.0);
+    let squared = t * t;
+    let corrected = (t * squared).mul_add(
+        polynomial(t, LOG_POLYNOMIAL),
+        squared.mul_add(Simd::splat(-0.5), t),
+    );
+
+    corrected.mul_add(Simd::splat(LOG2_E), exponent)
+}
+
+/// Splits `value` into `2^fraction`, with `fraction` in `[-0.5, 0.5]`, and the bits of `value`
+/// plus [`ROUNDING_SHIFTER`], whose low bits hold the rounded integer part.
+///
+/// Requires `value` below `2^22` in magnitude.
+#[inline(always)]
+#[expect(
+    clippy::inline_always,
+    reason = "must compile under the calling multiversioned function's target features"
+)]
+fn exp2_split<const N: usize>(value: Simd<f32, N>) -> (Simd<f32, N>, Simd<u32, N>) {
+    let shifted = value + Simd::splat(ROUNDING_SHIFTER);
+    let fraction = value - (shifted - Simd::splat(ROUNDING_SHIFTER));
+    let fractional = fraction.mul_add(polynomial(fraction, EXP2_POLYNOMIAL), Simd::splat(1.0));
+
+    (fractional, shifted.to_bits())
+}
+
+/// Returns `2^whole` for an integer `whole` in `-126..=127`, from [`exp2_split`]'s shifted bits.
+#[inline(always)]
+#[expect(
+    clippy::inline_always,
+    reason = "must compile under the calling multiversioned function's target features"
+)]
+fn exp2_scale<const N: usize>(shifted: Simd<u32, N>) -> Simd<f32, N> {
+    // The shifter's own bits are a multiple of 2^22, so shifting by 23 discards them and leaves
+    // `whole` in the exponent field; adding the bias completes `2^whole`.
+    Simd::from_bits((shifted << Simd::splat(23)) + Simd::splat(127 << 23))
+}
+
 /// Returns the base-two logarithm of each lane.
 ///
 /// Zero and negative inputs return negative infinity and `NaN`, matching [`f32::log2`]. Subnormal
@@ -139,38 +231,10 @@ pub(crate) fn polynomial<const N: usize, const DEGREE: usize>(
 pub fn log2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
     // A subnormal has a zero exponent field, so decomposing it directly would read a mantissa
     // without its implicit leading bit. Multiplying by 2^24 makes it normal; the exponent
-    // correction comes back out below.
-    const SUBNORMAL_SCALE: f32 = 16_777_216.0;
-    let subnormal = value.simd_lt(Simd::splat(f32::MIN_POSITIVE)) & value.simd_gt(Simd::splat(0.0));
+    // correction comes back out through the mask below.
+    let subnormal = value.simd_lt(Simd::splat(f32::MIN_POSITIVE));
     let scaled = subnormal.select(value * Simd::splat(SUBNORMAL_SCALE), value);
-    let scale_correction = subnormal.select(Simd::splat(-24.0), Simd::splat(0.0));
-
-    // Split into a mantissa in [1, 2) and an unbiased exponent.
-    let bits = scaled.to_bits();
-    let exponent = ((bits >> Simd::splat(23)) & Simd::splat(0xff)).cast::<i32>() - Simd::splat(127);
-    let mantissa =
-        Simd::from_bits((bits & Simd::splat(0x007f_ffff)) | Simd::splat(0x3f80_0000_u32));
-
-    // Recentre onto [sqrt(2)/2, sqrt(2)), where the polynomial is accurate, by lending a power of
-    // two to the exponent. Without this the argument reaches 1.0 at the top of the binade, where
-    // the series converges far too slowly.
-    let lend = mantissa.simd_gt(Simd::splat(SQRT_TWO));
-    let mantissa = lend.select(mantissa * Simd::splat(0.5), mantissa);
-
-    let exponent = lend
-        .select(exponent + Simd::splat(1), exponent)
-        .cast::<f32>();
-
-    // log(mantissa) = t + t^3 * P(t) - t^2 / 2, with t = mantissa - 1.
-    let t = mantissa - Simd::splat(1.0);
-    let squared = t * t;
-
-    let corrected = (t * squared).mul_add(
-        polynomial(t, LOG_POLYNOMIAL),
-        squared * Simd::splat(-0.5) + t,
-    );
-
-    let result = corrected.mul_add(Simd::splat(LOG2_E), exponent + scale_correction);
+    let result = log2_normal(scaled, subnormal.to_simd() & Simd::splat(-24));
 
     // Zero, negatives and non-finite inputs never reach the polynomial's assumptions.
     let result = value
@@ -178,48 +242,40 @@ pub fn log2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
         .select(Simd::splat(f32::NEG_INFINITY), result);
 
     let result = value
-        .simd_lt(Simd::splat(0.0))
-        .select(Simd::splat(f32::NAN), result);
-
-    let result = value
         .simd_eq(Simd::splat(f32::INFINITY))
         .select(Simd::splat(f32::INFINITY), result);
 
-    value.is_nan().select(Simd::splat(f32::NAN), result)
+    // Also true for `NaN`.
+    value
+        .simd_ge(Simd::splat(0.0))
+        .select(result, Simd::splat(f32::NAN))
 }
 
 /// Returns two raised to the power of each lane.
 ///
-/// Underflows to zero below `-149` and overflows to infinity above `128`, matching [`f32::exp2`].
+/// Rounds to zero below `-149` and overflows to infinity from `128`, matching [`f32::exp2`].
 #[must_use]
 #[inline]
 pub fn exp2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
-    // Clamping first keeps the exponent assembly below in range; the true extremes are restored by
-    // the selects at the end.
-    let bounded = value.simd_clamp(Simd::splat(-150.0), Simd::splat(129.0));
+    // `NaN` passes both bounds and propagates through the arithmetic below. The bounds keep the
+    // two half scales below normal, and `2^-150` and `2^129` still round to zero and infinity.
+    let bounded = min_or_second(
+        Simd::splat(129.0),
+        max_or_second(Simd::splat(-150.0), value),
+    );
 
-    // Split into an integer part and a remainder in [-0.5, 0.5].
-    let whole = bounded.round();
-    let fraction = bounded - whole;
+    let (fractional, shifted) = exp2_split(bounded);
 
-    // 2^fraction, via the minimax polynomial for 2^x - 1.
-    let fractional = fraction.mul_add(polynomial(fraction, EXP2_POLYNOMIAL), Simd::splat(1.0));
+    // Apply `2^whole` as two normal halves so that results below `2^-126` round once, to the
+    // correct subnormal, rather than wrapping the exponent field. Both multiplies are exact for
+    // normal results.
+    let whole = shifted.cast::<i32>() - Simd::splat(ROUNDING_SHIFTER.to_bits().cast_signed());
+    let low = whole >> Simd::splat(1);
+    let scale = |exponent: Simd<i32, N>| {
+        Simd::<f32, N>::from_bits(((exponent + Simd::splat(127)) << Simd::splat(23)).cast::<u32>())
+    };
 
-    // 2^whole, assembled directly into the exponent field.
-    let exponent = whole.cast::<i32>() + Simd::splat(127);
-    let scale = Simd::<f32, N>::from_bits((exponent << Simd::splat(23)).cast::<u32>());
-
-    let result = fractional * scale;
-
-    let result = value
-        .simd_le(Simd::splat(-150.0))
-        .select(Simd::splat(0.0), result);
-
-    let result = value
-        .simd_ge(Simd::splat(128.0))
-        .select(Simd::splat(f32::INFINITY), result);
-
-    value.is_nan().select(Simd::splat(f32::NAN), result)
+    fractional * scale(low) * scale(whole - low)
 }
 
 /// `log2`, for finite values at least `1.0`.
@@ -228,62 +284,71 @@ pub fn exp2<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
 ///
 /// Callers must not rely on a defined result outside `1.0..=f32::MAX`.
 #[must_use]
-#[inline]
+#[inline(always)]
+#[expect(
+    clippy::inline_always,
+    reason = "must compile under the calling multiversioned function's target features"
+)]
 pub(crate) fn log2_positive_normal<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
-    let bits = value.to_bits();
-    let exponent = ((bits >> Simd::splat(23)) & Simd::splat(0xff)).cast::<i32>() - Simd::splat(127);
-    let mantissa =
-        Simd::from_bits((bits & Simd::splat(0x007f_ffff)) | Simd::splat(0x3f80_0000_u32));
-
-    let lend = mantissa.simd_gt(Simd::splat(SQRT_TWO));
-    let mantissa = lend.select(mantissa * Simd::splat(0.5), mantissa);
-    let exponent = lend
-        .select(exponent + Simd::splat(1), exponent)
-        .cast::<f32>();
-
-    let t = mantissa - Simd::splat(1.0);
-    let squared = t * t;
-    let corrected = (t * squared).mul_add(
-        polynomial(t, LOG_POLYNOMIAL),
-        squared * Simd::splat(-0.5) + t,
-    );
-
-    corrected.mul_add(Simd::splat(LOG2_E), exponent)
+    log2_normal(value, Simd::splat(0))
 }
 
 /// `exp2`, for finite values away from the `-150.0..=128.0` extremes.
 ///
 /// Omits input clamping and underflow, overflow, and `NaN` handling. Results are defined only
-/// roughly in `-16.0..=16.0`.
+/// in `-126.0..=127.0`.
 #[must_use]
-#[inline]
+#[inline(always)]
+#[expect(
+    clippy::inline_always,
+    reason = "must compile under the calling multiversioned function's target features"
+)]
 pub(crate) fn exp2_bounded<const N: usize>(value: Simd<f32, N>) -> Simd<f32, N> {
-    let whole = value.round();
-    let fraction = value - whole;
+    let (fractional, shifted) = exp2_split(value);
+    fractional * exp2_scale(shifted)
+}
 
-    let fractional = fraction.mul_add(polynomial(fraction, EXP2_POLYNOMIAL), Simd::splat(1.0));
+/// Returns `value` raised to `exponent`, for `value` in `0.0..=1.0` and positive `exponent`.
+///
+/// Zero maps to zero. Results below `2^-126` flush to zero, and subnormal inputs are treated as
+/// approximately `2^-127`, so this suits display-referred encodings where both are invisible. It
+/// skips the special-value handling of [`log2`] and [`exp2`], which matters on hot paths that
+/// apply a transfer function to every component.
+#[must_use]
+#[inline(always)]
+#[expect(
+    clippy::inline_always,
+    reason = "must compile under the calling multiversioned function's target features"
+)]
+pub fn pow_unit_interval<const N: usize>(value: Simd<f32, N>, exponent: f32) -> Simd<f32, N> {
+    // At least -127 times `exponent`; the floor at -127 rounds to an exponent field of zero, which
+    // `exp2_scale` turns into a zero scale.
+    let power = log2_positive_normal(value) * Simd::splat(exponent);
+    let (fractional, shifted) = exp2_split(max_or_second(power, Simd::splat(-127.0)));
 
-    let exponent = whole.cast::<i32>() + Simd::splat(127);
-    let scale = Simd::<f32, N>::from_bits((exponent << Simd::splat(23)).cast::<u32>());
-
-    fractional * scale
+    value
+        .simd_gt(Simd::splat(0.0))
+        .select(fractional * exp2_scale(shifted), Simd::splat(0.0))
 }
 
 /// Returns the base-two logarithm of `value` using the vector path.
-#[inline]
+#[cfg(test)]
 pub(crate) fn log2_scalar(value: f32) -> f32 {
     log2(Simd::<f32, 1>::splat(value))[0]
 }
 
 /// Returns two raised to the power of `value` using the vector path.
-#[inline]
+#[cfg(test)]
 pub(crate) fn exp2_scalar(value: f32) -> f32 {
     exp2(Simd::<f32, 1>::splat(value))[0]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{exp2, exp2_bounded, exp2_scalar, log2, log2_positive_normal, log2_scalar, recip};
+    use super::{
+        exp2, exp2_bounded, exp2_scalar, log2, log2_positive_normal, log2_scalar,
+        pow_unit_interval, recip,
+    };
     use std::simd::Simd;
 
     /// Returns the distance between two floats in units in the last place.
@@ -355,6 +420,54 @@ mod tests {
             worst <= 4,
             "exp2 drifted {worst} ULP from the standard library"
         );
+    }
+
+    #[test]
+    fn exp2_rounds_subnormal_results_like_the_standard_library() {
+        let mut worst = 0;
+        for step in -15_100..=-12_500_i32 {
+            let value = f32::from(i16::try_from(step).unwrap()) / 100.0;
+            worst = worst.max(ulp_distance(exp2_scalar(value), value.exp2()));
+        }
+        assert!(
+            worst <= 1,
+            "exp2 drifted {worst} ULP from the standard library below 2^-125"
+        );
+    }
+
+    #[test]
+    fn pow_unit_interval_tracks_powf_and_pins_the_ends() {
+        for exponent in [1.0 / 2.4, 2.4, 0.5, 4.0] {
+            assert_eq!(
+                pow_unit_interval(Simd::<f32, 1>::splat(0.0), exponent)[0],
+                0.0
+            );
+            assert_eq!(
+                pow_unit_interval(Simd::<f32, 1>::splat(1.0), exponent)[0],
+                1.0
+            );
+
+            for step in 1..=100_000_u32 {
+                let value = f32::from(u16::try_from(step % 50_000).unwrap() + 1) / 50_001.0
+                    * if step > 50_000 { 1.0e-6 } else { 1.0 };
+                
+                let actual = pow_unit_interval(Simd::<f32, 1>::splat(value), exponent)[0];
+                let expected = f64::from(value).powf(f64::from(exponent));
+                
+                if expected < f64::from(f32::MIN_POSITIVE) {
+                    assert!(
+                        actual < f32::MIN_POSITIVE * 2.0,
+                        "{value}^{exponent} = {actual}"
+                    );
+                } else {
+                    let error = (f64::from(actual) - expected).abs() / expected;
+                    assert!(
+                        error < 2.0e-5,
+                        "{value}^{exponent} = {actual}, expected {expected}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
