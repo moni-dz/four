@@ -9,11 +9,14 @@ mod error;
 use std::io::Cursor;
 
 use ::tiff::ColorType;
-use ::tiff::decoder::{BufferLayoutPreference, Decoder, DecodingResult, Limits};
+use ::tiff::decoder::{
+    BufferLayoutPreference, Decoder, DecodingResult, DecodingSampleType, Limits,
+};
 use nutype::nutype;
 
 use super::{
     DIMENSION_MAX, DecodedImage, Dimensions, PIXELS_MAX, map_dimensions_error, rgba_pixel_rows,
+    widen_to_rgba_in_place,
 };
 use error::error;
 
@@ -71,6 +74,10 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     let format = PixelFormat::from_color(color)?;
     let raw_bytes = validate_raw_size(width, height, format)?;
 
+    if let Some(rgba) = decode_packed_u8_in_place(&mut decoder, width, height, format, raw_bytes)? {
+        return Ok(DecodedImage::new(width, height, rgba));
+    }
+
     let mut sample_buffer = DecodingResult::U8(Vec::new());
     let layout = decoder
         .read_image_to_buffer(&mut sample_buffer)
@@ -101,6 +108,70 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
         }
     };
     Ok(DecodedImage::new(width, height, rgba))
+}
+
+/// Decodes tightly packed, chunky eight-bit grayscale or RGB samples straight into the RGBA
+/// result and widens them in place, skipping the codec's separate sample buffer.
+///
+/// Returns `None`, having read no image data, for every other layout.
+fn decode_packed_u8_in_place(
+    decoder: &mut Decoder<Cursor<&[u8]>>,
+    width: u32,
+    height: u32,
+    format: PixelFormat,
+    raw_bytes: u64,
+) -> Result<Option<Vec<u8>>> {
+    if format.bit_depth.into_inner() != 8
+        || !matches!(
+            format.kind,
+            PixelKind::Grayscale | PixelKind::GrayscaleAlpha | PixelKind::RGB | PixelKind::RGBA
+        )
+    {
+        return Ok(None);
+    }
+
+    let layout = decoder
+        .image_buffer_layout()
+        .map_err(|source| codec_error(source, Some(raw_bytes)))?;
+    let width = usize::try_from(width).expect("validated TIFF width fits usize");
+    let height = usize::try_from(height).expect("validated TIFF height fits usize");
+    let pixel_count = width * height;
+    let sample_count = pixel_count * format.channels;
+
+    if layout.sample_type != Some(DecodingSampleType::U8)
+        || layout.planes != 1
+        || layout.row_stride.map(std::num::NonZeroUsize::get) != Some(width * format.channels)
+        || layout.complete_len != sample_count
+    {
+        return Ok(None);
+    }
+
+    let mut rgba = vec![0; pixel_count * 4];
+    decoder
+        .read_image_bytes(&mut rgba[..sample_count])
+        .map_err(|source| codec_error(source, Some(raw_bytes)))?;
+
+    match format.kind {
+        PixelKind::Grayscale => {
+            widen_to_rgba_in_place(&mut rgba, pixel_count, |[gray]| [gray, gray, gray, u8::MAX]);
+        }
+        PixelKind::GrayscaleAlpha => {
+            widen_to_rgba_in_place(&mut rgba, pixel_count, |[gray, alpha]| {
+                [gray, gray, gray, alpha]
+            });
+        }
+        PixelKind::RGB => {
+            widen_to_rgba_in_place(&mut rgba, pixel_count, |[red, green, blue]| {
+                [red, green, blue, u8::MAX]
+            });
+        }
+        PixelKind::RGBA => {}
+        PixelKind::CMYK | PixelKind::CMYKA => {
+            unreachable!("CMYK samples were routed to the general normalization path")
+        }
+    }
+
+    Ok(Some(rgba))
 }
 
 #[derive(Clone, Copy, Debug)]

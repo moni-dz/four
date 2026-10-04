@@ -10,7 +10,10 @@ use std::io::Cursor;
 
 use jxl_oxide::{AllocTracker, EnumColourEncoding, JxlImage, PixelFormat, RenderingIntent};
 
-use super::{DIMENSION_MAX, DecodedImage, Dimensions, PIXELS_MAX, map_dimensions_error};
+use super::{
+    DIMENSION_MAX, DecodedImage, Dimensions, PIXELS_MAX, map_dimensions_error,
+    widen_to_rgba_in_place,
+};
 
 use error::error;
 pub use error::{Error, JPEGXLError, JPEGXLLimit, Result};
@@ -87,14 +90,25 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
         )));
     }
 
-    let mut samples = vec![0_u8; sample_count];
-    if stream.write_to_buffer(&mut samples) != sample_count {
+    // Render into a buffer sized for the RGBA result, so RGB samples widen in place rather than
+    // into a second full-image allocation.
+    let output_len = pixel_count
+        .checked_mul(4)
+        .ok_or_else(|| error(JPEGXLError::Output("JPEG XL RGBA byte count exceeds usize")))?;
+    if sample_count > output_len {
+        return Err(error(JPEGXLError::Output(
+            "JPEG XL color management did not produce sRGB samples",
+        )));
+    }
+
+    let mut buffer = vec![0_u8; output_len];
+    if stream.write_to_buffer(&mut buffer[..sample_count]) != sample_count {
         return Err(error(JPEGXLError::Output(
             "JPEG XL renderer did not produce a complete image",
         )));
     }
 
-    let rgba = normalize_rgba(samples, pixel_format, pixel_count)?;
+    let rgba = normalize_rgba(buffer, sample_count, pixel_format, pixel_count)?;
     Ok(DecodedImage::new(width, height, rgba))
 }
 
@@ -134,41 +148,44 @@ fn pixel_count(width: u32, height: u32) -> Result<usize> {
     })
 }
 
+/// Widens the first `sample_count` bytes of `buffer`, which is sized for the RGBA result, in place.
 fn normalize_rgba(
-    samples: Vec<u8>,
+    mut buffer: Vec<u8>,
+    sample_count: usize,
     pixel_format: PixelFormat,
     pixel_count: usize,
 ) -> Result<Vec<u8>> {
     let output_len = pixel_count
         .checked_mul(4)
         .ok_or_else(|| error(JPEGXLError::Output("JPEG XL RGBA byte count exceeds usize")))?;
+    if buffer.len() != output_len {
+        return Err(error(JPEGXLError::Output(
+            "JPEG XL output buffer has an invalid length",
+        )));
+    }
+
     match pixel_format {
         PixelFormat::Rgba => {
-            if samples.len() != output_len {
+            if sample_count != output_len {
                 return Err(error(JPEGXLError::Output(
                     "JPEG XL RGBA output has an invalid length",
                 )));
             }
 
-            Ok(samples)
+            Ok(buffer)
         }
         PixelFormat::Rgb => {
-            let mut rgba = Vec::with_capacity(output_len);
-            let (pixels, remainder) = samples.as_chunks::<3>();
-
-            if !remainder.is_empty() || pixels.len() != pixel_count {
+            if pixel_count.checked_mul(3) != Some(sample_count) {
                 return Err(error(JPEGXLError::Output(
                     "JPEG XL RGB output has an invalid length",
                 )));
             }
 
-            rgba.extend(
-                pixels
-                    .iter()
-                    .flat_map(|&[red, green, blue]| [red, green, blue, u8::MAX]),
-            );
+            widen_to_rgba_in_place(&mut buffer, pixel_count, |[red, green, blue]| {
+                [red, green, blue, u8::MAX]
+            });
 
-            Ok(rgba)
+            Ok(buffer)
         }
         PixelFormat::Gray | PixelFormat::Graya | PixelFormat::Cmyk | PixelFormat::Cmyka => {
             Err(error(JPEGXLError::Output(

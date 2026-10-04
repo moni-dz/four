@@ -83,12 +83,25 @@ pub(crate) struct PredictedLowpass {
 
 #[derive(Debug)]
 pub(crate) struct HighpassImage {
-    pub(crate) macroblock_width: usize,
-    pub(crate) macroblock_height: usize,
     pub(crate) components: usize,
     /// 256 values per macroblock component, laid out by [`highpass_index`].
+    ///
+    /// Macroblocks are tile-major: each tile's macroblocks are contiguous, in raster order within
+    /// the tile, so every tile decodes straight into its own slice of one shared buffer.
     pub(crate) values: Vec<i32>,
-    pub(crate) model_bits: Vec<[u8; 2]>,
+    /// Maps a raster-order macroblock index to its tile-major position in `values`.
+    pub(crate) macroblock_positions: Vec<usize>,
+}
+
+/// One tile's disjoint view into a [`HighpassImage`]'s tile-major buffers.
+#[derive(Debug)]
+struct HighpassTile<'a> {
+    macroblock_width: usize,
+    macroblock_height: usize,
+    components: usize,
+    /// 256 values per macroblock component, laid out by [`highpass_index`].
+    values: &'a mut [i32],
+    model_bits: &'a mut [[u8; 2]],
 }
 
 /// The number of 4x4 blocks in a macroblock, and of coefficients in a block.
@@ -311,7 +324,11 @@ pub(crate) fn decode_bgr101010(stream: &ParsedCodestream<'_>) -> Result<Vec<u32>
 
     let (width, height, pixel_count) = validated_dimensions(&stream.header, stream.offset)?;
 
-    let color = reconstruct(stream)?;
+    let (lowpass, highpass) = reconstruct_coefficients(stream)?;
+    let (extended_width, extended_height) = (
+        lowpass.macroblock_width.saturating_mul(16),
+        lowpass.macroblock_height.saturating_mul(16),
+    );
 
     let crop = crop_rect(
         stream.header.margins,
@@ -323,7 +340,7 @@ pub(crate) fn decode_bgr101010(stream: &ParsedCodestream<'_>) -> Result<Vec<u32>
     )?;
     let (left, top) = (crop.left, crop.top);
 
-    if color.components != 3 || crop.right > color.width || crop.bottom > color.height {
+    if lowpass.components != 3 || crop.right > extended_width || crop.bottom > extended_height {
         return Err(Error::new(
             ErrorKind::InvalidCodestream("decoded component dimensions are inconsistent"),
             stream.offset,
@@ -340,32 +357,49 @@ pub(crate) fn decode_bgr101010(stream: &ParsedCodestream<'_>) -> Result<Vec<u32>
     let bias = (512_i64 << shift) + rounding;
     let swapped = stream.header.red_blue_swapped;
 
-    // Allocation and per-row fill closure shared by the parallel and serial paths below.
     #[expect(
         unsafe_code,
         reason = "avoids zeroing an output buffer this function immediately overwrites in full"
     )]
     // SAFETY: `fill_bgr101010_row` unconditionally writes every pixel of its row slice (its SIMD
     // chunk loop and scalar tail loop both write unconditionally, no data-dependent skip), and
-    // the `chunks_mut`/`par_chunks_mut` split below covers the entire `pixels` buffer, so every
-    // element is written before this function returns.
+    // the per-macroblock-row slices below partition the entire `pixels` buffer into whole rows,
+    // each filled by `transform_macroblock_rows`, so every element is written before this
+    // function returns `Ok`; on `Err` the buffer is dropped without being read.
     let mut pixels = unsafe { uninit_vec::<u32>(pixel_count) };
 
-    let fill_row =
-        |y, row: &mut [u32]| fill_bgr101010_row(row, y, left, top, &color, shift, bias, swapped);
-
-    if pixel_count >= MIN_PARALLEL_PIXELS {
-        pixels
-            .par_chunks_mut(width)
-            .with_min_len(8)
-            .enumerate()
-            .for_each(|(y, row)| fill_row(y, row));
-    } else {
-        pixels
-            .chunks_mut(width)
-            .enumerate()
-            .for_each(|(y, row)| fill_row(y, row));
+    // Macroblock row `y` covers extended rows `16 * y..16 * y + 16`; the crop shifts those up by
+    // `top` and clips them to the output, so consecutive rows own consecutive output slices.
+    let mut rows = Vec::with_capacity(lowpass.macroblock_height);
+    let mut rest = pixels.as_mut_slice();
+    for macroblock_y in 0..lowpass.macroblock_height {
+        let first = (macroblock_y * 16).saturating_sub(top).min(height);
+        let last = (macroblock_y * 16 + 16).saturating_sub(top).min(height);
+        if first == last {
+            continue;
+        }
+        let (slice, remainder) = rest.split_at_mut((last - first) * width);
+        rest = remainder;
+        rows.push((macroblock_y, (first, slice)));
     }
+    debug_assert_eq!(rest, []);
+
+    transform_macroblock_rows(
+        stream,
+        &lowpass,
+        &highpass,
+        rows,
+        pixel_count >= MIN_PARALLEL_PIXELS,
+        |band, (first, slice): (usize, &mut [u32])| {
+            for (offset, row) in slice.chunks_mut(width).enumerate() {
+                // Output row `first + offset` is extended row `first + offset + top`, which sits
+                // at that position modulo 16 within its macroblock row's band.
+                let band_row = (first + offset + top) % 16;
+                fill_bgr101010_row(row, band_row, left, 0, band, shift, bias, swapped);
+            }
+            Ok(())
+        },
+    )?;
 
     Ok(pixels)
 }
@@ -1052,58 +1086,72 @@ pub(crate) fn decode_highpass(
             )
         })?;
 
-    // Highpass tiles also decode their flexbits refinement while the tile is local, so the
-    // scatter below runs once over finished coefficients.
     let tiles = tile_grid(stream);
-    let decode_tile = |tile: &Tile| decode_highpass_tile(stream, tile, components, lowpass);
-    let mut tile_images = if macroblock_count >= MIN_PARALLEL_MACROBLOCKS && tiles.len() > 1 {
-        tiles
-            .par_iter()
-            .map(decode_tile)
-            .collect::<Result<Vec<_>>>()?
-    } else {
-        tiles.iter().map(decode_tile).collect::<Result<Vec<_>>>()?
-    };
 
-    if tile_images.len() == 1 {
-        // Parsing guarantees the tile grid exactly covers the macroblock grid.
-        let only = tile_images.pop().expect("one tile image per tile");
-        debug_assert_eq!(only.macroblock_width, macroblock_width);
-        debug_assert_eq!(only.macroblock_height, macroblock_height);
-        return Ok(only);
-    }
-
-    let mut image = HighpassImage {
-        macroblock_width,
-        macroblock_height,
-        components,
-        values: vec![0; value_count],
-        model_bits: vec![[0; 2]; macroblock_count],
-    };
-
-    for (tile, tile_image) in tiles.iter().zip(&tile_images) {
-        let row_len = tile.width * components * 256;
+    // Tiles are laid out back to back in tile-grid order, so carving the buffers front to back
+    // hands each tile its own disjoint slice to decode into, with no copy afterwards.
+    let mut values = vec![0; value_count];
+    let mut model_bits = vec![[0; 2]; macroblock_count];
+    let mut macroblock_positions = vec![0; macroblock_count];
+    let mut views = Vec::with_capacity(tiles.len());
+    let (mut values_rest, mut model_bits_rest) = (values.as_mut_slice(), model_bits.as_mut_slice());
+    let mut position = 0;
+    for tile in &tiles {
         for local_y in 0..tile.height {
-            let global_row = (tile.top + local_y) * macroblock_width + tile.left;
-            let local_row = local_y * tile.width;
-
-            image.values[global_row * components * 256..][..row_len]
-                .copy_from_slice(&tile_image.values[local_row * components * 256..][..row_len]);
-            image.model_bits[global_row..][..tile.width]
-                .copy_from_slice(&tile_image.model_bits[local_row..][..tile.width]);
+            let row = (tile.top + local_y) * macroblock_width + tile.left;
+            for (local_x, slot) in macroblock_positions[row..row + tile.width]
+                .iter_mut()
+                .enumerate()
+            {
+                *slot = position + local_y * tile.width + local_x;
+            }
         }
-    }
 
-    Ok(image)
+        let tile_macroblocks = tile.width * tile.height;
+        position += tile_macroblocks;
+        let (tile_values, rest) = values_rest.split_at_mut(tile_macroblocks * components * 256);
+        values_rest = rest;
+        let (tile_model_bits, rest) = model_bits_rest.split_at_mut(tile_macroblocks);
+        model_bits_rest = rest;
+        views.push((
+            tile,
+            HighpassTile {
+                macroblock_width: tile.width,
+                macroblock_height: tile.height,
+                components,
+                values: tile_values,
+                model_bits: tile_model_bits,
+            },
+        ));
+    }
+    debug_assert!(values_rest.is_empty() && model_bits_rest.is_empty());
+
+    // Highpass tiles also decode their flexbits refinement while the tile is local, so the
+    // transform later runs once over finished coefficients.
+    let decode_tile = |(tile, view): &mut (&Tile, HighpassTile<'_>)| {
+        decode_highpass_tile(stream, tile, view, lowpass)
+    };
+    if macroblock_count >= MIN_PARALLEL_MACROBLOCKS && views.len() > 1 {
+        views.par_iter_mut().try_for_each(decode_tile)?;
+    } else {
+        views.iter_mut().try_for_each(decode_tile)?;
+    }
+    drop(views);
+
+    Ok(HighpassImage {
+        components,
+        values,
+        macroblock_positions,
+    })
 }
 
-/// Decodes one tile's highpass packet and its flexbits refinement into a tile-local image.
+/// Decodes one tile's highpass packet and its flexbits refinement into its slice of the image.
 fn decode_highpass_tile(
     stream: &ParsedCodestream<'_>,
     tile: &Tile,
-    components: usize,
+    image: &mut HighpassTile<'_>,
     lowpass: &PredictedLowpass,
-) -> Result<HighpassImage> {
+) -> Result<()> {
     let macroblock_count = tile.width * tile.height;
     let mut modes = Vec::with_capacity(macroblock_count);
     for y in tile.top..tile.top + tile.height {
@@ -1111,19 +1159,11 @@ fn decode_highpass_tile(
         modes.extend_from_slice(&lowpass.highpass_modes[start..start + tile.width]);
     }
 
-    let mut image = HighpassImage {
-        macroblock_width: tile.width,
-        macroblock_height: tile.height,
-        components,
-        values: vec![0; macroblock_count * components * 256],
-        model_bits: vec![[0; 2]; macroblock_count],
-    };
-
     decode_highpass_packet(
         packet(stream, tile.index, 2)?,
         &stream.primary_plane,
         &modes,
-        &mut image,
+        image,
     )?;
 
     match stream.primary_plane.bands {
@@ -1132,11 +1172,11 @@ fn decode_highpass_tile(
                 decode_flexbits_packet(
                     packet(stream, tile.index, 3)?,
                     stream.header.trim_flexbits,
-                    &mut image,
+                    image,
                 )?;
             }
         }
-        Bands::NoFlexbits => shift_highpass_without_flexbits(&mut image)?,
+        Bands::NoFlexbits => shift_highpass_without_flexbits(image)?,
         Bands::NoHighpass | Bands::DCOnly => {
             return Err(Error::new(
                 ErrorKind::Unsupported("highpass band is absent"),
@@ -1145,7 +1185,7 @@ fn decode_highpass_tile(
         }
     }
 
-    Ok(image)
+    Ok(())
 }
 
 fn validate_float_rgb_profile(
@@ -1240,6 +1280,14 @@ fn validate_bgr101010_profile(stream: &ParsedCodestream<'_>) -> Result<()> {
 }
 
 fn reconstruct(stream: &ParsedCodestream<'_>) -> Result<IntegerImage> {
+    let (lowpass, highpass) = reconstruct_coefficients(stream)?;
+    combine_and_transform(stream, &lowpass, &highpass)
+}
+
+/// Decodes and predicts every band, leaving only the final inverse transform to run.
+fn reconstruct_coefficients(
+    stream: &ParsedCodestream<'_>,
+) -> Result<(PredictedLowpass, HighpassImage)> {
     let dc = decode_dc(stream)?;
     let lowpass = decode_lowpass(stream)?;
     let mut lowpass = predict_lowpass(stream, &dc, lowpass)?;
@@ -1247,7 +1295,7 @@ fn reconstruct(stream: &ParsedCodestream<'_>) -> Result<IntegerImage> {
     let highpass = decode_highpass(stream, &lowpass)?;
 
     let (blocks, remainder) = lowpass.values.as_chunks_mut::<16>();
-    debug_assert!(remainder.is_empty());
+    debug_assert_eq!(remainder, []);
 
     if blocks.len() >= MIN_PARALLEL_LOWPASS_BLOCKS {
         blocks
@@ -1272,7 +1320,7 @@ fn reconstruct(stream: &ParsedCodestream<'_>) -> Result<IntegerImage> {
         )?;
     }
 
-    combine_and_transform(stream, &lowpass, &highpass)
+    Ok((lowpass, highpass))
 }
 
 #[multiversion(targets = "simd")]
@@ -1308,7 +1356,7 @@ fn dequantize_and_predict_highpass_macroblock(
     offset: usize,
 ) -> Result<()> {
     let (components, remainder) = macroblock.as_chunks_mut::<256>();
-    debug_assert!(remainder.is_empty());
+    debug_assert_eq!(remainder, []);
 
     for (values, &factor) in components.iter_mut().zip(factors) {
         // Lossless quantization leaves coefficients unchanged.
@@ -1433,26 +1481,7 @@ fn combine_and_transform(
         values: unsafe { uninit_vec(value_count) },
     };
 
-    let quantization = stream
-        .primary_plane
-        .highpass_quantization
-        .as_ref()
-        .ok_or_else(|| {
-            Error::new(
-                ErrorKind::Unsupported("per-tile highpass quantization"),
-                stream.offset,
-            )
-        })?;
-
-    let factors = (0..highpass.components)
-        .map(|component| {
-            quant_map(
-                quantization.components[component],
-                stream.primary_plane.scaled,
-                1,
-            )
-        })
-        .collect::<Vec<_>>();
+    let factors = highpass_factors(stream, highpass.components)?;
 
     let band_len = width * 16;
 
@@ -1485,6 +1514,92 @@ fn combine_and_transform(
     Ok(output)
 }
 
+/// Returns each component's highpass dequantization factor.
+fn highpass_factors(stream: &ParsedCodestream<'_>, components: usize) -> Result<Vec<i32>> {
+    let quantization = stream
+        .primary_plane
+        .highpass_quantization
+        .as_ref()
+        .ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unsupported("per-tile highpass quantization"),
+                stream.offset,
+            )
+        })?;
+
+    Ok((0..components)
+        .map(|component| {
+            quant_map(
+                quantization.components[component],
+                stream.primary_plane.scaled,
+                1,
+            )
+        })
+        .collect())
+}
+
+/// Inverse-transforms the image one macroblock row at a time, handing each row's finished samples
+/// to `consume` instead of materializing the whole sample image.
+///
+/// `rows` pairs a macroblock row index with whatever `consume` writes that row's output to. Each
+/// worker reuses one scratch [`IntegerImage`], 16 sample rows tall and holding every component, in
+/// which `consume` finds macroblock row `y`'s samples at local rows `0..16`.
+fn transform_macroblock_rows<T: Send>(
+    stream: &ParsedCodestream<'_>,
+    lowpass: &PredictedLowpass,
+    highpass: &HighpassImage,
+    rows: Vec<(usize, T)>,
+    parallel: bool,
+    consume: impl Fn(&IntegerImage, T) -> Result<()> + Sync,
+) -> Result<()> {
+    let width = lowpass
+        .macroblock_width
+        .checked_mul(16)
+        .ok_or_else(|| Error::new(ErrorKind::LimitExceeded("extended width"), stream.offset))?;
+    let band_len = width * 16;
+    let factors = highpass_factors(stream, highpass.components)?;
+
+    let scratch = || {
+        #[expect(
+            unsafe_code,
+            reason = "avoids zeroing a scratch buffer every macroblock row overwrites in full"
+        )]
+        IntegerImage {
+            width,
+            height: 16,
+            components: lowpass.components,
+            // SAFETY: before `consume` reads it, `combine_and_transform_band` writes every sample
+            // of each component's band (see `combine_and_transform`), and the bands below cover
+            // the whole buffer; on `Err` the scratch is dropped unread.
+            values: unsafe { uninit_vec(band_len * lowpass.components) },
+        }
+    };
+
+    let transform_row = |band: &mut IntegerImage, (macroblock_y, target): (usize, T)| {
+        for (component, values) in band.values.chunks_mut(band_len).enumerate() {
+            combine_and_transform_band(
+                values,
+                component * lowpass.macroblock_height + macroblock_y,
+                width,
+                lowpass,
+                highpass,
+                &factors,
+                stream.offset,
+            )?;
+        }
+        consume(band, target)
+    };
+
+    if parallel {
+        rows.into_par_iter()
+            .try_for_each_init(scratch, transform_row)
+    } else {
+        let mut band = scratch();
+        rows.into_iter()
+            .try_for_each(|row| transform_row(&mut band, row))
+    }
+}
+
 #[multiversion(targets = "simd")]
 fn combine_and_transform_band(
     output: &mut [i32],
@@ -1502,7 +1617,8 @@ fn combine_and_transform_band(
     for macroblock_x in 0..lowpass.macroblock_width {
         let macroblock = macroblock_y * lowpass.macroblock_width + macroblock_x;
         let lowpass_start = (macroblock * lowpass.components + component) * 16;
-        let highpass_start = (macroblock * highpass.components + component) * 256;
+        let highpass_start =
+            (highpass.macroblock_positions[macroblock] * highpass.components + component) * 256;
 
         // Dequantizing and predicting this macroblock's highpass coefficients here, right
         // before they're consumed by the transform below, avoids a second full pass over the
@@ -2057,7 +2173,7 @@ impl FloatFormat {
     }
 }
 
-fn shift_highpass_without_flexbits(highpass: &mut HighpassImage) -> Result<()> {
+fn shift_highpass_without_flexbits(highpass: &mut HighpassTile<'_>) -> Result<()> {
     for macroblock in 0..highpass.model_bits.len() {
         for component in 0..highpass.components {
             let bits = highpass.model_bits[macroblock][usize::from(component != 0)];
@@ -2448,7 +2564,7 @@ fn decode_highpass_packet(
     packet: Packet<'_>,
     plane: &PlaneHeader,
     modes: &[u8],
-    image: &mut HighpassImage,
+    image: &mut HighpassTile<'_>,
 ) -> Result<()> {
     let mut reader = BitReader::new(packet.bytes, packet.offset);
 
@@ -2499,8 +2615,8 @@ fn decode_highpass_packet(
                 modes[macroblock],
                 &patterns[..components],
                 components,
-                &mut image.values,
-                &mut image.model_bits,
+                image.values,
+                image.model_bits,
             )?;
 
             if local_x.is_multiple_of(16) || local_x + 1 == width {
@@ -2523,7 +2639,7 @@ fn decode_highpass_packet(
 fn decode_flexbits_packet(
     packet: Packet<'_>,
     trim_present: bool,
-    highpass: &mut HighpassImage,
+    highpass: &mut HighpassTile<'_>,
 ) -> Result<()> {
     const HIERARCHICAL_ORDER: [usize; 16] = [0, 1, 4, 5, 2, 3, 6, 7, 8, 9, 12, 13, 10, 11, 14, 15];
     const TRANSPOSE: [usize; 16] = [0, 4, 8, 12, 1, 5, 9, 13, 2, 6, 10, 14, 3, 7, 11, 15];
@@ -3437,7 +3553,6 @@ fn decode_absolute_level(reader: &mut BitReader<'_>, adaptive: &mut AdaptiveVLC)
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::{HalfFormat, SampleFormat};
     use crate::{Decoder, PixelFormat};
 
     #[test]
