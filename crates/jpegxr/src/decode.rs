@@ -12,9 +12,10 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::marker::PhantomData;
 use std::mem::{self, MaybeUninit};
+use std::ops::{Add, Neg, Sub};
 use std::simd::{
-    Simd,
-    cmp::{SimdOrd, SimdPartialEq},
+    Simd, ToBytes,
+    cmp::{SimdOrd, SimdPartialEq, SimdPartialOrd},
     num::SimdInt,
     simd_swizzle,
 };
@@ -50,6 +51,7 @@ const MIN_PARALLEL_PIXELS: usize = 256 * 1024;
 const PIXEL_LANES: usize = 8;
 
 type I32x8 = Simd<i32, PIXEL_LANES>;
+type I32x16 = Simd<i32, 16>;
 type I64x2 = Simd<i64, 2>;
 type I64x4 = Simd<i64, 4>;
 type I64x8 = Simd<i64, PIXEL_LANES>;
@@ -84,8 +86,22 @@ pub(crate) struct HighpassImage {
     pub(crate) macroblock_width: usize,
     pub(crate) macroblock_height: usize,
     pub(crate) components: usize,
+    /// 256 values per macroblock component, laid out by [`highpass_index`].
     pub(crate) values: Vec<i32>,
     pub(crate) model_bits: Vec<[u8; 2]>,
+}
+
+/// The number of 4x4 blocks in a macroblock, and of coefficients in a block.
+const HIGHPASS_BLOCKS: usize = 16;
+
+/// Locates `coefficient` of `block` within one macroblock component's 256 highpass values.
+///
+/// Storage is coefficient-major, so one coefficient of all sixteen blocks is a contiguous vector:
+/// the inverse transform then runs one block per lane without transposing its input.
+const fn highpass_index(block: usize, coefficient: usize) -> usize {
+    // The wrap is a no-op for in-range blocks; with a constant `coefficient` it lets the compiler
+    // see every index stays below 256 and drop the bounds checks.
+    coefficient * HIGHPASS_BLOCKS + block % HIGHPASS_BLOCKS
 }
 
 #[derive(Debug)]
@@ -1297,22 +1313,15 @@ fn dequantize_and_predict_highpass_macroblock(
     for (values, &factor) in components.iter_mut().zip(factors) {
         // Lossless quantization leaves coefficients unchanged.
         if factor != 1 {
-            for value in values.iter_mut() {
-                *value = value.checked_mul(factor).ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::InvalidCodestream("dequantized highpass coefficient overflow"),
-                        offset,
-                    )
-                })?;
-            }
+            dequantize_highpass(values, factor, offset)?;
         }
 
         match mode {
             0 => {
                 for block in [1_usize, 2, 3, 5, 6, 7, 9, 10, 11, 13, 14, 15] {
                     for coefficient in [4_usize, 8, 12] {
-                        let reference = values[(block - 1) * 16 + coefficient];
-                        let index = block * 16 + coefficient;
+                        let reference = values[highpass_index(block - 1, coefficient)];
+                        let index = highpass_index(block, coefficient);
 
                         values[index] = values[index].checked_add(reference).ok_or_else(|| {
                             Error::new(
@@ -1328,8 +1337,8 @@ fn dequantize_and_predict_highpass_macroblock(
             1 => {
                 for block in 4_usize..16 {
                     for coefficient in [1_usize, 2, 3] {
-                        let reference = values[(block - 4) * 16 + coefficient];
-                        let index = block * 16 + coefficient;
+                        let reference = values[highpass_index(block - 4, coefficient)];
+                        let index = highpass_index(block, coefficient);
 
                         values[index] = values[index].checked_add(reference).ok_or_else(|| {
                             Error::new(
@@ -1344,6 +1353,42 @@ fn dequantize_and_predict_highpass_macroblock(
             }
             _ => {}
         }
+    }
+
+    Ok(())
+}
+
+/// Multiplies every value by `factor`, failing on overflow.
+#[inline]
+fn dequantize_highpass(values: &mut [i32; 256], factor: i32, offset: usize) -> Result<()> {
+    // No product can overflow when every magnitude is at most `i32::MAX / |factor|`. `abs` wraps
+    // `i32::MIN` to itself, which reads as 2^31 unsigned and so always fails the bound.
+    let limit = i32::MAX
+        .unsigned_abs()
+        .checked_div(factor.unsigned_abs())
+        .unwrap_or(u32::MAX);
+    let (chunks, remainder) = values.as_chunks_mut::<HIGHPASS_BLOCKS>();
+    debug_assert_eq!(remainder, []);
+
+    let largest = chunks.iter().fold(Simd::splat(0), |largest, chunk| {
+        largest.simd_max(I32x16::from_array(*chunk).abs().cast::<u32>())
+    });
+
+    if largest.simd_le(Simd::splat(limit)).all() {
+        let factor = I32x16::splat(factor);
+        for chunk in chunks {
+            *chunk = (I32x16::from_array(*chunk) * factor).to_array();
+        }
+        return Ok(());
+    }
+
+    for value in values.iter_mut() {
+        *value = value.checked_mul(factor).ok_or_else(|| {
+            Error::new(
+                ErrorKind::InvalidCodestream("dequantized highpass coefficient overflow"),
+                offset,
+            )
+        })?;
     }
 
     Ok(())
@@ -1474,29 +1519,221 @@ fn combine_and_transform_band(
             offset,
         )?;
 
-        for block in 0_usize..16 {
-            let dc = lowpass.values[lowpass_start + block];
-            let source = &scratch[block * 16..(block + 1) * 16];
+        // Coefficient zero of each block is highpass's placeholder; the real DC values are the
+        // macroblock's sixteen lowpass outputs, already one per block in order.
+        let dc = &lowpass.values[lowpass_start..lowpass_start + HIGHPASS_BLOCKS];
+        let (rows, remainder) = scratch.as_chunks::<HIGHPASS_BLOCKS>();
+        debug_assert_eq!(remainder, []);
+        let coefficients: [I32x16; 16] = std::array::from_fn(|coefficient| {
+            I32x16::from_slice(if coefficient == 0 {
+                dc
+            } else {
+                &rows[coefficient]
+            })
+        });
 
-            // `source[0]` is highpass's own placeholder DC; substitute the real lowpass value.
-            let values = permute_coefficients(|input| if input == 0 { dc } else { source[input] });
-            let coefficients = inverse_transform_4x4_values(values, offset)?;
-
-            let block_x = block % 4;
-            let block_y = block / 4;
-
-            for local_y in 0..4 {
-                let row = block_y * 4 + local_y;
-
-                for local_x in 0..4 {
-                    let x = macroblock_x * 16 + block_x * 4 + local_x;
-                    output[row * width + x] = coefficients[local_y * 4 + local_x];
-                }
+        let destination = &mut output[macroblock_x * 16..];
+        if fits_narrow_inverse_transform(&coefficients) {
+            let mut values = [I32x16::splat(0); 16];
+            for (input, position) in INVERSE_TRANSFORM_PERMUTATION.into_iter().enumerate() {
+                values[position] = coefficients[input];
             }
+            write_macroblock_rows(&inverse_transform_lanes(values), destination, width);
+        } else {
+            transform_macroblock_checked(&coefficients, destination, width, offset)?;
         }
     }
 
     Ok(())
+}
+
+/// Bounds [`inverse_transform_lanes`] inputs to `-2^24..2^24`, where every intermediate fits `i32`.
+///
+/// `inverse_transform_bound_keeps_every_intermediate_in_i32` checks the bound.
+const NARROW_INVERSE_TRANSFORM_BOUND: i32 = 1 << 24;
+
+/// Reports whether every lane of `coefficients` is within [`NARROW_INVERSE_TRANSFORM_BOUND`].
+#[inline]
+fn fits_narrow_inverse_transform(coefficients: &[I32x16; 16]) -> bool {
+    // Offsetting by the bound maps the accepted range onto `0..2^25` and wraps everything else to
+    // a value with a higher bit set, so one mask test covers all sixteen vectors.
+    let offset = I32x16::splat(NARROW_INVERSE_TRANSFORM_BOUND);
+    let combined = coefficients
+        .iter()
+        .fold(I32x16::splat(0), |combined, coefficient| {
+            combined | (*coefficient + offset)
+        });
+    (combined & I32x16::splat(!(2 * NARROW_INVERSE_TRANSFORM_BOUND - 1)))
+        .simd_eq(I32x16::splat(0))
+        .all()
+}
+
+/// Writes 16 output positions, each holding one sample of all 16 blocks, as the macroblock's 16
+/// rows of 16 samples.
+#[inline]
+fn write_macroblock_rows(positions: &[I32x16; 16], output: &mut [i32], width: usize) {
+    // Reinterprets adjacent sample pairs as single lanes, so the second interleave moves pairs.
+    let pairs = |samples: I32x16| Simd::<i64, 8>::from_ne_bytes(samples.to_ne_bytes());
+    let samples = |pairs: Simd<i64, 8>| I32x16::from_ne_bytes(pairs.to_ne_bytes());
+
+    for local_y in 0..4 {
+        let [first, second, third, fourth] = std::array::from_fn(|x| positions[local_y * 4 + x]);
+
+        // Two interleaves turn four `local_x` vectors into rows: after them, each run of four
+        // samples is one block's row, and blocks follow in raster order.
+        let (first_low, first_high) = first.interleave(second);
+        let (second_low, second_high) = third.interleave(fourth);
+
+        for (block_y, (left, right)) in
+            [(0, (first_low, second_low)), (2, (first_high, second_high))]
+        {
+            let (upper, lower) = pairs(left).interleave(pairs(right));
+            for (block_y, row) in [(block_y, upper), (block_y + 1, lower)] {
+                let start = (block_y * 4 + local_y) * width;
+                output[start..start + 16].copy_from_slice(&samples(row).to_array());
+            }
+        }
+    }
+}
+
+/// Transforms a macroblock one block at a time in 64-bit arithmetic, reporting overflow.
+///
+/// Handles inputs outside [`fits_narrow_inverse_transform`].
+fn transform_macroblock_checked(
+    coefficients: &[I32x16; 16],
+    output: &mut [i32],
+    width: usize,
+    offset: usize,
+) -> Result<()> {
+    for block in 0..HIGHPASS_BLOCKS {
+        let values = permute_coefficients(|input| coefficients[input][block]);
+        let samples = inverse_transform_4x4_values(values, offset)?;
+
+        let block_x = block % 4;
+        let block_y = block / 4;
+
+        for local_y in 0..4 {
+            let start = (block_y * 4 + local_y) * width + block_x * 4;
+            output[start..start + 4].copy_from_slice(&samples[local_y * 4..local_y * 4 + 4]);
+        }
+    }
+
+    Ok(())
+}
+
+/// The arithmetic [`inverse_transform_lanes`] needs, for SIMD lanes and for range analysis.
+trait TransformLane: Copy + Add<Output = Self> + Sub<Output = Self> + Neg<Output = Self> {
+    fn splat(value: i32) -> Self;
+
+    /// Arithmetic right shift.
+    fn shr(self, bits: i32) -> Self;
+
+    fn triple(self) -> Self;
+}
+
+impl TransformLane for I32x16 {
+    #[inline]
+    fn splat(value: i32) -> Self {
+        Simd::splat(value)
+    }
+
+    #[inline]
+    fn shr(self, bits: i32) -> Self {
+        self >> Simd::splat(bits)
+    }
+
+    #[inline]
+    fn triple(self) -> Self {
+        // A shift and an add, rather than a multiply with several times the latency.
+        (self << Simd::splat(1)) + self
+    }
+}
+
+/// Applies [`inverse_transform_4x4_values`] to one block per lane.
+///
+/// `values` is in the permuted order [`permute_coefficients`] produces, and the result is in
+/// raster order. Every lane is an independent block, so no stage moves data between lanes.
+#[inline]
+fn inverse_transform_lanes<T: TransformLane>(mut values: [T; 16]) -> [T; 16] {
+    t2x2_lanes(&mut values, [0, 1, 4, 5], 1);
+    inverse_odd_pair_lanes(&mut values, [2, 3, 6, 7]);
+    inverse_odd_pair_lanes(&mut values, [8, 12, 9, 13]);
+    inverse_odd_odd_lanes(&mut values, [10, 11, 14, 15]);
+
+    for group in [[0, 3, 12, 15], [5, 6, 9, 10], [1, 2, 13, 14], [4, 7, 8, 11]] {
+        t2x2_lanes(&mut values, group, 0);
+    }
+
+    values
+}
+
+/// [`t2x2`] on the four values at `indexes`.
+#[inline]
+fn t2x2_lanes<T: TransformLane>(values: &mut [T; 16], [a, b, c, d]: [usize; 4], rounding: i32) {
+    values[a] = values[a] + values[d];
+    values[b] = values[b] - values[c];
+
+    let first = (values[a] - values[b] + T::splat(rounding)).shr(1);
+    let second = values[c];
+
+    values[c] = first - values[d];
+    values[d] = first - second;
+    values[a] = values[a] - values[d];
+    values[b] = values[b] + values[c];
+}
+
+/// One of the two odd-pair rotations in [`inverse_odd_pair`], on the values at `indexes`.
+#[inline]
+fn inverse_odd_pair_lanes<T: TransformLane>(values: &mut [T; 16], indexes: [usize; 4]) {
+    let [mut first, mut second, mut third, mut fourth] = indexes.map(|index| values[index]);
+    let one = T::splat(1);
+    let four = T::splat(4);
+
+    second = second + fourth;
+    first = first - third;
+
+    fourth = fourth - second.shr(1);
+    third = third + (first + one).shr(1);
+
+    first = first - (second.triple() + four).shr(3);
+    second = second + (first.triple() + four).shr(3);
+    third = third - (fourth.triple() + four).shr(3);
+    fourth = fourth + (third.triple() + four).shr(3);
+
+    third = third - (second + one).shr(1);
+    fourth = (first + one).shr(1) - fourth;
+    second = second + third;
+    first = first - fourth;
+
+    for (index, value) in indexes.into_iter().zip([first, second, third, fourth]) {
+        values[index] = value;
+    }
+}
+
+/// [`inverse_odd_odd`] on the four values at `indexes`.
+#[inline]
+fn inverse_odd_odd_lanes<T: TransformLane>(values: &mut [T; 16], indexes: [usize; 4]) {
+    let [mut a, mut b, mut c, mut d] = indexes.map(|index| values[index]);
+
+    d = d + a;
+    c = c - b;
+
+    let first = d.shr(1);
+    let second = c.shr(1);
+
+    a = a - first;
+    b = b + second;
+    a = a - (b.triple() + T::splat(3)).shr(3);
+    b = b + (a.triple() + T::splat(3)).shr(2);
+    a = a - (b.triple() + T::splat(4)).shr(3);
+    b = b - second;
+    a = a + first;
+    c = c + b;
+    d = d - a;
+
+    for (index, value) in indexes.into_iter().zip([a, -b, -c, d]) {
+        values[index] = value;
+    }
 }
 
 // Regroups the 16 macroblock-relative coefficient positions (T.832's raster scan order) into
@@ -2310,14 +2547,15 @@ fn decode_flexbits_packet(
             let flex_bits = model_bits.saturating_sub(trim);
 
             for block in HIERARCHICAL_ORDER {
-                let start = (macroblock * components + component) * 256 + block * 16;
-                let values: &mut [i32; 16] = (&mut highpass.values[start..start + 16])
+                let start = (macroblock * components + component) * 256;
+                let values: &mut [i32; 256] = (&mut highpass.values[start..start + 256])
                     .try_into()
-                    .expect("block slice has length 16");
+                    .expect("macroblock component slice has length 256");
+                let index = |coefficient: usize| highpass_index(block, coefficient);
 
                 if flex_bits == 0 {
                     for coefficient in TRANSPOSE.into_iter().skip(1) {
-                        values[coefficient] = values[coefficient]
+                        values[index(coefficient)] = values[index(coefficient)]
                             .checked_shl(u32::from(model_bits))
                             .ok_or_else(|| {
                                 reader.error(ErrorKind::InvalidCodestream(
@@ -2329,7 +2567,7 @@ fn decode_flexbits_packet(
                 }
 
                 for coefficient in TRANSPOSE.into_iter().skip(1) {
-                    let vlc = values[coefficient];
+                    let vlc = values[index(coefficient)];
 
                     let refinement = i32::try_from(reader.read_u32(flex_bits)?)
                         .expect("at most 15 flexbits fit i32");
@@ -2347,7 +2585,7 @@ fn decode_flexbits_packet(
                         ))
                     })?;
 
-                    values[coefficient] = vlc
+                    values[index(coefficient)] = vlc
                         .checked_shl(u32::from(model_bits))
                         .and_then(|value| value.checked_add(flex))
                         .ok_or_else(|| {
@@ -2488,7 +2726,8 @@ fn decode_band_block(
     vlc: &mut BandVLC,
     scan: &mut AdaptiveScan,
     chroma: bool,
-    coefficients: &mut [i32; 16],
+    coefficients: &mut [i32],
+    stride: usize,
     messages: BandMessages,
 ) -> Result<i32> {
     let first = vlc.decode_first(reader, chroma)?;
@@ -2509,7 +2748,7 @@ fn decode_band_block(
         position += entropy::run(reader, 14)?;
     }
 
-    scan.place(coefficients, position, value);
+    scan.place(coefficients, stride, position, value);
     let mut location = position + 1;
     let mut nonzero = 1_i32;
 
@@ -2546,7 +2785,7 @@ fn decode_band_block(
         };
 
         value = signed_level(reader, magnitude, negative)?;
-        scan.place(coefficients, position, value);
+        scan.place(coefficients, stride, position, value);
         nonzero += 1;
     }
 
@@ -2766,11 +3005,8 @@ fn decode_highpass_macroblock(
         let mut pattern = pattern;
         for block in HIERARCHICAL_ORDER {
             if pattern & 1 != 0 {
-                let start = (macroblock * components + component) * 256 + block * 16;
-
-                let coefficients: &mut [i32; 16] = (&mut value_band[start..start + 16])
-                    .try_into()
-                    .expect("highpass block has 16 coefficients");
+                let start = (macroblock * components + component) * 256;
+                let coefficients = &mut value_band[start + block..start + 256];
 
                 // Split-borrow the context: the shared tables and the chosen scan are disjoint
                 // fields, so both can be handed to the decoder at once.
@@ -2786,6 +3022,7 @@ fn decode_highpass_macroblock(
                     scan,
                     component != 0,
                     coefficients,
+                    HIGHPASS_BLOCKS,
                     HIGHPASS_MESSAGES,
                 )?;
             }
@@ -2885,10 +3122,11 @@ impl AdaptiveScan {
         self.totals = Self::INITIAL_TOTALS;
     }
 
-    fn place(&mut self, coefficients: &mut [i32; 16], position: u8, value: i32) {
+    /// Stores `value` at scan `position`, where coefficient `n` lives at `coefficients[n * stride]`.
+    fn place(&mut self, coefficients: &mut [i32], stride: usize, position: u8, value: i32) {
         let position = usize::from(position);
 
-        coefficients[usize::from(self.order[position])] = value;
+        coefficients[usize::from(self.order[position]) * stride] = value;
         self.totals[position] += 1;
 
         if position > 1 && self.totals[position] > self.totals[position - 1] {
@@ -2947,6 +3185,7 @@ fn decode_lowpass_macroblock(
                 &mut context.scan,
                 component != 0,
                 coefficients,
+                1,
                 LOWPASS_MESSAGES,
             )?
         } else {
@@ -3287,8 +3526,8 @@ mod tests {
                 dequantize_and_predict_highpass_macroblock(&mut values, &[factor], mode, 7)
                     .unwrap();
                 for (index, value) in values.into_iter().enumerate() {
-                    let block = index / 16;
-                    let coefficient = index % 16;
+                    let block = index % 16;
+                    let coefficient = index / 16;
                     let chain_length = match (mode, coefficient) {
                         (0, 4 | 8 | 12) => block % 4 + 1,
                         (1, 1..=3) => block / 4 + 1,
@@ -3313,7 +3552,7 @@ mod tests {
         );
 
         let mut values = [1; 256];
-        values[4] = i32::MAX;
+        values[highpass_index(0, 4)] = i32::MAX;
         assert_eq!(
             dequantize_and_predict_highpass_macroblock(&mut values, &[1], 0, 7),
             Err(Error::new(
@@ -3456,6 +3695,138 @@ mod tests {
                     )),
                 );
             }
+        }
+    }
+
+    /// Tracks a bound on a value's magnitude, recording the largest bound any operation yields.
+    #[derive(Clone, Copy, Debug)]
+    struct Magnitude(i64);
+
+    thread_local! {
+        static LARGEST_MAGNITUDE: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+    }
+
+    impl Magnitude {
+        fn recorded(self) -> Self {
+            LARGEST_MAGNITUDE.with(|largest| largest.set(largest.get().max(self.0)));
+            self
+        }
+    }
+
+    impl Add for Magnitude {
+        type Output = Self;
+        fn add(self, rhs: Self) -> Self {
+            Self(self.0 + rhs.0).recorded()
+        }
+    }
+
+    impl Sub for Magnitude {
+        type Output = Self;
+        #[expect(
+            clippy::suspicious_arithmetic_impl,
+            reason = "a difference's magnitude is bounded by the sum of the magnitudes"
+        )]
+        fn sub(self, rhs: Self) -> Self {
+            Self(self.0 + rhs.0).recorded()
+        }
+    }
+
+    impl Neg for Magnitude {
+        type Output = Self;
+        fn neg(self) -> Self {
+            self
+        }
+    }
+
+    impl TransformLane for Magnitude {
+        fn splat(value: i32) -> Self {
+            Self(i64::from(value).abs())
+        }
+
+        fn shr(self, bits: i32) -> Self {
+            // Flooring rounds negative values away from zero, so round the magnitude up.
+            let divisor = 1_i64 << bits;
+            Self((self.0 + divisor - 1) / divisor).recorded()
+        }
+
+        fn triple(self) -> Self {
+            Self(3 * self.0).recorded()
+        }
+    }
+
+    #[test]
+    fn inverse_transform_bound_keeps_every_intermediate_in_i32() {
+        LARGEST_MAGNITUDE.with(|largest| largest.set(0));
+        let outputs =
+            inverse_transform_lanes([Magnitude(i64::from(NARROW_INVERSE_TRANSFORM_BOUND)); 16]);
+        let largest = LARGEST_MAGNITUDE.with(std::cell::Cell::get);
+
+        assert!(outputs.iter().all(|output| output.0 <= largest));
+        assert!(
+            largest <= i64::from(i32::MAX),
+            "an intermediate may reach {largest}, beyond i32"
+        );
+    }
+
+    #[test]
+    fn lane_transform_matches_the_checked_transform_inside_its_bound() {
+        let bound = NARROW_INVERSE_TRANSFORM_BOUND;
+        let mut state = 0x2468_ace1_u32;
+        let mut sample = |shift: u32| {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let edge = [-bound, bound - 1, 0, -1, 1][usize::try_from(state >> 29).unwrap() % 5];
+            if state & 0x100 == 0 {
+                edge
+            } else {
+                i32::from_ne_bytes(state.to_ne_bytes()) >> shift
+            }
+        };
+
+        for shift in [7, 12, 20, 28] {
+            for _ in 0..64 {
+                let coefficients: [I32x16; 16] = std::array::from_fn(|_| {
+                    I32x16::from_array(std::array::from_fn(|_| sample(shift)))
+                });
+                assert!(fits_narrow_inverse_transform(&coefficients));
+
+                let mut values = [I32x16::splat(0); 16];
+                for (input, position) in INVERSE_TRANSFORM_PERMUTATION.into_iter().enumerate() {
+                    values[position] = coefficients[input];
+                }
+                let width = 19;
+                let mut narrow = vec![0; 16 * width];
+                let mut checked = vec![0; 16 * width];
+                write_macroblock_rows(&inverse_transform_lanes(values), &mut narrow, width);
+                transform_macroblock_checked(&coefficients, &mut checked, width, 0).unwrap();
+                assert_eq!(narrow, checked);
+            }
+        }
+
+        let mut outside = [I32x16::splat(0); 16];
+        outside[3][9] = bound;
+        assert!(!fits_narrow_inverse_transform(&outside));
+        outside[3][9] = -bound - 1;
+        assert!(!fits_narrow_inverse_transform(&outside));
+    }
+
+    #[test]
+    fn checked_macroblock_transform_places_each_block_in_raster_order() {
+        // Block `b` holds only a DC of `16 * b`, which reconstructs to a flat block of `4 * b`.
+        let mut coefficients = [I32x16::splat(0); 16];
+        coefficients[0] = I32x16::from_array(std::array::from_fn(|block| {
+            16 * i32::try_from(block).unwrap()
+        }));
+
+        let width = 16;
+        let mut output = vec![0; 16 * width];
+        transform_macroblock_checked(&coefficients, &mut output, width, 0).unwrap();
+        for (index, sample) in output.into_iter().enumerate() {
+            let (x, y) = (index % width, index / width);
+            assert_eq!(
+                sample,
+                4 * i32::try_from(y / 4 * 4 + x / 4).unwrap(),
+                "({x}, {y})"
+            );
         }
     }
 
