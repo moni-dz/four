@@ -6,6 +6,7 @@ use nutype::nutype;
 use rayon::prelude::*;
 
 pub mod gif;
+pub mod hdr;
 pub mod jpeg;
 pub mod jpeg_xl;
 pub mod jpeg_xr;

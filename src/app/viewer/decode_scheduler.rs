@@ -3,7 +3,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use four::jpeg_xr;
+use four::hdr;
 
 use super::HDROptions;
 
@@ -21,8 +21,8 @@ pub(super) enum LoadPurpose {
 pub(super) enum DecodeSource {
     /// Read and decode the file at `DecodePayload::path` from scratch.
     File,
-    /// Re-tone-map an already-decoded native JPEG XR image; no file I/O or entropy decode.
-    RetainedJpegXr(Arc<jpeg_xr::NativeJPEGXR>),
+    /// Re-tone-map an already-decoded native HDR image; no file I/O or entropy decode.
+    RetainedHdr(Arc<hdr::NativeHDR>),
 }
 
 #[derive(Debug)]

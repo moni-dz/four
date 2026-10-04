@@ -87,4 +87,4 @@ macro_rules! format_error_boilerplate {
 mod image_formats;
 
 #[doc(inline)]
-pub use image_formats::{DecodedImage, encode_bmp, gif, jpeg, jpeg_xl, jpeg_xr, png, tiff};
+pub use image_formats::{DecodedImage, encode_bmp, gif, hdr, jpeg, jpeg_xl, jpeg_xr, png, tiff};
