@@ -374,7 +374,7 @@ fn fill_bgr101010_row(
         let luma = I32x8::from_array(*luma);
         let chroma_u = I32x8::from_array(*chroma_u);
         let chroma_v = I32x8::from_array(*chroma_v);
-        
+
         let [red, green, blue] = if fits_narrow_color_transform([luma, chroma_u, chroma_v]) {
             inverse_color_transform_narrow_simd(luma, chroma_u, chroma_v, narrow_bias)
                 .map(|channel| clip_10_bit_narrow_simd(channel, shift))

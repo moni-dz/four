@@ -24,8 +24,6 @@ zerocopy = "0.8.56"
 [dependencies]
 exn = "0.3.1"
 gif = "0.14.2"
-gpui = { git = "https://github.com/zed-industries/zed", rev = "38ca9106c5306ef93e52c35643df015a27f15b72" }
-gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "38ca9106c5306ef93e52c35643df015a27f15b72", features = ["font-kit", "wayland", "x11"] }
 jxl-oxide = { version = "0.12.6", default-features = false, features = ["moxcms", "rayon"] }
 jpegxr = { workspace = true }
 multiversion = { workspace = true }
@@ -37,6 +35,7 @@ tiff = "0.11.3"
 tonemapping = { workspace = true }
 zune-jpeg = "0.5.15"
 zerocopy = { workspace = true, features = ["simd", "simd-nightly", "float-nightly"] }
+gpui-kit = "0.7.0"
 
 [dev-dependencies]
 divan = { workspace = true }

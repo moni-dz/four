@@ -1,167 +1,23 @@
-//! Builds the GPUI element tree: context menu, tone-mapping controls, image surface, status bar,
+//! Builds the GPUI element tree: tone-mapping controls, image surface, status bar,
 //! and the mouse handlers that back the image surface.
 
 use std::sync::Arc;
 
-use gpui::{
-    Anchor, AnchoredPositionMode, CursorStyle, Image as GPUIImage, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, Pixels, Point, ScrollWheelEvent, SharedString, Window,
-    WindowControlArea, anchored, deferred, div, img, point, prelude::*, px, rgb, rgba,
+use gpui_kit::component::select::{Select, SelectState};
+use gpui_kit::{
+    CursorStyle, Entity, Image as GPUIImage, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, ScrollWheelEvent, SharedString, Window, WindowControlArea, div, img,
+    point, prelude::*, px, rgb,
 };
-use tonemapping::ToneMappingMethod;
 
 use super::geometry::{clamp_pan, fit_scale, zoom_to_cursor_pan};
 use super::{
-    COLOR_ACCENT_GREEN, COLOR_CONTROL_BACKGROUND, COLOR_CONTROL_BORDER, COLOR_CONTROL_HOVER,
-    COLOR_MENU_ITEM_HOVER, COLOR_PANEL_BACKGROUND, COLOR_PANEL_BORDER, COLOR_SELECTED_BACKGROUND,
-    COLOR_STATUS_BAR_BACKGROUND, COLOR_TEXT_HINT, COLOR_TEXT_MENU, COLOR_TEXT_SECONDARY,
-    CONTEXT_MENU_HEIGHT, CONTEXT_MENU_ITEM_HEIGHT, CONTEXT_MENU_WIDTH, DRAG_REGION_HEIGHT,
-    HDROptions, LABEL_ROW_GAP, Root, SCROLL_LINE_HEIGHT, TONE_MAPPING_LABEL_WIDTH,
-    TONE_MAPPING_MENU_ITEM_HEIGHT, TONE_MAPPING_MENU_MARGIN, TONE_MAPPING_MENU_SNAP_MARGIN,
-    TONE_MAPPING_MENU_WIDTH, TONE_MAPPING_SELECTOR_HEIGHT, TONE_MAPPING_TITLEBAR_WIDTH, ZOOM_MAX,
-    ZOOM_MIN, ZOOM_STEP_BASE,
+    COLOR_STATUS_BAR_BACKGROUND, COLOR_TEXT_HINT, COLOR_TEXT_SECONDARY, DRAG_REGION_HEIGHT,
+    LABEL_ROW_GAP, Root, SCROLL_LINE_HEIGHT, TONE_MAPPING_LABEL_WIDTH, TONE_MAPPING_TITLEBAR_WIDTH,
+    ToneMappingItem, ZOOM_MAX, ZOOM_MIN, ZOOM_STEP_BASE,
 };
 
 impl Root {
-    pub(super) fn render_context_menu(
-        position: Point<Pixels>,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        assert!(
-            position.x >= px(0.0),
-            "context menu x position must be clamped nonnegative, got {:?}",
-            position.x
-        );
-        assert!(
-            position.y >= px(DRAG_REGION_HEIGHT),
-            "context menu y position must clear the drag region, got {:?}",
-            position.y
-        );
-
-        deferred(
-            div()
-                .absolute()
-                .left(position.x)
-                .top(position.y)
-                .w(px(CONTEXT_MENU_WIDTH))
-                .h(px(CONTEXT_MENU_HEIGHT))
-                .p_1()
-                .rounded_md()
-                .shadow_lg()
-                .border_1()
-                .border_color(rgb(COLOR_PANEL_BORDER))
-                .bg(rgb(COLOR_PANEL_BACKGROUND))
-                .flex()
-                .flex_col()
-                .on_mouse_down_out(cx.listener(|root, _, _, cx| {
-                    root.context_menu_position = None;
-                    cx.notify();
-                }))
-                .child(
-                    menu_item("open-image", "Open image…")
-                        .on_click(cx.listener(|root, _, window, cx| root.open_image(window, cx))),
-                )
-                .child(menu_item("quit", "Quit").on_click(|_, _, cx| cx.quit())),
-        )
-        .priority(1)
-    }
-
-    pub(super) fn render_tone_mapping_selector(
-        active_method: ToneMappingMethod,
-        menu_open: bool,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
-        let selector = div()
-            .id("tone-mapping-selector")
-            .relative()
-            .h(px(TONE_MAPPING_SELECTOR_HEIGHT))
-            .min_w_0()
-            .flex_1()
-            .flex()
-            .items_center()
-            .justify_between()
-            .px_2()
-            .rounded_sm()
-            .border_1()
-            .border_color(rgba(COLOR_CONTROL_BORDER))
-            .bg(rgb(COLOR_CONTROL_BACKGROUND))
-            .cursor_pointer()
-            .hover(|style| style.bg(rgb(COLOR_CONTROL_HOVER)))
-            .child(active_method.label())
-            .child(
-                div()
-                    .ml_2()
-                    .text_color(rgb(COLOR_TEXT_SECONDARY))
-                    .child("▼"),
-            )
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |root, _, _, cx| {
-                    root.context_menu_position = None;
-                    root.tone_mapping_menu_open = !menu_open;
-                    cx.notify();
-                }),
-            )
-            .when(menu_open, |selector| {
-                selector.child(Self::render_tone_mapping_menu(active_method, cx))
-            });
-
-        div()
-            .w_full()
-            .flex()
-            .items_center()
-            .gap(px(LABEL_ROW_GAP))
-            .child(
-                div()
-                    .w(px(TONE_MAPPING_LABEL_WIDTH))
-                    .flex_none()
-                    .text_color(rgb(COLOR_TEXT_SECONDARY))
-                    .child("Tone mapper"),
-            )
-            .child(selector)
-    }
-
-    pub(super) fn render_tone_mapping_menu(
-        active_method: ToneMappingMethod,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        deferred(
-            anchored()
-                .anchor(Anchor::TopLeft)
-                .position(point(
-                    px(0.0),
-                    px(TONE_MAPPING_SELECTOR_HEIGHT + TONE_MAPPING_MENU_MARGIN),
-                ))
-                .position_mode(AnchoredPositionMode::Local)
-                .snap_to_window_with_margin(px(TONE_MAPPING_MENU_SNAP_MARGIN))
-                .child(
-                    div()
-                        .occlude()
-                        .w(px(TONE_MAPPING_MENU_WIDTH))
-                        .p_1()
-                        .rounded_md()
-                        .shadow_lg()
-                        .border_1()
-                        .border_color(rgb(COLOR_PANEL_BORDER))
-                        .bg(rgb(COLOR_PANEL_BACKGROUND))
-                        .flex()
-                        .flex_col()
-                        .children(ToneMappingMethod::ALL.map(|method| {
-                            tone_mapping_menu_item(method, active_method).on_click(cx.listener(
-                                move |root, _, window, cx| {
-                                    root.select_tone_mapping(method, window, cx);
-                                },
-                            ))
-                        }))
-                        .on_mouse_down_out(cx.listener(|root, _, _, cx| {
-                            root.tone_mapping_menu_open = false;
-                            cx.notify();
-                        })),
-                ),
-        )
-        .priority(2)
-    }
-
     pub(super) fn on_image_scroll(
         &mut self,
         event: &ScrollWheelEvent,
@@ -226,7 +82,7 @@ impl Root {
         image_dims: Option<(u32, u32)>,
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> gpui::Div {
+    ) -> gpui_kit::Div {
         let has_image = image.is_some();
 
         div()
@@ -304,10 +160,8 @@ impl Root {
 
     pub(super) fn render_status_bar(
         status: SharedString,
-        hdr_options: Option<HDROptions>,
-        tone_mapping_menu_open: bool,
-        cx: &mut Context<Self>,
-    ) -> gpui::Div {
+        tone_mapping_select: Option<Entity<SelectState<Vec<ToneMappingItem>>>>,
+    ) -> gpui_kit::Div {
         div()
             .w_full()
             .h(px(DRAG_REGION_HEIGHT))
@@ -328,7 +182,7 @@ impl Root {
                     .window_control_area(WindowControlArea::Drag)
                     .child(status),
             )
-            .when_some(hdr_options, |titlebar, options| {
+            .when_some(tone_mapping_select, |titlebar, select| {
                 titlebar.child(
                     div()
                         .w(px(TONE_MAPPING_TITLEBAR_WIDTH))
@@ -336,64 +190,23 @@ impl Root {
                         .flex_none()
                         .flex()
                         .items_center()
+                        .gap(px(LABEL_ROW_GAP))
                         .px_3()
-                        .child(Self::render_tone_mapping_selector(
-                            options.tone_mapping(),
-                            tone_mapping_menu_open,
-                            cx,
-                        )),
+                        .child(
+                            div()
+                                .w(px(TONE_MAPPING_LABEL_WIDTH))
+                                .flex_none()
+                                .text_color(rgb(COLOR_TEXT_SECONDARY))
+                                .child("Tone mapper"),
+                        )
+                        .child(
+                            div().min_w_0().flex_1().child(
+                                Select::new(&select)
+                                    .id("tone-mapping-selector")
+                                    .accessibility_label("Tone mapper"),
+                            ),
+                        ),
                 )
             })
     }
-}
-
-fn menu_item(identifier: &'static str, label: &'static str) -> gpui::Stateful<gpui::Div> {
-    assert_ne!(
-        identifier.len(),
-        0,
-        "menu item identifier must not be blank"
-    );
-    assert_ne!(label.len(), 0, "menu item label must not be blank");
-
-    div()
-        .id(identifier)
-        .h(px(CONTEXT_MENU_ITEM_HEIGHT))
-        .w_full()
-        .flex()
-        .items_center()
-        .px_2()
-        .rounded_sm()
-        .cursor_pointer()
-        .text_sm()
-        .text_color(rgb(COLOR_TEXT_MENU))
-        .hover(|style| style.bg(rgb(COLOR_MENU_ITEM_HOVER)))
-        .child(label)
-}
-
-fn tone_mapping_menu_item(
-    method: ToneMappingMethod,
-    active_method: ToneMappingMethod,
-) -> gpui::Stateful<gpui::Div> {
-    div()
-        .id(method.label())
-        .h(px(TONE_MAPPING_MENU_ITEM_HEIGHT))
-        .w_full()
-        .flex()
-        .items_center()
-        .px_2()
-        .rounded_sm()
-        .cursor_pointer()
-        .text_color(rgb(COLOR_TEXT_MENU))
-        .hover(|style| style.bg(rgb(COLOR_MENU_ITEM_HOVER)))
-        .when(method == active_method, |item| {
-            item.bg(rgb(COLOR_SELECTED_BACKGROUND))
-        })
-        .child(
-            div()
-                .w_5()
-                .flex_none()
-                .text_color(rgb(COLOR_ACCENT_GREEN))
-                .child(if method == active_method { "✓" } else { "" }),
-        )
-        .child(method.label())
 }

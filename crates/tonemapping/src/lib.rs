@@ -1070,11 +1070,11 @@ mod tests {
 
         let mut pushed = LinearRGBPlanes::default();
         let mut extended = LinearRGBPlanes::default();
-        
+
         for offset in 0..raw.len() {
             let channels = [lanes(offset), lanes(offset + 1), lanes(offset + 2)];
             extended.extend_from_lanes(channels);
-            
+
             for lane in 0..4 {
                 pushed.push(LinearRGB::new(channels.map(|channel| channel[lane])));
             }

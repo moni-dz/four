@@ -1,6 +1,6 @@
 //! Pure zoom/pan math shared by the render tree and the top-level viewer state.
 
-use gpui::{Pixels, Point, point, px};
+use gpui_kit::{Pixels, Point, point, px};
 
 /// Scale that fits an image inside a content area while preserving aspect ratio.
 #[expect(
@@ -48,7 +48,7 @@ pub(super) fn zoom_to_cursor_pan(
 #[cfg(test)]
 mod zoom_math_tests {
     use super::{clamp_pan, fit_scale, zoom_to_cursor_pan};
-    use gpui::{point, px};
+    use gpui_kit::{point, px};
 
     #[test]
     fn fit_scale_stays_positive_when_content_area_collapses() {
