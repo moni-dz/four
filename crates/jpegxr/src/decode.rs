@@ -320,6 +320,7 @@ pub(crate) fn decode_bgr101010(stream: &ParsedCodestream<'_>) -> Result<Vec<u32>
     // the `chunks_mut`/`par_chunks_mut` split below covers the entire `pixels` buffer, so every
     // element is written before this function returns.
     let mut pixels = unsafe { uninit_vec::<u32>(pixel_count) };
+
     let fill_row =
         |y, row: &mut [u32]| fill_bgr101010_row(row, y, left, top, &color, shift, bias, swapped);
 
@@ -362,19 +363,25 @@ fn fill_bgr101010_row(
     let (chroma_v_chunks, chroma_v_tail) = chroma_v.as_chunks::<PIXEL_LANES>();
     let (pixel_chunks, pixel_tail) = row.as_chunks_mut::<PIXEL_LANES>();
 
+    let narrow_bias = I32x8::splat(i32::try_from(bias).expect("the BGR101010 bias is small"));
+
     for (((luma, chroma_u), chroma_v), pixels) in luma_chunks
         .iter()
         .zip(chroma_u_chunks)
         .zip(chroma_v_chunks)
         .zip(pixel_chunks)
     {
-        let [red, green, blue] = inverse_color_transform_simd(
-            I32x8::from_array(*luma),
-            I32x8::from_array(*chroma_u),
-            I32x8::from_array(*chroma_v),
-            bias,
-        )
-        .map(|channel| clip_10_bit_simd(channel, shift));
+        let luma = I32x8::from_array(*luma);
+        let chroma_u = I32x8::from_array(*chroma_u);
+        let chroma_v = I32x8::from_array(*chroma_v);
+        
+        let [red, green, blue] = if fits_narrow_color_transform([luma, chroma_u, chroma_v]) {
+            inverse_color_transform_narrow_simd(luma, chroma_u, chroma_v, narrow_bias)
+                .map(|channel| clip_10_bit_narrow_simd(channel, shift))
+        } else {
+            inverse_color_transform_simd(luma, chroma_u, chroma_v, bias)
+                .map(|channel| clip_10_bit_simd(channel, shift))
+        };
 
         let packed = if swapped {
             blue | (green << 10) | (red << 20)
@@ -432,6 +439,51 @@ fn inverse_color_transform(y: i32, u: i32, v: i32, bias: i64) -> [i64; 3] {
     blue += red;
 
     [red, green, blue]
+}
+
+/// Bounds [`inverse_color_transform_narrow_simd`] inputs to `-2^28..2^28`.
+///
+/// With every input and the bias within `2^28` in magnitude, each intermediate stays below `2^31`.
+const NARROW_COLOR_TRANSFORM_BOUND: i32 = 1 << 28;
+
+/// Reports whether every lane of `samples` is in `-2^28..2^28`, as
+/// [`NARROW_COLOR_TRANSFORM_BOUND`] requires.
+#[inline]
+fn fits_narrow_color_transform(samples: [I32x8; 3]) -> bool {
+    // Offsetting by the bound maps the accepted range onto `0..2^29` and wraps everything else to
+    // a value with a higher bit set, so one mask test covers all three channels.
+    let offset = I32x8::splat(NARROW_COLOR_TRANSFORM_BOUND);
+    let combined = samples
+        .into_iter()
+        .fold(I32x8::splat(0), |combined, sample| {
+            combined | (sample + offset)
+        });
+    (combined & I32x8::splat(!(2 * NARROW_COLOR_TRANSFORM_BOUND - 1)))
+        .simd_eq(I32x8::splat(0))
+        .all()
+}
+
+/// [`inverse_color_transform_simd`] in 32-bit lanes, for inputs that pass
+/// [`fits_narrow_color_transform`].
+#[inline]
+fn inverse_color_transform_narrow_simd(y: I32x8, u: I32x8, v: I32x8, bias: I32x8) -> [I32x8; 3] {
+    let mut green = y + bias;
+    let mut red = -u;
+    let mut blue = v;
+
+    green -= red >> 1;
+    red -= ((blue + I32x8::splat(1)) >> 1) - green;
+    blue += red;
+
+    [red, green, blue]
+}
+
+#[inline]
+fn clip_10_bit_narrow_simd(value: I32x8, shift: u32) -> Simd<u32, PIXEL_LANES> {
+    value
+        .simd_clamp(I32x8::splat(0), I32x8::splat(1023 << shift))
+        .cast::<u32>()
+        >> shift
 }
 
 #[inline]
@@ -3221,6 +3273,58 @@ mod tests {
                     clip_10_bit_simd(I64x8::from_array(values), shift).to_array(),
                     values.map(|value| clip_10_bit(value >> shift)),
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn narrow_color_transform_matches_the_wide_one_inside_its_bound() {
+        let bound = NARROW_COLOR_TRANSFORM_BOUND;
+        let edges = [
+            -bound + 1,
+            -bound / 2,
+            -1023,
+            -1,
+            0,
+            1,
+            1023,
+            4096,
+            bound / 2,
+            bound - 1,
+        ];
+        let mut state = 0x9e37_79b9_u32;
+        let mut sample = || {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            let edge = edges[usize::try_from(state % 10).unwrap()];
+            edge.wrapping_add(i32::try_from((state >> 8) % 3).unwrap() - 1)
+        };
+
+        for shift in [0, 3] {
+            let bias = (512_i64 << shift) + if shift == 0 { 0 } else { 3 };
+            for _ in 0..4_096 {
+                let channels: [I32x8; 3] =
+                    std::array::from_fn(|_| I32x8::from_array(std::array::from_fn(|_| sample())));
+                let [y, u, v] = channels;
+                let fits = channels
+                    .into_iter()
+                    .flat_map(Simd::to_array)
+                    .all(|value| (-bound..bound).contains(&value));
+                assert_eq!(fits_narrow_color_transform(channels), fits);
+
+                if fits {
+                    let narrow = inverse_color_transform_narrow_simd(
+                        y,
+                        u,
+                        v,
+                        I32x8::splat(i32::try_from(bias).unwrap()),
+                    )
+                    .map(|channel| clip_10_bit_narrow_simd(channel, shift));
+                    let wide = inverse_color_transform_simd(y, u, v, bias)
+                        .map(|channel| clip_10_bit_simd(channel, shift));
+                    assert_eq!(narrow, wide);
+                }
             }
         }
     }

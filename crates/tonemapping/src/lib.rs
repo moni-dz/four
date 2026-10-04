@@ -156,6 +156,23 @@ impl LinearRGBPlanes {
         self.blue.push(blue);
     }
 
+    /// Appends one color per lane of `channels`, sanitized as [`LinearRGB::new`] does.
+    ///
+    /// Equivalent to pushing each lane's color in order, with vector sanitization.
+    #[inline]
+    pub fn extend_from_lanes<const N: usize>(&mut self, channels: [Simd<f32, N>; 3]) {
+        let [red, green, blue] = channels.map(|channel| {
+            math::min_or_second(
+                math::max_or_second(channel, Simd::splat(0.0)),
+                Simd::splat(MAX_MAPPABLE),
+            )
+            .to_array()
+        });
+        self.red.extend_from_slice(&red);
+        self.green.extend_from_slice(&green);
+        self.blue.extend_from_slice(&blue);
+    }
+
     /// Returns the number of stored colors.
     #[must_use]
     pub const fn len(&self) -> usize {
@@ -947,7 +964,7 @@ pub use clamp::{Clamp, ScaledClamp};
 #[doc(inline)]
 pub use hable::Hable;
 #[doc(inline)]
-pub use math::{exp2, log2};
+pub use math::{exp2, log2, pow_unit_interval};
 #[doc(inline)]
 pub use reinhard::{
     ExtendedLuminanceReinhard, ExtendedReinhard, LuminanceReinhard, LuminanceWhitePoint,
@@ -1027,6 +1044,54 @@ mod tests {
         (0..17)
             .map(|index| LinearRGB::new(palette[index % palette.len()]))
             .collect()
+    }
+
+    #[test]
+    fn lane_extension_sanitizes_like_push() {
+        let raw = [
+            0.0,
+            -0.0,
+            -1.0,
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(1),
+            f32::MAX,
+            0.5,
+            2.0e19,
+            1.0e19,
+            3.0,
+        ];
+        let lanes = |offset: usize| {
+            Simd::<f32, 4>::from_array(std::array::from_fn(|lane| {
+                raw[(lane * 5 + offset) % raw.len()]
+            }))
+        };
+
+        let mut pushed = LinearRGBPlanes::default();
+        let mut extended = LinearRGBPlanes::default();
+        
+        for offset in 0..raw.len() {
+            let channels = [lanes(offset), lanes(offset + 1), lanes(offset + 2)];
+            extended.extend_from_lanes(channels);
+            
+            for lane in 0..4 {
+                pushed.push(LinearRGB::new(channels.map(|channel| channel[lane])));
+            }
+        }
+
+        for (pushed, extended) in pushed.channels().into_iter().zip(extended.channels()) {
+            assert_eq!(
+                pushed
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                extended
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            );
+        }
     }
 
     fn assert_batch_matches_scalar(mapper: &dyn ToneMapper, inputs: &[LinearRGB]) {

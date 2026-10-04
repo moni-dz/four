@@ -237,7 +237,9 @@ const GOLDENS: &[Golden] = &[
     Golden {
         file: "screenshot.jxr",
         dimensions: (3840, 2160),
-        hash: 0x6d05_5895_20a4_8482,
+        // Re-recorded when BT.2446 stopped calling libm `exp2f` and `fmaf` from an outlined
+        // baseline kernel; 31 of 33,177,600 bytes moved by one level.
+        hash: 0x7cca_0f87_0cae_ff48,
         thumbnail: [
             [50, 45, 37, 255],
             [127, 108, 97, 255],

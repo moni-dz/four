@@ -1,6 +1,7 @@
-use std::simd::{Select, Simd, cmp::SimdPartialOrd, num::SimdFloat};
+use std::simd::Simd;
 
 use super::{LinearRGBPlanes, ToneMapper};
+use crate::math::{max_or_second, min_or_second};
 
 pub(crate) const COLOR_LANES: usize = 8;
 pub(crate) type F32x8 = Simd<f32, COLOR_LANES>;
@@ -44,13 +45,14 @@ pub(crate) fn map_planes(
     colors.map_from(simd_len, mapper);
 }
 
-#[inline]
+/// Clips `component` to `0.0..=1.0`, mapping `NaN` and negative zero to positive zero.
+///
+/// Matches [`super::display_component_f32`] with one `MAXPS` and one `MINPS` per vector.
+#[inline(always)]
+#[expect(
+    clippy::inline_always,
+    reason = "must compile under the calling multiversioned function's target features"
+)]
 pub(crate) fn displayable<const N: usize>(component: Simd<f32, N>) -> [f32; N] {
-    let zero = Simd::splat(0.0);
-    let one = Simd::splat(1.0);
-    let below = component.is_nan() | component.simd_le(zero);
-
-    below
-        .select(zero, component.simd_ge(one).select(one, component))
-        .to_array()
+    min_or_second(max_or_second(component, Simd::splat(0.0)), Simd::splat(1.0)).to_array()
 }
