@@ -1,7 +1,8 @@
 //! Decodes JPEG XR images.
 //!
 //! [`Decoder`] validates the Annex A container and T.832 codestream before coefficient decoding.
-//! Input is borrowed. Pixel reconstruction supports packed `BGR101010` and `RGBA128Float`; other
+//! Input is borrowed. Pixel reconstruction supports packed `BGR101010`, `RGBA128Float` and
+//! `RGBA64Half`; other
 //! valid profiles return an error classified by [`Error::is_unsupported`].
 
 #![feature(portable_simd)]
@@ -134,6 +135,44 @@ impl<'a> Decoder<'a> {
         })
     }
 
+    /// Decodes a `64bppRGBAHalf` image into interleaved IEEE 754 binary16 bit patterns.
+    ///
+    /// The returned samples are ordered R, G, B, A for each pixel in row-major order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] for malformed coefficients or unsupported image features.
+    pub fn decode_rgba_half(&self) -> Result<RGBAF16Image> {
+        if self.info.pixel_format != PixelFormat::RGBA64_HALF {
+            return Err(Error::new(
+                ErrorKind::Unsupported("pixel format other than 64bppRGBAHalf"),
+                self.primary.offset,
+            ));
+        }
+
+        if self.info.orientation != Orientation::Identity {
+            return Err(Error::new(
+                ErrorKind::Unsupported("non-identity container orientation"),
+                self.primary.offset,
+            ));
+        }
+
+        let alpha = self.alpha.as_ref().ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unsupported("RGBAHalf without separate alpha"),
+                self.primary.offset,
+            )
+        })?;
+
+        let pixels = decode::decode_rgba_half(&self.primary, alpha)?;
+
+        Ok(RGBAF16Image {
+            width: self.info.width,
+            height: self.info.height,
+            pixels,
+        })
+    }
+
     /// Decodes a `32bppBGR101010` image into packed native-endian words.
     ///
     /// Each word stores blue in bits 0–9, green in bits 10–19, and red in bits 20–29.
@@ -210,6 +249,40 @@ impl RGBAF32Image {
     /// Consumes the image and returns its interleaved RGBA samples.
     #[must_use]
     pub fn into_pixels(self) -> Vec<f32> {
+        self.pixels
+    }
+}
+
+/// A decoded image containing interleaved RGBA binary16 samples, stored as raw bit patterns.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RGBAF16Image {
+    width: u32,
+    height: u32,
+    pixels: Vec<u16>,
+}
+
+impl RGBAF16Image {
+    /// Returns the image width in pixels.
+    #[must_use]
+    pub const fn width(&self) -> u32 {
+        self.width
+    }
+
+    /// Returns the image height in pixels.
+    #[must_use]
+    pub const fn height(&self) -> u32 {
+        self.height
+    }
+
+    /// Returns row-major binary16 bit patterns in interleaved R, G, B, A order.
+    #[must_use]
+    pub fn pixels(&self) -> &[u16] {
+        &self.pixels
+    }
+
+    /// Consumes the image and returns its interleaved RGBA bit patterns.
+    #[must_use]
+    pub fn into_pixels(self) -> Vec<u16> {
         self.pixels
     }
 }

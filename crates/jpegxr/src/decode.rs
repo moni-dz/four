@@ -182,8 +182,22 @@ pub(crate) fn decode_rgba_f32(
     primary: &ParsedCodestream<'_>,
     alpha: &ParsedCodestream<'_>,
 ) -> Result<Vec<f32>> {
-    validate_float_rgb_profile(primary, alpha)?;
+    validate_float_rgb_profile(primary, alpha, OutputBitDepth::ThirtyTwoFloat)?;
+    decode_rgba::<FloatFormat>(primary, alpha)
+}
 
+pub(crate) fn decode_rgba_half(
+    primary: &ParsedCodestream<'_>,
+    alpha: &ParsedCodestream<'_>,
+) -> Result<Vec<u16>> {
+    validate_float_rgb_profile(primary, alpha, OutputBitDepth::SixteenFloat)?;
+    decode_rgba::<HalfFormat>(primary, alpha)
+}
+
+fn decode_rgba<F: SampleFormat>(
+    primary: &ParsedCodestream<'_>,
+    alpha: &ParsedCodestream<'_>,
+) -> Result<Vec<F::Sample>> {
     let (width, height, pixel_count) = validated_dimensions(&primary.header, primary.offset)?;
 
     let (color, alpha_image) = if pixel_count >= MIN_PARALLEL_PIXELS {
@@ -210,7 +224,7 @@ pub(crate) fn decode_rgba_f32(
     // channels, no data-dependent skip), and the `chunks_mut`/`par_chunks_mut` split below
     // covers the entire `pixels` buffer, so every element is written before this function
     // returns `Ok`; on `Err` the partially-filled buffer is dropped without being read.
-    let mut pixels = unsafe { uninit_vec::<f32>(output_len) };
+    let mut pixels = unsafe { uninit_vec::<F::Sample>(output_len) };
 
     let color_crop = crop_rect(
         primary.header.margins,
@@ -242,10 +256,10 @@ pub(crate) fn decode_rgba_f32(
         ));
     }
 
-    let color_format = FloatFormat::new(primary)?;
-    let alpha_format = FloatFormat::new(alpha)?;
+    let color_format = F::new(primary)?;
+    let alpha_format = F::new(alpha)?;
 
-    let fill_row = |y, row: &mut [f32]| {
+    let fill_row = |y, row: &mut [F::Sample]| {
         fill_rgba_row(
             row,
             y,
@@ -500,8 +514,8 @@ fn inverse_color_transform_simd(y: I32x8, u: I32x8, v: I32x8, bias: i64) -> [I64
 }
 
 #[multiversion(targets = "simd")]
-fn fill_rgba_row(
-    row: &mut [f32],
+fn fill_rgba_row<F: SampleFormat>(
+    row: &mut [F::Sample],
     y: usize,
     color_left: usize,
     color_top: usize,
@@ -509,11 +523,11 @@ fn fill_rgba_row(
     alpha_top: usize,
     color: &IntegerImage,
     alpha: &IntegerImage,
-    color_format: FloatFormat,
-    alpha_format: FloatFormat,
+    color_format: F,
+    alpha_format: F,
 ) -> Result<()> {
     let (pixels, remainder) = row.as_chunks_mut::<4>();
-    debug_assert_eq!(remainder, []);
+    debug_assert!(remainder.is_empty());
 
     // Slice each plane once so the pixel loop needs no flat-index bounds checks.
     let color_component_len = color.width * color.height;
@@ -1121,27 +1135,28 @@ fn decode_highpass_tile(
 fn validate_float_rgb_profile(
     primary: &ParsedCodestream<'_>,
     alpha: &ParsedCodestream<'_>,
+    depth: OutputBitDepth,
 ) -> Result<()> {
     if primary.header.output_color_format != OutputColorFormat::RGB
-        || primary.header.output_bit_depth != OutputBitDepth::ThirtyTwoFloat
+        || primary.header.output_bit_depth != depth
         || primary.primary_plane.internal_color_format != InternalColorFormat::YUV444
         || primary.primary_plane.bands != Bands::All
-        || primary.primary_plane.scaled
+        || primary.primary_plane.scaled && depth != OutputBitDepth::SixteenFloat
     {
         return Err(Error::new(
-            ErrorKind::Unsupported("RGBA128Float primary image profile"),
+            ErrorKind::Unsupported("floating-point RGBA primary image profile"),
             primary.offset,
         ));
     }
 
     if alpha.header.output_color_format != OutputColorFormat::YOnly
-        || alpha.header.output_bit_depth != OutputBitDepth::ThirtyTwoFloat
+        || alpha.header.output_bit_depth != depth
         || alpha.primary_plane.internal_color_format != InternalColorFormat::YOnly
         || alpha.primary_plane.bands != Bands::All
-        || alpha.primary_plane.scaled
+        || alpha.primary_plane.scaled && depth != OutputBitDepth::SixteenFloat
     {
         return Err(Error::new(
-            ErrorKind::Unsupported("RGBA128Float separate-alpha profile"),
+            ErrorKind::Unsupported("floating-point RGBA separate-alpha profile"),
             alpha.offset,
         ));
     }
@@ -1216,7 +1231,7 @@ fn reconstruct(stream: &ParsedCodestream<'_>) -> Result<IntegerImage> {
     let highpass = decode_highpass(stream, &lowpass)?;
 
     let (blocks, remainder) = lowpass.values.as_chunks_mut::<16>();
-    debug_assert_eq!(remainder, []);
+    debug_assert!(remainder.is_empty());
 
     if blocks.len() >= MIN_PARALLEL_LOWPASS_BLOCKS {
         blocks
@@ -1277,7 +1292,7 @@ fn dequantize_and_predict_highpass_macroblock(
     offset: usize,
 ) -> Result<()> {
     let (components, remainder) = macroblock.as_chunks_mut::<256>();
-    debug_assert_eq!(remainder, []);
+    debug_assert!(remainder.is_empty());
 
     for (values, &factor) in components.iter_mut().zip(factors) {
         // Lossless quantization leaves coefficients unchanged.
@@ -1659,6 +1674,61 @@ struct FloatFormat {
     mantissa_bits: u8,
     exponent_bias: i8,
     offset: usize,
+}
+
+/// Converts reconstructed integer samples to a floating-point output sample type.
+trait SampleFormat: Copy + Send + Sync {
+    type Sample: Copy + Send;
+
+    fn new(stream: &ParsedCodestream<'_>) -> Result<Self>;
+
+    fn convert(self, value: i64) -> Result<Self::Sample>;
+}
+
+impl SampleFormat for FloatFormat {
+    type Sample = f32;
+
+    fn new(stream: &ParsedCodestream<'_>) -> Result<Self> {
+        Self::new(stream)
+    }
+
+    fn convert(self, value: i64) -> Result<f32> {
+        self.convert(value)
+    }
+}
+
+/// `BD16F` samples: sign-magnitude IEEE 754 binary16 bit patterns mapped to one's-complement
+/// integers (negative `x` encodes `0x8000 | !x & 0x7fff`).
+#[derive(Clone, Copy, Debug)]
+struct HalfFormat {
+    /// Fractional bits carried by `scaled` planes, removed before bit-pattern mapping.
+    shift: u32,
+}
+
+impl SampleFormat for HalfFormat {
+    type Sample = u16;
+
+    fn new(stream: &ParsedCodestream<'_>) -> Result<Self> {
+        Ok(Self {
+            shift: if stream.primary_plane.scaled { 3 } else { 0 },
+        })
+    }
+
+    fn convert(self, value: i64) -> Result<u16> {
+        let value = if self.shift == 0 {
+            value
+        } else {
+            (value + ((1 << (self.shift - 1)) - 1)) >> self.shift
+        };
+        let clamped = value.clamp(i64::from(i16::MIN), i64::from(i16::MAX));
+        let bits = if clamped < 0 {
+            0x8000 | (clamped ^ 0x7fff) & 0x7fff
+        } else {
+            clamped
+        };
+
+        Ok(u16::try_from(bits).expect("half bit pattern fits u16"))
+    }
 }
 
 impl FloatFormat {
@@ -3128,6 +3198,7 @@ fn decode_absolute_level(reader: &mut BitReader<'_>, adaptive: &mut AdaptiveVLC)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{HalfFormat, SampleFormat};
     use crate::{Decoder, PixelFormat};
 
     #[test]
@@ -3561,5 +3632,26 @@ mod tests {
             }
         }
         hash
+    }
+
+    #[test]
+    fn half_format_maps_ones_complement_integers_to_sign_magnitude_bits() {
+        let format = HalfFormat { shift: 0 };
+
+        assert_eq!(format.convert(0).unwrap(), 0x0000);
+        assert_eq!(format.convert(0x3c00).unwrap(), 0x3c00);
+        assert_eq!(format.convert(-1).unwrap(), 0x8000);
+        assert_eq!(format.convert(-0x3c01).unwrap(), 0xbc00);
+        assert_eq!(format.convert(i64::MAX).unwrap(), 0x7fff);
+        assert_eq!(format.convert(i64::MIN).unwrap(), 0xffff);
+    }
+
+    #[test]
+    fn half_format_removes_scaled_fractional_bits_with_rounding() {
+        let format = HalfFormat { shift: 3 };
+
+        assert_eq!(format.convert(0x3c00 << 3).unwrap(), 0x3c00);
+        assert_eq!(format.convert((0x3c00 << 3) + 5).unwrap(), 0x3c01);
+        assert_eq!(format.convert((0x3c00 << 3) + 4).unwrap(), 0x3c00);
     }
 }

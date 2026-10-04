@@ -59,6 +59,7 @@ impl PixelFormat {
     /// Four 32-bit floating-point RGBA channels.
     pub const RGBA128_FLOAT: Self = Self::from_code(0x19);
     /// Four premultiplied 32-bit floating-point RGBA channels.
+    pub const RGBA64_HALF: Self = Self::from_code(0x3A);
     pub const PRGBA128_FLOAT: Self = Self::from_code(0x1A);
 
     const fn from_code(code: u8) -> Self {
