@@ -9,6 +9,7 @@ use super::hdr::{self, DecodeOptions, DecodedHDR, NativeFormat, NativeHDR, Pixel
 use super::{DIMENSION_MAX, DecodedImage, Dimensions, PIXELS_MAX, map_dimensions_error};
 use error::error;
 
+pub use ::jpegxr::Arena;
 pub use error::{Error, JPEGXRError, JPEGXRLimit, Result};
 
 /// The four-byte signature at the beginning of a JPEG XR file.
@@ -51,6 +52,24 @@ pub fn has_signature(bytes: &[u8]) -> bool {
 /// representations.
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     decode_with_options(bytes, DecodeOptions::default())
+}
+
+/// Decodes a JPEG XR image like [`decode`], keeping the codec's intermediate buffers in `arena`.
+///
+/// Reusing one arena across decodes serves the ~150 MB of coefficient planes a 4K image needs from
+/// memory that is already mapped, instead of faulting in fresh pages every time.
+///
+/// # Errors
+///
+/// Returns [`JPEGXRError`] for malformed input, resource-limit failures, and unsupported pixel
+/// representations.
+pub fn decode_in(bytes: &[u8], arena: &mut Arena) -> Result<DecodedImage> {
+    let options = DecodeOptions::default().with_hdr_metrics(false);
+    Ok(
+        hdr::tonemap_native(&decode_native_in(bytes, arena)?, options)
+            .map_err(|source| source.raise(JPEGXRError::Normalize))?
+            .into_image(),
+    )
 }
 
 /// Decodes JPEG XR pixels using the selected HDR normalization `options`.
@@ -107,6 +126,21 @@ pub fn decode_with_metadata_and_options(
 /// Returns [`JPEGXRError`] for malformed input, resource-limit failures, and unsupported pixel
 /// representations.
 pub fn decode_native(bytes: &[u8]) -> Result<NativeHDR> {
+    decode_native_with(bytes, None)
+}
+
+/// Decodes JPEG XR pixels like [`decode_native`], keeping the codec's intermediate buffers in
+/// `arena`.
+///
+/// # Errors
+///
+/// Returns [`JPEGXRError`] for malformed input, resource-limit failures, and unsupported pixel
+/// representations.
+pub fn decode_native_in(bytes: &[u8], arena: &mut Arena) -> Result<NativeHDR> {
+    decode_native_with(bytes, Some(arena))
+}
+
+fn decode_native_with(bytes: &[u8], arena: Option<&mut Arena>) -> Result<NativeHDR> {
     if !has_signature(bytes) {
         return Err(error(JPEGXRError::Signature));
     }
@@ -151,26 +185,50 @@ pub fn decode_native(bytes: &[u8]) -> Result<NativeHDR> {
         )));
     }
 
-    let pixels: Box<dyn PixelBuffer> = match format {
-        NativeFormat::BGR101010 => Box::new(
+    let pixels = decode_pixels(&decoder, format, arena)?;
+
+    NativeHDR::from_buffer(width, height, format, pixels)
+        .map_err(|source| source.raise(JPEGXRError::Normalize))
+}
+
+/// Decodes `format` pixels into their native buffer, in `arena` when one is given.
+fn decode_pixels(
+    decoder: &::jpegxr::Decoder<'_>,
+    format: NativeFormat,
+    arena: Option<&mut Arena>,
+) -> Result<Box<dyn PixelBuffer>> {
+    Ok(match (format, arena) {
+        (NativeFormat::BGR101010, None) => Box::new(
             decoder
                 .decode_bgr101010()
                 .map_err(|source| codec_error(&source))?,
         ),
-        NativeFormat::RGBAF32 => Box::new(
+        (NativeFormat::BGR101010, Some(arena)) => Box::new(
+            decoder
+                .decode_bgr101010_in(arena)
+                .map_err(|source| codec_error(&source))?,
+        ),
+        (NativeFormat::RGBAF32, None) => Box::new(
             decoder
                 .decode_rgba_f32()
                 .map_err(|source| codec_error(&source))?,
         ),
-        NativeFormat::RGBAF16 => Box::new(
+        (NativeFormat::RGBAF32, Some(arena)) => Box::new(
+            decoder
+                .decode_rgba_f32_in(arena)
+                .map_err(|source| codec_error(&source))?,
+        ),
+        (NativeFormat::RGBAF16, None) => Box::new(
             decoder
                 .decode_rgba_half()
                 .map_err(|source| codec_error(&source))?,
         ),
-    };
-
-    NativeHDR::from_buffer(width, height, format, pixels)
-        .map_err(|source| source.raise(JPEGXRError::Normalize))
+        (NativeFormat::RGBAF16, Some(arena)) => Box::new(
+            decoder
+                .decode_rgba_half_in(arena)
+                .map_err(|source| codec_error(&source))?,
+        ),
+    })
 }
 
 /// Builds the error for a decoder-reported dimension too large to convert to `i32`.

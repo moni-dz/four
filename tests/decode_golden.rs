@@ -188,6 +188,21 @@ fn truncated_fixtures_fail_without_panicking() {
     }
 }
 
+/// Decoding through a reused scratch arena must match the global-allocator decode exactly.
+#[test]
+fn jpeg_xr_arena_decode_matches_the_global_decode() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/screenshot.jxr");
+    let bytes = std::fs::read(&path).expect("read screenshot.jxr fixture");
+    let expected = jpeg_xr::decode(&bytes).expect("screenshot.jxr decodes");
+
+    let mut arena = jpeg_xr::Arena::new();
+    for pass in 0..2 {
+        let decoded = jpeg_xr::decode_in(&bytes, &mut arena).expect("screenshot.jxr decodes");
+        assert_eq!(decoded, expected, "arena decode {pass} differs");
+    }
+}
+
 /// Re-tone-mapping a retained native JPEG XR decode matches decoding the same options from
 /// scratch, for every tone-mapping method the viewer can switch to.
 ///

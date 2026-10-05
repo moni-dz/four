@@ -171,6 +171,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "allocator-api2"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c880a97d28a3681c0267bd29cff89621202715b065127cd445fa0f0fe0aa2880"
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -638,6 +644,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7eff00be299a18769011411c9def0d827e8f2d7bf0c3dbf53633147a8867fd1f"
 dependencies = [
  "no_std_io2",
+]
+
+[[package]]
+name = "blink-alloc"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce4c15bad517bc0fb4a44523adf470e2c3eb3a365769327acdba849948ea3705"
+dependencies = [
+ "allocator-api2 0.4.0",
+ "parking_lot",
 ]
 
 [[package]]
@@ -3051,7 +3067,7 @@ version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
- "allocator-api2",
+ "allocator-api2 0.2.21",
  "equivalent",
  "foldhash 0.2.0",
 ]
@@ -3620,6 +3636,7 @@ dependencies = [
 name = "jpegxr"
 version = "0.1.0"
 dependencies = [
+ "blink-alloc",
  "multiversion",
  "rayon",
  "thiserror 2.0.20",
