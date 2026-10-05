@@ -11,6 +11,7 @@ rayon = { workspace = true }
 thiserror = { workspace = true }
 zerocopy = { workspace = true }
 multiversion = { workspace = true }
+blink-alloc = { version = "0.4.0", features = ["nightly", "sync"] }
 
 [lints]
 workspace = true

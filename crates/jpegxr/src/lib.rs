@@ -5,7 +5,7 @@
 //! `RGBA64Half`; other
 //! valid profiles return an error classified by [`Error::is_unsupported`].
 
-#![feature(portable_simd)]
+#![feature(allocator_ext, portable_simd)]
 #![expect(
     clippy::comparison_chain,
     clippy::items_after_statements,
@@ -19,6 +19,7 @@
     reason = "private decoder code follows the T.832 tables and bit-reading order closely"
 )]
 
+mod arena;
 mod bitstream;
 mod codestream;
 mod container;
@@ -26,8 +27,10 @@ mod decode;
 mod entropy;
 mod error;
 
+use std::alloc::Global;
 use std::fmt;
 
+pub use arena::Arena;
 #[doc(inline)]
 pub use codestream::{
     Bands, CodestreamInfo, InternalColorFormat, OutputBitDepth, OutputColorFormat, OverlapMode,
@@ -105,6 +108,22 @@ impl<'a> Decoder<'a> {
     ///
     /// Returns [`Error`] for malformed coefficients or unsupported image features.
     pub fn decode_rgba_f32(&self) -> Result<RGBAF32Image> {
+        self.decode_rgba_f32_with(Global)
+    }
+
+    /// Like [`Self::decode_rgba_f32`], but keeps intermediate buffers in `arena`.
+    ///
+    /// The arena is reset first, so its memory is reused from one decode to the next.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] for malformed coefficients or unsupported image features.
+    pub fn decode_rgba_f32_in(&self, arena: &mut Arena) -> Result<RGBAF32Image> {
+        arena.reset();
+        self.decode_rgba_f32_with(&*arena)
+    }
+
+    fn decode_rgba_f32_with(&self, scratch: impl decode::ScratchAlloc) -> Result<RGBAF32Image> {
         if self.info.pixel_format != PixelFormat::RGBA128_FLOAT {
             return Err(Error::new(
                 ErrorKind::Unsupported("pixel format other than 128bppRGBAFloat"),
@@ -126,7 +145,7 @@ impl<'a> Decoder<'a> {
             )
         })?;
 
-        let pixels = decode::decode_rgba_f32(&self.primary, alpha)?;
+        let pixels = decode::decode_rgba_f32(&self.primary, alpha, scratch)?;
 
         Ok(RGBAF32Image {
             width: self.info.width,
@@ -143,6 +162,22 @@ impl<'a> Decoder<'a> {
     ///
     /// Returns [`Error`] for malformed coefficients or unsupported image features.
     pub fn decode_rgba_half(&self) -> Result<RGBAF16Image> {
+        self.decode_rgba_half_with(Global)
+    }
+
+    /// Like [`Self::decode_rgba_half`], but keeps intermediate buffers in `arena`.
+    ///
+    /// The arena is reset first, so its memory is reused from one decode to the next.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] for malformed coefficients or unsupported image features.
+    pub fn decode_rgba_half_in(&self, arena: &mut Arena) -> Result<RGBAF16Image> {
+        arena.reset();
+        self.decode_rgba_half_with(&*arena)
+    }
+
+    fn decode_rgba_half_with(&self, scratch: impl decode::ScratchAlloc) -> Result<RGBAF16Image> {
         if self.info.pixel_format != PixelFormat::RGBA64_HALF {
             return Err(Error::new(
                 ErrorKind::Unsupported("pixel format other than 64bppRGBAHalf"),
@@ -164,7 +199,7 @@ impl<'a> Decoder<'a> {
             )
         })?;
 
-        let pixels = decode::decode_rgba_half(&self.primary, alpha)?;
+        let pixels = decode::decode_rgba_half(&self.primary, alpha, scratch)?;
 
         Ok(RGBAF16Image {
             width: self.info.width,
@@ -182,6 +217,22 @@ impl<'a> Decoder<'a> {
     ///
     /// Returns [`Error`] for malformed coefficients or unsupported image features.
     pub fn decode_bgr101010(&self) -> Result<BGR101010Image> {
+        self.decode_bgr101010_with(Global)
+    }
+
+    /// Like [`Self::decode_bgr101010`], but keeps intermediate buffers in `arena`.
+    ///
+    /// The arena is reset first, so its memory is reused from one decode to the next.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error`] for malformed coefficients or unsupported image features.
+    pub fn decode_bgr101010_in(&self, arena: &mut Arena) -> Result<BGR101010Image> {
+        arena.reset();
+        self.decode_bgr101010_with(&*arena)
+    }
+
+    fn decode_bgr101010_with(&self, scratch: impl decode::ScratchAlloc) -> Result<BGR101010Image> {
         if self.info.pixel_format != PixelFormat::BGR101010 {
             return Err(Error::new(
                 ErrorKind::Unsupported("pixel format other than 32bppBGR101010"),
@@ -196,7 +247,7 @@ impl<'a> Decoder<'a> {
             ));
         }
 
-        let pixels = decode::decode_bgr101010(&self.primary)?;
+        let pixels = decode::decode_bgr101010(&self.primary, scratch)?;
 
         Ok(BGR101010Image {
             width: self.info.width,

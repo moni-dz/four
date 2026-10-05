@@ -94,6 +94,31 @@ mod decode {
         bench_decode(bencher, "screenshot.jxr", jpeg_xr::decode);
     }
 
+    /// Decodes the screenshot with a fresh scratch arena per decode, sized by its own spills.
+    #[divan::bench]
+    fn jpeg_xr_bgr101010_arena_fresh(bencher: Bencher<'_, '_>) {
+        bench_decode(bencher, "screenshot.jxr", |bytes| {
+            jpeg_xr::decode_in(bytes, &mut jpeg_xr::Arena::new())
+        });
+    }
+
+    /// Decodes the screenshot reusing one scratch arena, so coefficient planes stay mapped.
+    #[divan::bench]
+    fn jpeg_xr_bgr101010_arena_reused(bencher: Bencher<'_, '_>) {
+        let bytes = fixture("screenshot.jxr");
+        let mut arena = jpeg_xr::Arena::new();
+        let output_bytes = jpeg_xr::decode_in(&bytes, &mut arena)
+            .expect("benchmark fixture decodes successfully")
+            .rgba8()
+            .len();
+
+        bencher
+            .counter(BytesCount::new(output_bytes))
+            .bench_local(|| {
+                jpeg_xr::decode_in(&bytes, &mut arena).map(|image| image.rgba8().len())
+            });
+    }
+
     /// Decodes and analyzes the production JPEG XR path.
     #[divan::bench]
     fn jpeg_xr_bgr101010_metadata(bencher: Bencher<'_, '_>) {

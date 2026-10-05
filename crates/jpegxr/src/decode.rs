@@ -9,9 +9,10 @@ use crate::entropy::{self, AdaptiveVLC};
 use crate::error::{Error, ErrorKind, Result};
 use multiversion::multiversion;
 use rayon::prelude::*;
+use std::alloc::{Allocator, Global};
 use std::cmp::Ordering;
 use std::marker::PhantomData;
-use std::mem::{self, MaybeUninit};
+use std::mem::MaybeUninit;
 use std::ops::{Add, Neg, Sub};
 use std::simd::{
     Simd, ToBytes,
@@ -57,40 +58,40 @@ type I64x4 = Simd<i64, 4>;
 type I64x8 = Simd<i64, PIXEL_LANES>;
 
 #[derive(Debug)]
-pub(crate) struct DCImage {
+pub(crate) struct DCImage<A: Allocator = Global> {
     pub(crate) macroblock_width: usize,
     pub(crate) macroblock_height: usize,
     pub(crate) components: usize,
-    pub(crate) values: Vec<i32>,
+    pub(crate) values: Vec<i32, A>,
 }
 
 #[derive(Debug)]
-pub(crate) struct LowpassImage {
+pub(crate) struct LowpassImage<A: Allocator = Global> {
     pub(crate) macroblock_width: usize,
     pub(crate) macroblock_height: usize,
     pub(crate) components: usize,
-    pub(crate) values: Vec<i32>,
+    pub(crate) values: Vec<i32, A>,
 }
 
 #[derive(Debug)]
-pub(crate) struct PredictedLowpass {
+pub(crate) struct PredictedLowpass<A: Allocator = Global> {
     pub(crate) macroblock_width: usize,
     pub(crate) macroblock_height: usize,
     pub(crate) components: usize,
-    pub(crate) values: Vec<i32>,
-    pub(crate) highpass_modes: Vec<u8>,
+    pub(crate) values: Vec<i32, A>,
+    pub(crate) highpass_modes: Vec<u8, A>,
 }
 
 #[derive(Debug)]
-pub(crate) struct HighpassImage {
+pub(crate) struct HighpassImage<A: Allocator = Global> {
     pub(crate) components: usize,
     /// 256 values per macroblock component, laid out by [`highpass_index`].
     ///
     /// Macroblocks are tile-major: each tile's macroblocks are contiguous, in raster order within
     /// the tile, so every tile decodes straight into its own slice of one shared buffer.
-    pub(crate) values: Vec<i32>,
+    pub(crate) values: Vec<i32, A>,
     /// Maps a raster-order macroblock index to its tile-major position in `values`.
-    pub(crate) macroblock_positions: Vec<usize>,
+    pub(crate) macroblock_positions: Vec<usize, A>,
 }
 
 /// One tile's disjoint view into a [`HighpassImage`]'s tile-major buffers.
@@ -118,14 +119,21 @@ const fn highpass_index(block: usize, coefficient: usize) -> usize {
 }
 
 #[derive(Debug)]
-struct IntegerImage {
+struct IntegerImage<A: Allocator = Global> {
     width: usize,
     height: usize,
     components: usize,
-    values: Vec<i32>,
+    values: Vec<i32, A>,
 }
 
-/// Allocates a `Vec<T>` of `len` elements without zeroing them.
+/// An allocator for intermediate buffers: copied into each buffer and shared with rayon workers.
+///
+/// [`Global`] and `&`[`Arena`](crate::Arena) both qualify.
+pub(crate) trait ScratchAlloc: Allocator + Copy + Send + Sync {}
+
+impl<A: Allocator + Copy + Send + Sync> ScratchAlloc for A {}
+
+/// Allocates a `Vec<T, A>` of `len` elements without zeroing them.
 ///
 /// # Safety
 ///
@@ -135,15 +143,30 @@ struct IntegerImage {
     unsafe_code,
     reason = "avoids zeroing output buffers this decoder immediately overwrites in full"
 )]
-unsafe fn uninit_vec<T: Copy>(len: usize) -> Vec<T> {
-    let mut values: Vec<MaybeUninit<T>> = Vec::with_capacity(len);
+unsafe fn uninit_vec_in<T: Copy, A: Allocator>(len: usize, alloc: A) -> Vec<T, A> {
+    let mut values: Vec<MaybeUninit<T>, A> = Vec::with_capacity_in(len, alloc);
     // SAFETY: `MaybeUninit<T>` has no validity invariant, so any length up to `capacity` (just
     // reserved above) is valid, regardless of `T`.
     unsafe { values.set_len(len) };
-    // SAFETY: `MaybeUninit<T>` and `T` share size, alignment and layout, so a `Vec` of one
-    // transmutes into a `Vec` of the other; the caller's precondition (every element written
-    // before being read) is what makes reading back a `T` from each slot sound.
-    unsafe { mem::transmute::<Vec<MaybeUninit<T>>, Vec<T>>(values) }
+    let (pointer, len, capacity, alloc) = values.into_raw_parts_with_allocator();
+    // SAFETY: `MaybeUninit<T>` and `T` share size, alignment and layout, so the allocation is a
+    // valid `Vec<T, A>` buffer of the same capacity; the caller's precondition (every element
+    // written before being read) is what makes reading back a `T` from each slot sound.
+    unsafe { Vec::from_raw_parts_in(pointer.cast::<T>(), len, capacity, alloc) }
+}
+
+/// Allocates a `Vec<T, A>` of `len` zeroes through [`Allocator::allocate_zeroed`].
+///
+/// Equivalent to `vec![0; len]`, which only reaches the zeroed allocation path for [`Global`]:
+/// fresh memory from either the system or a clean arena region then needs no clearing pass.
+#[expect(
+    unsafe_code,
+    reason = "reaches the allocator's zeroed path, which `vec![0; len]` takes only for `Global`"
+)]
+fn zeroed_vec_in<T: zerocopy::FromZeros, A: Allocator>(len: usize, alloc: A) -> Vec<T, A> {
+    let zeroed = Box::<[T], A>::new_zeroed_slice_in(len, alloc);
+    // SAFETY: `T: FromZeros` guarantees the all-zero bit pattern is a valid `T`.
+    unsafe { zeroed.assume_init() }.into_vec()
 }
 
 /// Validates a plane's declared dimensions and returns `(width, height, pixel_count)`.
@@ -210,30 +233,37 @@ fn crop_rect(
 pub(crate) fn decode_rgba_f32(
     primary: &ParsedCodestream<'_>,
     alpha: &ParsedCodestream<'_>,
+    scratch: impl ScratchAlloc,
 ) -> Result<Vec<f32>> {
     validate_float_rgb_profile(primary, alpha, OutputBitDepth::ThirtyTwoFloat)?;
-    decode_rgba::<FloatFormat>(primary, alpha)
+    decode_rgba::<FloatFormat>(primary, alpha, scratch)
 }
 
 pub(crate) fn decode_rgba_half(
     primary: &ParsedCodestream<'_>,
     alpha: &ParsedCodestream<'_>,
+    scratch: impl ScratchAlloc,
 ) -> Result<Vec<u16>> {
     validate_float_rgb_profile(primary, alpha, OutputBitDepth::SixteenFloat)?;
-    decode_rgba::<HalfFormat>(primary, alpha)
+    decode_rgba::<HalfFormat>(primary, alpha, scratch)
 }
 
+/// Decodes interleaved RGBA samples, keeping intermediate buffers in `scratch`.
 fn decode_rgba<F: SampleFormat>(
     primary: &ParsedCodestream<'_>,
     alpha: &ParsedCodestream<'_>,
+    scratch: impl ScratchAlloc,
 ) -> Result<Vec<F::Sample>> {
     let (width, height, pixel_count) = validated_dimensions(&primary.header, primary.offset)?;
 
     let (color, alpha_image) = if pixel_count >= MIN_PARALLEL_PIXELS {
-        let (color, alpha_image) = rayon::join(|| reconstruct(primary), || reconstruct(alpha));
+        let (color, alpha_image) = rayon::join(
+            || reconstruct(primary, scratch),
+            || reconstruct(alpha, scratch),
+        );
         (color?, alpha_image?)
     } else {
-        (reconstruct(primary)?, reconstruct(alpha)?)
+        (reconstruct(primary, scratch)?, reconstruct(alpha, scratch)?)
     };
 
     let output_len = pixel_count.checked_mul(4).ok_or_else(|| {
@@ -253,7 +283,7 @@ fn decode_rgba<F: SampleFormat>(
     // channels, no data-dependent skip), and the `chunks_mut`/`par_chunks_mut` split below
     // covers the entire `pixels` buffer, so every element is written before this function
     // returns `Ok`; on `Err` the partially-filled buffer is dropped without being read.
-    let mut pixels = unsafe { uninit_vec::<F::Sample>(output_len) };
+    let mut pixels = unsafe { uninit_vec_in::<F::Sample, _>(output_len, Global) };
 
     let color_crop = crop_rect(
         primary.header.margins,
@@ -319,12 +349,16 @@ fn decode_rgba<F: SampleFormat>(
     Ok(pixels)
 }
 
-pub(crate) fn decode_bgr101010(stream: &ParsedCodestream<'_>) -> Result<Vec<u32>> {
+/// Decodes packed `BGR101010` pixels, keeping intermediate buffers in `scratch`.
+pub(crate) fn decode_bgr101010(
+    stream: &ParsedCodestream<'_>,
+    scratch: impl ScratchAlloc,
+) -> Result<Vec<u32>> {
     validate_bgr101010_profile(stream)?;
 
     let (width, height, pixel_count) = validated_dimensions(&stream.header, stream.offset)?;
 
-    let (lowpass, highpass) = reconstruct_coefficients(stream)?;
+    let (lowpass, highpass) = reconstruct_coefficients(stream, scratch)?;
     let (extended_width, extended_height) = (
         lowpass.macroblock_width.saturating_mul(16),
         lowpass.macroblock_height.saturating_mul(16),
@@ -366,10 +400,11 @@ pub(crate) fn decode_bgr101010(stream: &ParsedCodestream<'_>) -> Result<Vec<u32>
     // the per-macroblock-row slices below partition the entire `pixels` buffer into whole rows,
     // each filled by `transform_macroblock_rows`, so every element is written before this
     // function returns `Ok`; on `Err` the buffer is dropped without being read.
-    let mut pixels = unsafe { uninit_vec::<u32>(pixel_count) };
+    let mut pixels = unsafe { uninit_vec_in::<u32, _>(pixel_count, Global) };
 
     // Macroblock row `y` covers extended rows `16 * y..16 * y + 16`; the crop shifts those up by
     // `top` and clips them to the output, so consecutive rows own consecutive output slices.
+    // Rayon only splits `Vec<T, Global>`, so this one small list stays off the scratch allocator.
     let mut rows = Vec::with_capacity(lowpass.macroblock_height);
     let mut rest = pixels.as_mut_slice();
     for macroblock_y in 0..lowpass.macroblock_height {
@@ -405,12 +440,12 @@ pub(crate) fn decode_bgr101010(stream: &ParsedCodestream<'_>) -> Result<Vec<u32>
 }
 
 #[multiversion(targets = "simd")]
-fn fill_bgr101010_row(
+fn fill_bgr101010_row<A: Allocator>(
     row: &mut [u32],
     y: usize,
     left: usize,
     top: usize,
-    color: &IntegerImage,
+    color: &IntegerImage<A>,
     shift: u32,
     bias: i64,
     swapped: bool,
@@ -564,15 +599,15 @@ fn inverse_color_transform_simd(y: I32x8, u: I32x8, v: I32x8, bias: i64) -> [I64
 }
 
 #[multiversion(targets = "simd")]
-fn fill_rgba_row<F: SampleFormat>(
+fn fill_rgba_row<F: SampleFormat, A: Allocator>(
     row: &mut [F::Sample],
     y: usize,
     color_left: usize,
     color_top: usize,
     alpha_left: usize,
     alpha_top: usize,
-    color: &IntegerImage,
-    alpha: &IntegerImage,
+    color: &IntegerImage<A>,
+    alpha: &IntegerImage<A>,
     color_format: F,
     alpha_format: F,
 ) -> Result<()> {
@@ -606,7 +641,10 @@ fn fill_rgba_row<F: SampleFormat>(
     Ok(())
 }
 
-pub(crate) fn decode_dc(stream: &ParsedCodestream<'_>) -> Result<DCImage> {
+pub(crate) fn decode_dc<A: ScratchAlloc>(
+    stream: &ParsedCodestream<'_>,
+    scratch: A,
+) -> Result<DCImage<A>> {
     if !stream.header.frequency_mode {
         return Err(Error::new(
             ErrorKind::Unsupported("spatial-mode coefficient decoding"),
@@ -668,7 +706,7 @@ pub(crate) fn decode_dc(stream: &ParsedCodestream<'_>) -> Result<DCImage> {
         macroblock_width,
         macroblock_height,
         components,
-        values: vec![0; value_count],
+        values: zeroed_vec_in(value_count, scratch),
     };
 
     decode_tiles_into(
@@ -676,6 +714,7 @@ pub(crate) fn decode_dc(stream: &ParsedCodestream<'_>) -> Result<DCImage> {
         &mut image.values,
         macroblock_width,
         components,
+        scratch,
         |tile, writer| {
             decode_dc_packet(
                 packet(stream, tile.index, 0)?,
@@ -691,7 +730,10 @@ pub(crate) fn decode_dc(stream: &ParsedCodestream<'_>) -> Result<DCImage> {
     Ok(image)
 }
 
-pub(crate) fn decode_lowpass(stream: &ParsedCodestream<'_>) -> Result<LowpassImage> {
+pub(crate) fn decode_lowpass<A: ScratchAlloc>(
+    stream: &ParsedCodestream<'_>,
+    scratch: A,
+) -> Result<LowpassImage<A>> {
     validate_frequency_profile(stream)?;
 
     if stream.primary_plane.bands.count() < 2 {
@@ -725,7 +767,7 @@ pub(crate) fn decode_lowpass(stream: &ParsedCodestream<'_>) -> Result<LowpassIma
         macroblock_width,
         macroblock_height,
         components,
-        values: vec![0; value_count],
+        values: zeroed_vec_in(value_count, scratch),
     };
 
     decode_tiles_into(
@@ -733,6 +775,7 @@ pub(crate) fn decode_lowpass(stream: &ParsedCodestream<'_>) -> Result<LowpassIma
         &mut image.values,
         macroblock_width,
         components * 16,
+        scratch,
         |tile, writer| {
             decode_lowpass_packet(
                 packet(stream, tile.index, 1)?,
@@ -757,9 +800,11 @@ struct Tile {
     height: usize,
 }
 
-fn tile_grid(stream: &ParsedCodestream<'_>) -> Vec<Tile> {
-    let mut tiles =
-        Vec::with_capacity(stream.header.tile_widths.len() * stream.header.tile_heights.len());
+fn tile_grid<A: Allocator>(stream: &ParsedCodestream<'_>, scratch: A) -> Vec<Tile, A> {
+    let mut tiles = Vec::with_capacity_in(
+        stream.header.tile_widths.len() * stream.header.tile_heights.len(),
+        scratch,
+    );
 
     let mut top = 0_usize;
     for tile_height in stream.header.tile_heights.iter().copied() {
@@ -862,9 +907,10 @@ fn decode_tiles_into(
     values: &mut [i32],
     macroblock_width: usize,
     stride: usize,
+    scratch: impl ScratchAlloc,
     decode_packet: impl Fn(&Tile, TileWriter<'_>) -> Result<()> + Sync,
 ) -> Result<()> {
-    let tiles = tile_grid(stream);
+    let tiles = tile_grid(stream, scratch);
     let row_stride = macroblock_width * stride;
     let base = SharedBase(values.as_mut_ptr());
 
@@ -890,11 +936,12 @@ fn decode_tiles_into(
     Ok(())
 }
 
-pub(crate) fn predict_lowpass(
+pub(crate) fn predict_lowpass<A: ScratchAlloc>(
     stream: &ParsedCodestream<'_>,
-    dc: &DCImage,
-    lowpass: LowpassImage,
-) -> Result<PredictedLowpass> {
+    dc: &DCImage<A>,
+    lowpass: LowpassImage<A>,
+    scratch: A,
+) -> Result<PredictedLowpass<A>> {
     if dc.macroblock_width != lowpass.macroblock_width
         || dc.macroblock_height != lowpass.macroblock_height
         || dc.components != lowpass.components
@@ -935,8 +982,9 @@ pub(crate) fn predict_lowpass(
         .ok_or_else(|| Error::new(ErrorKind::LimitExceeded("macroblock count"), stream.offset))?;
 
     let mut raw = lowpass.values;
-    let mut output = vec![0_i32; value_count];
-    let mut highpass_modes = vec![2_u8; macroblock_count];
+    let mut output = zeroed_vec_in::<i32, _>(value_count, scratch);
+    let mut highpass_modes = Vec::with_capacity_in(macroblock_count, scratch);
+    highpass_modes.resize(macroblock_count, 2_u8);
 
     let mut top = 0_usize;
 
@@ -1040,10 +1088,11 @@ pub(crate) fn predict_lowpass(
     })
 }
 
-pub(crate) fn decode_highpass(
+pub(crate) fn decode_highpass<A: ScratchAlloc>(
     stream: &ParsedCodestream<'_>,
-    lowpass: &PredictedLowpass,
-) -> Result<HighpassImage> {
+    lowpass: &PredictedLowpass<A>,
+    scratch: A,
+) -> Result<HighpassImage<A>> {
     validate_frequency_profile(stream)?;
 
     if stream.primary_plane.bands.count() < 3 {
@@ -1086,14 +1135,14 @@ pub(crate) fn decode_highpass(
             )
         })?;
 
-    let tiles = tile_grid(stream);
+    let tiles = tile_grid(stream, scratch);
 
     // Tiles are laid out back to back in tile-grid order, so carving the buffers front to back
     // hands each tile its own disjoint slice to decode into, with no copy afterwards.
-    let mut values = vec![0; value_count];
-    let mut model_bits = vec![[0; 2]; macroblock_count];
-    let mut macroblock_positions = vec![0; macroblock_count];
-    let mut views = Vec::with_capacity(tiles.len());
+    let mut values = zeroed_vec_in(value_count, scratch);
+    let mut model_bits = zeroed_vec_in::<[u8; 2], _>(macroblock_count, scratch);
+    let mut macroblock_positions = zeroed_vec_in(macroblock_count, scratch);
+    let mut views = Vec::with_capacity_in(tiles.len(), scratch);
     let (mut values_rest, mut model_bits_rest) = (values.as_mut_slice(), model_bits.as_mut_slice());
     let mut position = 0;
     for tile in &tiles {
@@ -1129,7 +1178,7 @@ pub(crate) fn decode_highpass(
     // Highpass tiles also decode their flexbits refinement while the tile is local, so the
     // transform later runs once over finished coefficients.
     let decode_tile = |(tile, view): &mut (&Tile, HighpassTile<'_>)| {
-        decode_highpass_tile(stream, tile, view, lowpass)
+        decode_highpass_tile(stream, tile, view, lowpass, scratch)
     };
     if macroblock_count >= MIN_PARALLEL_MACROBLOCKS && views.len() > 1 {
         views.par_iter_mut().try_for_each(decode_tile)?;
@@ -1146,14 +1195,15 @@ pub(crate) fn decode_highpass(
 }
 
 /// Decodes one tile's highpass packet and its flexbits refinement into its slice of the image.
-fn decode_highpass_tile(
+fn decode_highpass_tile<A: ScratchAlloc>(
     stream: &ParsedCodestream<'_>,
     tile: &Tile,
     image: &mut HighpassTile<'_>,
-    lowpass: &PredictedLowpass,
+    lowpass: &PredictedLowpass<A>,
+    scratch: A,
 ) -> Result<()> {
     let macroblock_count = tile.width * tile.height;
-    let mut modes = Vec::with_capacity(macroblock_count);
+    let mut modes = Vec::with_capacity_in(macroblock_count, scratch);
     for y in tile.top..tile.top + tile.height {
         let start = y * lowpass.macroblock_width + tile.left;
         modes.extend_from_slice(&lowpass.highpass_modes[start..start + tile.width]);
@@ -1164,6 +1214,7 @@ fn decode_highpass_tile(
         &stream.primary_plane,
         &modes,
         image,
+        scratch,
     )?;
 
     match stream.primary_plane.bands {
@@ -1279,20 +1330,25 @@ fn validate_bgr101010_profile(stream: &ParsedCodestream<'_>) -> Result<()> {
     Ok(())
 }
 
-fn reconstruct(stream: &ParsedCodestream<'_>) -> Result<IntegerImage> {
-    let (lowpass, highpass) = reconstruct_coefficients(stream)?;
-    combine_and_transform(stream, &lowpass, &highpass)
+fn reconstruct<A: ScratchAlloc>(
+    stream: &ParsedCodestream<'_>,
+    scratch: A,
+) -> Result<IntegerImage<A>> {
+    let (lowpass, highpass) = reconstruct_coefficients(stream, scratch)?;
+    combine_and_transform(stream, &lowpass, &highpass, scratch)
 }
 
 /// Decodes and predicts every band, leaving only the final inverse transform to run.
-fn reconstruct_coefficients(
+fn reconstruct_coefficients<A: ScratchAlloc>(
     stream: &ParsedCodestream<'_>,
-) -> Result<(PredictedLowpass, HighpassImage)> {
-    let dc = decode_dc(stream)?;
-    let lowpass = decode_lowpass(stream)?;
-    let mut lowpass = predict_lowpass(stream, &dc, lowpass)?;
+    scratch: A,
+) -> Result<(PredictedLowpass<A>, HighpassImage<A>)> {
+    let dc = decode_dc(stream, scratch)?;
+    let lowpass = decode_lowpass(stream, scratch)?;
+    let mut lowpass = predict_lowpass(stream, &dc, lowpass, scratch)?;
+    drop(dc);
 
-    let highpass = decode_highpass(stream, &lowpass)?;
+    let highpass = decode_highpass(stream, &lowpass, scratch)?;
 
     let (blocks, remainder) = lowpass.values.as_chunks_mut::<16>();
     debug_assert_eq!(remainder, []);
@@ -1442,11 +1498,12 @@ fn dequantize_highpass(values: &mut [i32; 256], factor: i32, offset: usize) -> R
     Ok(())
 }
 
-fn combine_and_transform(
+fn combine_and_transform<A: ScratchAlloc>(
     stream: &ParsedCodestream<'_>,
-    lowpass: &PredictedLowpass,
-    highpass: &HighpassImage,
-) -> Result<IntegerImage> {
+    lowpass: &PredictedLowpass<A>,
+    highpass: &HighpassImage<A>,
+    scratch: A,
+) -> Result<IntegerImage<A>> {
     let width = lowpass
         .macroblock_width
         .checked_mul(16)
@@ -1478,7 +1535,7 @@ fn combine_and_transform(
         // `chunks_mut`/`par_chunks_mut` split below covers every band; together every element of
         // `values` is written before this function returns `Ok`. Unlike the highpass/lowpass
         // coefficient buffers, this one has no data-dependent "leave as zero" case.
-        values: unsafe { uninit_vec(value_count) },
+        values: unsafe { uninit_vec_in(value_count, scratch) },
     };
 
     let factors = highpass_factors(stream, highpass.components)?;
@@ -1544,10 +1601,10 @@ fn highpass_factors(stream: &ParsedCodestream<'_>, components: usize) -> Result<
 /// `rows` pairs a macroblock row index with whatever `consume` writes that row's output to. Each
 /// worker reuses one scratch [`IntegerImage`], 16 sample rows tall and holding every component, in
 /// which `consume` finds macroblock row `y`'s samples at local rows `0..16`.
-fn transform_macroblock_rows<T: Send>(
+fn transform_macroblock_rows<T: Send, A: ScratchAlloc>(
     stream: &ParsedCodestream<'_>,
-    lowpass: &PredictedLowpass,
-    highpass: &HighpassImage,
+    lowpass: &PredictedLowpass<A>,
+    highpass: &HighpassImage<A>,
     rows: Vec<(usize, T)>,
     parallel: bool,
     consume: impl Fn(&IntegerImage, T) -> Result<()> + Sync,
@@ -1559,7 +1616,7 @@ fn transform_macroblock_rows<T: Send>(
     let band_len = width * 16;
     let factors = highpass_factors(stream, highpass.components)?;
 
-    let scratch = || {
+    let new_band = || {
         #[expect(
             unsafe_code,
             reason = "avoids zeroing a scratch buffer every macroblock row overwrites in full"
@@ -1571,7 +1628,7 @@ fn transform_macroblock_rows<T: Send>(
             // SAFETY: before `consume` reads it, `combine_and_transform_band` writes every sample
             // of each component's band (see `combine_and_transform`), and the bands below cover
             // the whole buffer; on `Err` the scratch is dropped unread.
-            values: unsafe { uninit_vec(band_len * lowpass.components) },
+            values: unsafe { uninit_vec_in(band_len * lowpass.components, Global) },
         }
     };
 
@@ -1592,21 +1649,21 @@ fn transform_macroblock_rows<T: Send>(
 
     if parallel {
         rows.into_par_iter()
-            .try_for_each_init(scratch, transform_row)
+            .try_for_each_init(new_band, transform_row)
     } else {
-        let mut band = scratch();
+        let mut band = new_band();
         rows.into_iter()
             .try_for_each(|row| transform_row(&mut band, row))
     }
 }
 
 #[multiversion(targets = "simd")]
-fn combine_and_transform_band(
+fn combine_and_transform_band<A: Allocator>(
     output: &mut [i32],
     band_index: usize,
     width: usize,
-    lowpass: &PredictedLowpass,
-    highpass: &HighpassImage,
+    lowpass: &PredictedLowpass<A>,
+    highpass: &HighpassImage<A>,
     factors: &[i32],
     offset: usize,
 ) -> Result<()> {
@@ -2565,6 +2622,7 @@ fn decode_highpass_packet(
     plane: &PlaneHeader,
     modes: &[u8],
     image: &mut HighpassTile<'_>,
+    scratch: impl Allocator,
 ) -> Result<()> {
     let mut reader = BitReader::new(packet.bytes, packet.offset);
 
@@ -2582,7 +2640,7 @@ fn decode_highpass_packet(
         image.macroblock_height,
         image.components,
     );
-    let mut cbphp = vec![0_u16; image.model_bits.len() * components];
+    let mut cbphp = zeroed_vec_in::<u16, _>(image.model_bits.len() * components, scratch);
 
     for local_y in 0..height {
         for local_x in 0..width {
